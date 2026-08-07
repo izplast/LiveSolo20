@@ -1,0 +1,875 @@
+"""
+core/screener.py — скринер для DCA-бота на Bybit USDT Perpetual.
+
+Замена присланной версии. Что сохранено из неё без изменений:
+  * compute_natr  — NATR-14 по Уайлдеру, дословно;
+  * compute_uhlo  — Unreached Highs/Lows Oscillator (LuxAlgo), дословно;
+  * classify_color — бычий/медвежий по совпадению UHLO на 1м и 15м, дословно;
+  * отдельный процесс, отправляющий сигнал на локальный FastAPI бота (POST /signal).
+Индикаторы работают на строках вида [ts, open, high, low, close, ...] — индексы
+k[2]/k[3]/k[4] одинаковы у Binance и у Bybit v5, поэтому код не переписывался.
+
+Что изменено и почему (детали в CHANGES.md рядом с файлом):
+  1. Источник данных — WebSocket Bybit MAINNET вместо REST-опроса Binance.
+     Ордера идут на Testnet, поэтому цена сигнала должна приходить с той же
+     биржи, иначе проскальзывание в журнале превращается в межбиржевой базис.
+  2. Вселенная — пересечение инструментов mainnet и TESTNET: сигнал по символу,
+     которого нет на тестовом контуре, гарантированно даёт отклонённый ордер.
+  3. Ликвидность — топ-N по turnover24h из Bybit /v5/market/tickers вместо
+     CoinGecko: снимает лимиты внешнего API и проблему сопоставления тикеров
+     (1000PEPE и подобные множители называются на биржах по-разному).
+  4. Добавлено отсечение сверху (natr_max) — правило «волатильнее порога
+     слишком рискованно», которого в исходной версии не было вовсе.
+  5. В расчёт идут только ЗАКРЫТЫЕ свечи (confirm=true у WS, отброс текущего
+     бара у REST) — иначе сигнал мигает внутри минуты и невоспроизводим.
+  6. Конверт сигнала: signal_id, цена и метка времени на момент сигнала.
+     Без них задержка и проскальзывание не вычисляются, а это цель этапа.
+     Параметры DCA из сигнала убраны — их единственный владелец бот.
+  7. Состояние цвета сбрасывается при уходе в none и НЕ продвигается при
+     неудачной отправке: в исходной версии монета отстреливалась один раз
+     за весь прогон, а потерянный POST терял сигнал безвозвратно.
+  8. Журнал событий в JSONL: у каждого кандидата конечный статус с причиной,
+     фиксируются интервалы недоступности потока.
+
+Требования: Python >= 3.10, `pip install websockets requests` (и pyyaml, если
+используется config/config.yml). В Termux перед запуском: `termux-wake-lock`.
+
+Запуск рядом с ботом в отдельной tmux-сессии:
+    python3 core/screener.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import os
+import random
+import signal as os_signal
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Sequence
+
+import requests
+
+try:  # websockets >= 13
+    from websockets.asyncio.client import connect as ws_connect
+except ImportError:  # websockets < 13
+    from websockets import connect as ws_connect  # type: ignore[attr-defined]
+
+try:
+    from infra.logging_setup import setup_logging
+except ImportError:  # автономный запуск вне дерева проекта
+    import logging
+
+    def setup_logging(path: str):  # type: ignore[misc]
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            handlers=[logging.FileHandler(path), logging.StreamHandler()],
+        )
+        return logging.getLogger("screener")
+
+
+logger = setup_logging("logs/screener.log")
+
+# Данные берём с mainnet: на Testnet торгов почти нет, свечи вырожденные и
+# скринер не нашёл бы ничего. Ордера при этом остаются на Testnet — контур
+# исполнения задаётся конфигом бота, скринер ордеров не выставляет.
+MAINNET_REST = "https://api.bybit.com"
+MAINNET_WS = "wss://stream.bybit.com/v5/public/linear"
+TESTNET_REST = "https://api-testnet.bybit.com"
+
+# Диапазон NATR объявлен включительным, но арифметика double на ровной границе
+# даёт 0.8999999999999879 — без допуска кандидат ровно на границе отсекался бы.
+BOUNDARY_EPS = 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Конфигурация
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Config:
+    bot_api_url: str = "http://127.0.0.1:8000"
+    top_n_turnover: int = 300
+    natr_period: int = 14
+    natr_min: float = 0.9
+    natr_max: float = 2.5          # отсечение «слишком рискованно»
+    uhlo_length: int = 20
+    tf_fast: str = "1"
+    tf_slow: str = "15"
+    cooldown_sec: int = 300
+    required_leverage: float = 3.0
+    # 'candidates' — всё, кроме шума (нехватка истории, NATR ниже минимума,
+    # неизменный цвет); 'all' — включая шум; 'none' — только сигналы.
+    reject_log: str = "candidates"
+    ws_topics_per_conn: int = 200
+    ws_subscribe_batch: int = 10   # Bybit не принимает больше 10 args за раз
+    ws_ping_sec: int = 15          # Bybit закрывает соединение без ping в 20 с
+    ws_stale_sec: int = 45
+    # Обрыв длиннее этого — в окне свечей появляется дыра, и NATR с UHLO
+    # начинают считаться по разрывной истории. Тогда окно перечитывается
+    # заново из REST вместо доклейки к старому.
+    reseed_after_sec: int = 90
+    max_clock_skew_ms: int = 3000
+    post_retries: int = 3
+    seed_concurrency: int = 6
+    journal_path: str = "logs/screener-events.jsonl"
+
+
+def load_config(path: str = "config/config.yml") -> Config:
+    """Читает config.yml, если он есть. Отсутствие файла — не повод падать."""
+    raw: dict[str, Any] = {}
+    try:
+        import yaml  # локальный импорт: без конфига зависимость не нужна
+
+        with open(path, "r") as f:
+            raw = (yaml.safe_load(f) or {}).get("screener", {}) or {}
+    except FileNotFoundError:
+        logger.warning("%s не найден — работаем на значениях по умолчанию", path)
+    except Exception:
+        logger.exception("не удалось прочитать %s — работаем на значениях по умолчанию", path)
+
+    # Совместимость со старым ключом: раньше был один порог снизу.
+    if "natr_threshold" in raw and "natr_min" not in raw:
+        raw["natr_min"] = raw.pop("natr_threshold")
+        logger.warning("ключ natr_threshold устарел, переименуйте в natr_min (и задайте natr_max)")
+    raw.pop("scan_interval_sec", None)  # опроса больше нет, работаем по потоку
+    raw.pop("top_n_mcap", None)         # заменён на top_n_turnover
+
+    known = {f.name for f in Config.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+    unknown = set(raw) - known
+    if unknown:
+        logger.warning("незнакомые ключи в screener-конфиге игнорируются: %s", sorted(unknown))
+    cfg = Config(**{k: v for k, v in raw.items() if k in known})
+    validate_config(cfg)
+    return cfg
+
+
+def _is_minute_tf(value: Any) -> bool:
+    """Таймфрейм обязан быть строкой с целым числом минут ('1', '15')."""
+    try:
+        return isinstance(value, str) and int(value) > 0 and str(int(value)) == value
+    except (TypeError, ValueError):
+        return False
+
+
+def validate_config(cfg: Config) -> None:
+    problems = []
+    if not cfg.natr_min > 0:
+        problems.append("natr_min должен быть больше нуля")
+    if not cfg.natr_max > cfg.natr_min:
+        problems.append("natr_max должен быть больше natr_min")
+    if cfg.natr_period < 2:
+        problems.append("natr_period >= 2")
+    if cfg.uhlo_length < 2:
+        problems.append("uhlo_length >= 2")
+    if not 1 <= cfg.ws_subscribe_batch <= 10:
+        problems.append("ws_subscribe_batch в пределах 1..10")
+    if cfg.ws_ping_sec >= 20:
+        problems.append("ws_ping_sec < 20: Bybit закрывает соединение без ping")
+    if cfg.ws_stale_sec <= cfg.ws_ping_sec:
+        problems.append("ws_stale_sec должен превышать ws_ping_sec")
+    if cfg.reject_log not in ("all", "candidates", "none"):
+        problems.append("reject_log: all | candidates | none")
+    if not _is_minute_tf(cfg.tf_fast) or not _is_minute_tf(cfg.tf_slow):
+        problems.append("tf_fast/tf_slow — целые минуты в виде строки ('1', '15'); "
+                        "нецелые или нецифровые значения ('D', 'W') не поддерживаются")
+    elif int(cfg.tf_slow) <= int(cfg.tf_fast):
+        problems.append("tf_slow должен быть старше tf_fast")
+    if cfg.top_n_turnover < 1:
+        problems.append("top_n_turnover >= 1")
+    if cfg.ws_topics_per_conn < 2:
+        problems.append("ws_topics_per_conn >= 2 (по 2 топика на символ)")
+    if problems:
+        raise ValueError("некорректный screener-конфиг:\n- " + "\n- ".join(problems))
+
+
+# ---------------------------------------------------------------------------
+# Индикаторы — перенесены из присланной версии без изменений
+# ---------------------------------------------------------------------------
+
+def compute_natr(klines, period=14):
+    """NATR(period) = (ATR / close) * 100, сглаживание Уайлдера."""
+    if len(klines) < period + 1:
+        return None
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+
+    trs = []
+    for i in range(1, len(klines)):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+
+    if len(trs) < period:
+        return None
+
+    atr = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        atr = (atr * (period - 1) + trs[i]) / period
+
+    last_close = closes[-1]
+    if not last_close:
+        return None
+    return (atr / last_close) * 100
+
+
+def compute_uhlo(klines, length=20):
+    """Unreached Highs/Lows Oscillator [LuxAlgo] -- прямой порт Pine-логики.
+
+    На каждом баре:
+      1) убираем из массива highs те h, что текущий high пробил (high > h)
+      2) убираем из lows те l, что текущий low пробил (low < l)
+      3) обрезаем до длины length
+      4) значения = 100 * size / length
+      5) добавляем текущий high/low в начало массивов
+
+    Каждый бар вставляет ровно один элемент и обрезает массив до length,
+    поэтому результат зависит только от последних length+1 баров. Отсюда и
+    возможность считать индикатор по скользящему окну, а не по всей истории.
+    """
+    if len(klines) < 2:
+        return None
+
+    highs, lows = [], []
+    u_highs = u_lows = 0.0
+
+    for k in klines:
+        h = float(k[2])
+        l = float(k[3])
+
+        highs = [x for x in highs if h <= x]
+        lows = [x for x in lows if l >= x]
+
+        if len(highs) > length:
+            highs.pop()
+        if len(lows) > length:
+            lows.pop()
+
+        u_highs = 100 * len(highs) / length
+        u_lows = 100 * len(lows) / length
+
+        highs.insert(0, h)
+        lows.insert(0, l)
+
+    return {"highs": u_highs, "lows": u_lows}
+
+
+def classify_color(a, b):
+    """green = бычий сигнал (Unreached Lows высокие, Highs низкие на обоих ТФ)
+    red = медвежий (наоборот)."""
+    if not a or not b:
+        return "none"
+    green = (
+        80 <= a["lows"] <= 100 and 80 <= b["lows"] <= 100
+        and 0 <= a["highs"] <= 20 and 0 <= b["highs"] <= 20
+    )
+    red = (
+        80 <= a["highs"] <= 100 and 80 <= b["highs"] <= 100
+        and 0 <= a["lows"] <= 20 and 0 <= b["lows"] <= 20
+    )
+    if green:
+        return "green"
+    if red:
+        return "red"
+    return "none"
+
+
+# ---------------------------------------------------------------------------
+# Решение по кандидату
+# ---------------------------------------------------------------------------
+
+# Причины, которые в режиме 'candidates' в журнал не пишутся: это фон, а не
+# события. 300 символов × 1440 минут — за 72 часа это миллионы строк на
+# телефоне, поэтому отбор причин здесь не косметика.
+NOISE_REASONS = {"insufficient_history", "natr_below_min", "repeat_color"}
+
+
+@dataclass
+class Decision:
+    passed: bool
+    reason: str = ""
+    color: str = "none"
+    natr: float | None = None
+    uhlo_fast: dict | None = None
+    uhlo_slow: dict | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+def evaluate(fast: Sequence, slow: Sequence, cfg: Config) -> Decision:
+    """Чистая функция: свечи → решение. Проверяется юнит-тестами без сети."""
+    natr = compute_natr(fast, cfg.natr_period)
+    if natr is None:
+        return Decision(False, "insufficient_history",
+                        details={"fast_bars": len(fast), "slow_bars": len(slow)})
+
+    if natr > cfg.natr_max + BOUNDARY_EPS:
+        # Ключевое отсечение этапа: слишком рискованная монета.
+        return Decision(False, "natr_above_max", natr=natr,
+                        details={"natr": natr, "natr_max": cfg.natr_max})
+    if natr < cfg.natr_min - BOUNDARY_EPS:
+        return Decision(False, "natr_below_min", natr=natr,
+                        details={"natr": natr, "natr_min": cfg.natr_min})
+
+    uhlo_fast = compute_uhlo(fast, cfg.uhlo_length)
+    uhlo_slow = compute_uhlo(slow, cfg.uhlo_length)
+    if uhlo_slow is None:
+        return Decision(False, "uhlo_slow_missing", natr=natr, uhlo_fast=uhlo_fast,
+                        details={"slow_bars": len(slow)})
+
+    color = classify_color(uhlo_fast, uhlo_slow)
+    if color == "none":
+        return Decision(False, "uhlo_no_color", natr=natr,
+                        uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow)
+
+    return Decision(True, "", color=color, natr=natr,
+                    uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow)
+
+
+def color_to_side(color: str) -> str:
+    return "Buy" if color == "green" else "Sell"
+
+
+# ---------------------------------------------------------------------------
+# Состояние по символу
+# ---------------------------------------------------------------------------
+
+class SymbolState:
+    """Окна закрытых свечей и цвет, на котором монета уже отстрелялась."""
+
+    def __init__(self, fast_cap: int, slow_cap: int):
+        self.fast: deque[list] = deque(maxlen=fast_cap)
+        self.slow: deque[list] = deque(maxlen=slow_cap)
+        self.last_color = "none"
+        self.last_signal_ms = 0
+
+    def push(self, tf: str, row: list) -> bool:
+        """Добавляет закрытую свечу. False, если свеча не новая.
+
+        Дедупликация обязательна: Bybit повторяет закрытый kline снапшотом
+        после переподписки, а REST-прогрев пересекается с потоком. Без неё
+        одна свеча попала бы в окно дважды и исказила NATR.
+        """
+        buf = self.fast if tf == "fast" else self.slow
+        if buf:
+            last_start = buf[-1][0]
+            if row[0] < last_start:
+                return False
+            if row[0] == last_start:
+                buf[-1] = row  # уточнение той же свечи
+                return False
+        buf.append(row)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Журнал событий (JSONL)
+# ---------------------------------------------------------------------------
+
+class Journal:
+    """Машиночитаемый журнал: одна строка JSON на событие."""
+
+    def __init__(self, path: str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        self._f = open(path, "a", buffering=1, encoding="utf-8")
+
+    def write(self, kind: str, **fields: Any) -> None:
+        # kind и ts выставляются последними: иначе поле с таким же именем в
+        # fields молча перезаписало бы их, и строка перестала бы разбираться.
+        record = dict(fields)
+        record["kind"] = kind
+        record["ts"] = int(time.time() * 1000)
+        try:
+            self._f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.exception("не удалось записать событие в журнал")
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._f.close()
+
+
+# ---------------------------------------------------------------------------
+# REST-помощники
+# ---------------------------------------------------------------------------
+
+def _bybit_get(base: str, path: str, params: dict[str, Any], retries: int = 3) -> dict:
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        if attempt:
+            time.sleep(min(8.0, 0.5 * 2 ** attempt) * (0.7 + 0.6 * random.random()))
+        try:
+            r = requests.get(f"{base}{path}", params=params, timeout=15)
+            r.raise_for_status()
+            body = r.json()
+            if body.get("retCode") != 0:
+                raise RuntimeError(f"retCode={body.get('retCode')} {body.get('retMsg')}")
+            return body["result"]
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"GET {path} не удался после {retries + 1} попыток: {last_err}")
+
+
+def fetch_instruments(base: str) -> dict[str, dict]:
+    """Инструменты USDT-перпетуалов с ограничениями (плечо, шаг лота, шаг цены)."""
+    out: dict[str, dict] = {}
+    cursor: str | None = None
+    while True:
+        params: dict[str, Any] = {"category": "linear", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        res = _bybit_get(base, "/v5/market/instruments-info", params)
+        for it in res.get("list", []):
+            if it.get("contractType") != "LinearPerpetual" or it.get("quoteCoin") != "USDT":
+                continue
+            out[it["symbol"]] = {
+                "status": it.get("status"),
+                "max_leverage": float(it["leverageFilter"]["maxLeverage"]),
+                "qty_step": float(it["lotSizeFilter"]["qtyStep"]),
+                "min_qty": float(it["lotSizeFilter"]["minOrderQty"]),
+                "tick_size": float(it["priceFilter"]["tickSize"]),
+            }
+        cursor = res.get("nextPageCursor") or None
+        if not cursor:
+            return out
+
+
+def fetch_turnover(base: str) -> dict[str, float]:
+    res = _bybit_get(base, "/v5/market/tickers", {"category": "linear"})
+    return {t["symbol"]: float(t.get("turnover24h") or 0) for t in res.get("list", [])}
+
+
+def fetch_klines(base: str, symbol: str, interval: str, limit: int) -> list[list]:
+    """Закрытые свечи, от старых к новым.
+
+    Bybit отдаёт список от новых к старым и включает текущую незакрытую свечу —
+    её отбрасываем, иначе неполный бар занизит NATR и сдвинет UHLO.
+    """
+    res = _bybit_get(base, "/v5/market/kline",
+                     {"category": "linear", "symbol": symbol, "interval": interval,
+                      "limit": min(1000, limit + 1)})
+    interval_ms = int(interval) * 60_000
+    now_ms = int(time.time() * 1000)
+    rows = [[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])] for r in res.get("list", [])]
+    closed = [r for r in rows if r[0] + interval_ms <= now_ms]
+    closed.sort(key=lambda r: r[0])
+    return closed[-limit:]
+
+
+def check_clock_skew(cfg: Config) -> int:
+    """Расхождение часов с биржей (FR-032).
+
+    Проверяются оба контура: по mainnet-времени скринер ставит метки сигналов,
+    а по testnet-времени бот подписывает ордера. Расхождение на Android после
+    сна — обычное дело, и без явной проверки оно выглядит как серия отказов
+    биржи с непрозрачной причиной.
+    """
+    worst = 0
+    for name, base in (("mainnet", MAINNET_REST), ("testnet", TESTNET_REST)):
+        sent = time.time() * 1000
+        res = _bybit_get(base, "/v5/market/time", {})
+        received = time.time() * 1000
+        server_ms = int(res["timeNano"]) / 1e6
+        skew = int(server_ms + (received - sent) / 2 - received)
+        logger.info("сдвиг часов относительно %s: %d мс", name, skew)
+        if abs(skew) > abs(worst):
+            worst = skew
+    if abs(worst) > cfg.max_clock_skew_ms:
+        raise RuntimeError(
+            f"часы устройства расходятся с биржей на {worst} мс "
+            f"(допустимо {cfg.max_clock_skew_ms}); синхронизируйте время до торговли"
+        )
+    return worst
+
+
+# ---------------------------------------------------------------------------
+# Скринер
+# ---------------------------------------------------------------------------
+
+class Screener:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.journal = Journal(cfg.journal_path)
+        self.states: dict[str, SymbolState] = {}
+        self.instruments: dict[str, dict] = {}
+        self.symbols: list[str] = []
+        self.skew_ms = 0
+        self._stop = asyncio.Event()
+        self._fast_cap = max(cfg.natr_period + 2, cfg.uhlo_length * 2 + 2)
+        self._slow_cap = cfg.uhlo_length * 2 + 2
+
+    def now_ms(self) -> int:
+        return int(time.time() * 1000) + self.skew_ms
+
+    def state(self, symbol: str) -> SymbolState:
+        st = self.states.get(symbol)
+        if st is None:
+            st = SymbolState(self._fast_cap, self._slow_cap)
+            self.states[symbol] = st
+        return st
+
+    # ── подготовка ─────────────────────────────────────────────────────────
+
+    async def build_universe(self) -> list[str]:
+        """Топ по обороту, торгуемые и на mainnet, и на Testnet."""
+        mainnet, testnet, turnover = await asyncio.gather(
+            asyncio.to_thread(fetch_instruments, MAINNET_REST),
+            asyncio.to_thread(fetch_instruments, TESTNET_REST),
+            asyncio.to_thread(fetch_turnover, MAINNET_REST),
+        )
+        self.instruments = mainnet
+
+        ranked = sorted(turnover.items(), key=lambda kv: kv[1], reverse=True)
+        selected: list[str] = []
+        for symbol, turn in ranked:
+            info = mainnet.get(symbol)
+            if info is None:
+                continue
+            reason = None
+            if info["status"] != "Trading":
+                reason = "not_trading"
+            elif symbol not in testnet:
+                # Самая коварная из отсечённых причин: символ есть на mainnet,
+                # сигнал по нему выглядит нормальным, а ордер на Testnet
+                # обречён — и это попало бы в статистику как ошибка исполнения.
+                reason = "not_on_testnet"
+            elif testnet[symbol]["status"] != "Trading":
+                reason = "not_trading_on_testnet"
+            elif info["max_leverage"] < self.cfg.required_leverage:
+                reason = "max_leverage_below_required"
+            if reason:
+                self.journal.write("universe_reject", symbol=symbol, reason=reason,
+                                   turnover24h=turn)
+                continue
+            selected.append(symbol)
+            if len(selected) >= self.cfg.top_n_turnover:
+                break
+
+        if not selected:
+            raise RuntimeError("вселенная пуста — проверьте фильтры конфигурации")
+        logger.info("вселенная: %d символов, порог оборота %.0f USDT",
+                    len(selected), turnover.get(selected[-1], 0))
+        return selected
+
+    async def seed_history(self, symbols: Sequence[str] | None = None) -> None:
+        """Перечитывает окна свечей из REST: WS отдаёт только новые свечи.
+
+        Окна ЗАМЕНЯЮТСЯ, а не дополняются. После обрыва в буфере остаётся дыра,
+        а push() отбрасывает всё, что старше последней свечи, — доклейка молча
+        оставила бы разрывную историю, по которой NATR и UHLO считаются неверно.
+        """
+        targets = list(symbols if symbols is not None else self.symbols)
+        sem = asyncio.Semaphore(self.cfg.seed_concurrency)
+        failures = 0
+
+        async def one(symbol: str) -> None:
+            nonlocal failures
+            async with sem:
+                try:
+                    fast, slow = await asyncio.gather(
+                        asyncio.to_thread(fetch_klines, MAINNET_REST, symbol,
+                                          self.cfg.tf_fast, self._fast_cap),
+                        asyncio.to_thread(fetch_klines, MAINNET_REST, symbol,
+                                          self.cfg.tf_slow, self._slow_cap),
+                    )
+                except Exception as e:
+                    # Символ не теряется: историю доберёт из потока, до тех пор
+                    # будет отсекаться как insufficient_history.
+                    failures += 1
+                    self.journal.write("seed_failed", symbol=symbol, error=str(e))
+                    return
+                st = self.state(symbol)
+                st.fast.clear()
+                st.slow.clear()
+                for row in fast:
+                    st.push("fast", row)
+                for row in slow:
+                    st.push("slow", row)
+
+        await asyncio.gather(*(one(s) for s in targets))
+        logger.info("история прочитана для %d символов, неудач: %d", len(targets), failures)
+
+    # ── поток ──────────────────────────────────────────────────────────────
+
+    def _shards(self) -> list[list[str]]:
+        per_conn = max(1, self.cfg.ws_topics_per_conn // 2)  # 2 топика на символ
+        return [self.symbols[i:i + per_conn] for i in range(0, len(self.symbols), per_conn)]
+
+    async def run(self) -> None:
+        self.skew_ms = await asyncio.to_thread(check_clock_skew, self.cfg)
+        self.symbols = await self.build_universe()
+
+        started = self.now_ms()
+        self.journal.write("stream_down", cause="startup", symbols=len(self.symbols))
+        await self.seed_history()
+        self.journal.write("stream_up", cause="startup", duration_ms=self.now_ms() - started,
+                           symbols=len(self.symbols))
+
+        shards = self._shards()
+        logger.info("подписка: %d символов в %d соединениях", len(self.symbols), len(shards))
+        await asyncio.gather(*(self._shard_loop(i, group) for i, group in enumerate(shards)))
+
+    async def _shard_loop(self, index: int, group: list[str]) -> None:
+        attempt = 0
+        # None, а не текущее время: интервал от старта до первого подключения уже
+        # учтён парой stream_down/stream_up с причиной startup. Иначе первое же
+        # соединение писало бы ещё один stream_up без парного stream_down, и
+        # стартовая пауза попадала бы в сумму «слепого» времени дважды.
+        down_since: int | None = None
+        while not self._stop.is_set():
+            try:
+                async with ws_connect(MAINNET_WS, ping_interval=None,
+                                      open_timeout=20, close_timeout=5,
+                                      max_queue=2048) as ws:
+                    attempt = 0
+                    # Подписка раньше перечитывания истории: иначе свечи,
+                    # закрывшиеся во время чтения REST, будут потеряны.
+                    await self._subscribe(ws, group)
+                    if down_since is not None:
+                        outage_ms = self.now_ms() - down_since
+                        if outage_ms > self.cfg.reseed_after_sec * 1000:
+                            logger.info("shard#%d: обрыв %.0f с — перечитываю историю",
+                                        index, outage_ms / 1000)
+                            await self.seed_history(group)
+                        # stream_up пишется только после оформления подписки и
+                        # (при необходимости) перечитывания истории: «слепой»
+                        # интервал закрывается, когда данные реально пошли,
+                        # а не в момент открытия TCP-соединения. Если на этом
+                        # участке будет ошибка, down_since не сброшен — и интервал
+                        # останется одним непрерывным, без лишней пары down/up.
+                        self.journal.write("stream_up", shard=index, symbols=group,
+                                           duration_ms=outage_ms, cause="reconnect")
+                        down_since = None
+                    await self._pump(ws, index)
+            except Exception as e:
+                if self._stop.is_set():
+                    return
+                if down_since is None:
+                    down_since = self.now_ms()
+                    # Интервал недоступности потока: сигналы, которые могли бы
+                    # возникнуть внутри него, не считаются пропущенными.
+                    self.journal.write("stream_down", shard=index, symbols=group,
+                                       cause="disconnect", error=str(e))
+                attempt += 1
+                delay = min(60.0, 1.0 * 2 ** (attempt - 1)) * (0.7 + 0.6 * random.random())
+                logger.warning("shard#%d: обрыв (%s), переподключение через %.1f с (попытка %d)",
+                               index, e, delay, attempt)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
+
+    async def _subscribe(self, ws, group: Iterable[str]) -> None:
+        topics = []
+        for s in group:
+            topics.append(f"kline.{self.cfg.tf_fast}.{s}")
+            topics.append(f"kline.{self.cfg.tf_slow}.{s}")
+        batch = self.cfg.ws_subscribe_batch
+        for i in range(0, len(topics), batch):
+            await ws.send(json.dumps({"op": "subscribe", "args": topics[i:i + batch]}))
+
+    async def _pump(self, ws, index: int) -> None:
+        """Приём сообщений с ping и сторожем тишины.
+
+        Сторож нужен именно на Android: после сна устройства соединение часто
+        остаётся «открытым», но данные по нему не идут. Без него скринер молча
+        ослепнет, а прогон будет выглядеть успешным.
+        """
+        async def pinger() -> None:
+            while True:
+                await asyncio.sleep(self.cfg.ws_ping_sec)
+                await ws.send(json.dumps({"op": "ping"}))
+
+        ping_task = asyncio.create_task(pinger())
+        try:
+            while not self._stop.is_set():
+                raw = await asyncio.wait_for(ws.recv(), timeout=self.cfg.ws_stale_sec)
+                self._on_message(raw)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"нет сообщений {self.cfg.ws_stale_sec} с — соединение мёртвое")
+        finally:
+            ping_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ping_task
+
+    def _on_message(self, raw: str | bytes) -> None:
+        try:
+            msg = json.loads(raw)
+        except Exception:
+            return
+        if msg.get("op") == "subscribe" and msg.get("success") is False:
+            logger.warning("подписка отклонена: %s", msg.get("ret_msg"))
+            return
+        topic = msg.get("topic")
+        if not topic or not msg.get("data"):
+            return
+        parts = topic.split(".")
+        if len(parts) != 3 or parts[0] != "kline":
+            return
+        _, interval, symbol = parts
+        tf = "fast" if interval == self.cfg.tf_fast else "slow" if interval == self.cfg.tf_slow else None
+        if tf is None:
+            return
+
+        st = self.state(symbol)
+        for item in msg["data"]:
+            try:
+                if item.get("confirm") is not True:
+                    continue  # только закрытые свечи
+                row = [int(item["start"]), float(item["open"]), float(item["high"]),
+                       float(item["low"]), float(item["close"])]
+                if not row[3] > 0:
+                    continue
+                is_new = st.push(tf, row)
+            except Exception as e:
+                # Один битый элемент не должен ронять весь шард: исключение из
+                # цикла recv превращалось бы в фиктивный обрыв соединения и
+                # лишний «слепой» интервал на 72-часовом прогоне.
+                logger.warning("битое сообщение kline %s/%s: %s", symbol, interval, e)
+                self.journal.write("error", where="on_message", symbol=symbol, error=str(e))
+                continue
+            # Решение принимается только на закрытии свечи МЛАДШЕГО ТФ:
+            # старший лишь подтверждает направление.
+            if is_new and tf == "fast":
+                task = asyncio.create_task(self._on_fast_close(symbol, st, row))
+                # Без этого исключение в задаче уходит в «Task exception was
+                # never retrieved» и за 72 часа теряется вместе с причиной.
+                task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("ошибка обработки закрытой свечи", exc_info=exc)
+            self.journal.write("error", where="on_fast_close", error=str(exc))
+
+    # ── решение и отправка ─────────────────────────────────────────────────
+
+    async def _on_fast_close(self, symbol: str, st: SymbolState, trigger: list) -> None:
+        ts = self.now_ms()
+        fast = list(st.fast)
+        slow = list(st.slow)
+        d = evaluate(fast, slow, self.cfg)
+
+        if not d.passed:
+            self._log_reject(symbol, d.reason, ts, d.details)
+            if d.reason in ("uhlo_no_color", "uhlo_slow_missing"):
+                # Сброс цвета — то, чего не хватало в исходной версии: без него
+                # монета, побывавшая в none, больше никогда не выдаёт сигнал.
+                st.last_color = "none"
+            return
+
+        if d.color == st.last_color:
+            self._log_reject(symbol, "repeat_color", ts, {"color": d.color})
+            return
+
+        if ts - st.last_signal_ms < self.cfg.cooldown_sec * 1000:
+            # Цвет не фиксируем: после паузы сигнал должен состояться.
+            self._log_reject(symbol, "cooldown", ts,
+                             {"since_last_signal_ms": ts - st.last_signal_ms})
+            return
+
+        interval_ms = int(self.cfg.tf_fast) * 60_000
+        payload = {
+            "source": "local_screener",
+            "signal_id": f"{symbol}:{self.cfg.tf_fast}:{trigger[0]}",
+            "symbol": symbol,
+            "side": color_to_side(d.color),
+            "mode": "DCA",
+            # Цена и метка времени — без них бот не посчитает ни задержку,
+            # ни проскальзывание. Цена mainnet; свою Testnet-цену на момент
+            # получения бот пишет сам, тогда проскальзывание разложимо на
+            # базис контуров и собственно исполнение.
+            "price": trigger[4],
+            "price_venue": "bybit_mainnet",
+            "ts": ts,
+            "diagnostics": {
+                "natr": round(d.natr, 4) if d.natr is not None else None,
+                "uhlo_1m": d.uhlo_fast,
+                "uhlo_15m": d.uhlo_slow,
+                "color": d.color,
+                "candle_start": trigger[0],
+                "detection_lag_ms": ts - (trigger[0] + interval_ms),
+            },
+        }
+
+        ok, info = await asyncio.to_thread(self._post_signal, payload)
+        if ok:
+            # Состояние продвигается ТОЛЬКО после успешной доставки: иначе
+            # потерянный POST терял сигнал до следующей смены цвета.
+            st.last_color = d.color
+            st.last_signal_ms = ts
+            self.journal.write("signal_sent", status="sent", signal=payload)
+            logger.info("сигнал %s %s natr=%.2f lag=%d мс",
+                        symbol, payload["side"], d.natr or 0.0,
+                        payload["diagnostics"]["detection_lag_ms"])
+        else:
+            self.journal.write("signal_failed", status="delivery_failed", error=info, signal=payload)
+            logger.error("сигнал %s не доставлен: %s", symbol, info)
+
+    def _post_signal(self, payload: dict) -> tuple[bool, str]:
+        url = f"{self.cfg.bot_api_url}/signal"
+        last = ""
+        for attempt in range(self.cfg.post_retries + 1):
+            if attempt:
+                time.sleep(min(2.0, 0.2 * 2 ** attempt))
+            try:
+                r = requests.post(url, json=payload, timeout=5)
+                if 200 <= r.status_code < 300:
+                    return True, r.text[:200]
+                last = f"HTTP {r.status_code}: {r.text[:200]}"
+            except requests.RequestException as e:
+                last = str(e)
+        return False, last
+
+    def _log_reject(self, symbol: str, reason: str, ts: int, details: dict) -> None:
+        mode = self.cfg.reject_log
+        if mode == "none":
+            return
+        if mode == "candidates" and reason in NOISE_REASONS:
+            return
+        self.journal.write("reject", symbol=symbol, reason=reason, at=ts, details=details)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
+
+async def amain() -> int:
+    cfg = load_config()
+    logger.info("скринер запущен: NATR %.2f..%.2f (период %d), UHLO %d, ТФ %s/%s, топ-%d по обороту",
+                cfg.natr_min, cfg.natr_max, cfg.natr_period, cfg.uhlo_length,
+                cfg.tf_fast, cfg.tf_slow, cfg.top_n_turnover)
+
+    screener = Screener(cfg)
+    loop = asyncio.get_running_loop()
+    for sig in (os_signal.SIGINT, os_signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, screener.stop)
+
+    try:
+        await screener.run()
+        return 0
+    except Exception:
+        logger.exception("скринер остановлен из-за ошибки")
+        return 1
+    finally:
+        screener.journal.close()
+
+
+def main() -> None:
+    raise SystemExit(asyncio.run(amain()))
+
+
+if __name__ == "__main__":
+    main()

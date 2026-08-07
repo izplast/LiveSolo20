@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Рантайм-журналы и инбокс сигналов
+logs/
+signals_inbox.json
+
+# Виртуальные окружения
+.venv/
+.venv-screener/
+
+# Локальные настройки инструментов
+.claude/settings.local.json
