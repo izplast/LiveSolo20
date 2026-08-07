@@ -25,9 +25,16 @@ JSONL: одна строка JSON на событие, поля `kind` и `ts` �
 | signal_received | `signal_id, symbol, price_mainnet, price_testnet, ts_signal` |
 | signal_rejected | `signal_id, reason` — `duplicate | limit | exchange_limits | error` |
 | order_filled | `signal_id, cycle_id, symbol, role (entry|dca|close), mode (entry|adjust|close), expected_price, avg_fill_price, ts_signal, ts_confirmed` |
-| cycle_opened | `cycle_id, symbol` |
-| cycle_closed | `cycle_id, symbol, exit_reason (take_profit|time_exit|manual), pnl` |
+| cycle_opened | `cycle_id, symbol, open_ts` — открытие цикла: `open_ts` — точная метка начала цикла (epoch-мс, момент приёма сигнала, по которому бот завёл цикл) |
+| cycle_recovered | `cycle_id, symbol, open_ts` — восстановленный после перезапуска цикл; `open_ts` берётся из `createdTime` позиции |
+| cycle_closed | `cycle_id, symbol, exit_reason (take_profit|hard_sl|trailing|time_exit|manual), pnl, open_ts, close_ts, duration_ms` — `close_ts` — точная метка закрытия, `duration_ms = close_ts − open_ts` (длительность удержания) |
+| trail_activated | `cycle_id, symbol, avg_price, trigger_pct, peak_price, trail_level` — трейлинг-тейк-профит достиг порога прибыли; после этого выход при откате на `trail_step_pct` от пика |
 | stream_down / stream_up | «слепые» интервалы бота |
+
+`open_ts`/`close_ts` — epoch-мс на часовой шкале биржи (с поправкой `skew_ms`), а
+не метка записи события. Сводка (`tools/stats_summary.py`) считает длительность
+удержания именно по ним, поэтому оба поля обязаны попадать в журнал, а не только
+в текстовый `bot.log`.
 
 ## Правила
 

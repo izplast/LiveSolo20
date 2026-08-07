@@ -172,6 +172,108 @@ screener:
 
 
 
+## Метки времени цикла, сводка и healthcheck (2026-08-07)
+
+Три добавки к рабочей копии `~/bybit-dca-bot` (зеркало — этот репозиторий).
+
+### 1. Точное время начала и окончания цикла в структурированный журнал
+
+`core/main_bot.py` и `core/monitor.py` теперь пишут в `logs/bot-events.jsonl`
+(ключ `bot.journal_path`) явные метки, а не только строки в `bot.log`:
+
+- `cycle_opened` → добавлено поле `open_ts` (epoch-мс начала цикла);
+- `cycle_recovered` → добавлено поле `open_ts` (из `createdTime` позиции);
+- `cycle_closed` → добавлены `open_ts`, `close_ts` и `duration_ms`
+  (`close_ts − open_ts`), `held_sec` сохранён для обратной совместимости.
+
+Пример закрытия (TP/SL/time_exit/manual — все пути идут через
+`Monitor._handle_vanished`):
+
+```json
+{"kind":"cycle_closed","cycle_id":"C1","symbol":"BTCUSDT","exit_reason":"take_profit",
+ "pnl":0.64,"open_ts":1753960860123,"close_ts":1753961400000,
+ "duration_ms":539877,"held_sec":539,"ts":1753961400000}
+```
+
+### 2. `tools/stats_summary.py` — сводка по закрытым циклам
+
+Читает `logs/bot-events.jsonl` и печатает: сколько циклов закрыто, разбивку по
+причине (TP / SL / time_exit / manual), совокупный PnL в USDT, win-rate
+(прибыльный = pnl > 0, как в `tools/backtest.py`), среднюю/медианную/min/max
+длительность удержания и (опционально) разбивку по символам. Период фильтруется
+по моменту закрытия.
+
+```bash
+python3 tools/stats_summary.py                        # всё время
+python3 tools/stats_summary.py --days 7               # последние 7 суток
+python3 tools/stats_summary.py --days 7 --by-symbol   # + по символам
+python3 tools/stats_summary.py --json                 # машиночитаемо
+```
+
+Старые записи без полей `open_ts/close_ts/duration_ms` тоже разбираются: моменты
+берутся из `ts` событий, цикл связывается с `cycle_opened` по `cycle_id`.
+События с `pnl: null` учитываются в счётчиках, но не в PnL и win-rate (их число
+выводится как «циклов_с_pnl»).
+
+### 3. `tools/healthcheck.sh` — проверка живости бота
+
+Дёргает `http://localhost:8000/health`, пишет строку с timestamp в
+`logs/healthcheck.log` (по умолчанию `<бот>/logs/`, переопределяется через
+`HEALTHCHECK_LOG`). Провал помечается явным `FAIL` и возвращает ненулевой код
+выхода (код `curl`), чтобы его было легко поймать и найти в логе. Режимы:
+
+```bash
+tools/healthcheck.sh                                # разовый запуск
+tools/healthcheck.sh --daemon-interval 300          # фоновый цикл (фоллбэк без cron)
+```
+
+Периодический запуск в Termux:
+- **termux-job-scheduler** (`pkg install termux-api`):
+  `termux-job-scheduler --script "$HOME/bybit-dca-bot/tools/healthcheck.sh" --interval-ms 300000 --persisted true`;
+- **cron** (`pkg install cronie termux-services`, затем `sv-enable crond`, `crontab -e`
+  → `*/5 * * * * ~/bybit-dca-bot/tools/healthcheck.sh`);
+- **демон-цикл** без зависимостей: `nohup ... healthcheck.sh --daemon-interval 300 &`.
+
+В любом варианте держать Termux под `termux-wake-lock`, иначе Android усыпит
+устройство и проверка вместе с ботом не будут выполняться.
+
+Автопроверки: `reference/test_cycle_journal.py` (17) и `reference/test_stats_summary.py`
+(20) — без сети, без pytest, как и остальные тесты репозитория.
+
+## Трейлинг-тейк-профит (2026-08-07)
+
+Новые параметры `dca.trail_trigger_pct` (порог активации, % прибыли от средней
+цены входа; `0` — выключен) и `dca.trail_step_pct` (откат от пика цены, %).
+Когда прибыль достигает порога, монитор включает трейлинг: уровень выхода
+тащится за пиком цены и закрывает цикл при откате на `trail_step_pct` от пика
+(причина выхода `trailing`). Обычный `take_profit_pct` остаётся фолбэком — если
+пик не поднялся выше него, срабатывает обычный тейк.
+
+Реализация (рабочая копия `~/bybit-dca-bot`):
+
+- `core/dca_strategy.py`: поля `trail_trigger_pct`/`trail_step_pct` в `DcaParams`,
+  чтение из конфига, помощник `trail_exit_price` (уровень выхода от пика: для
+  лонга ниже пика, для шорта выше).
+- `core/main_bot.py`: состояние трейлинга в `Cycle` (`peak_price`,
+  `trail_active`, `trail_level`), пик инициализируется ценой входа; поля в
+  `status()` (`trail_active`, `trail_peak`, `trail_level`) и в `bot_started`.
+- `core/monitor.py`: проверка трейлинга в `_check_cycle` между тейк-профитом и
+  докупкой; активация пишет событие `trail_activated`; при росте пика биржевой
+  тейк переносится за уровень выхода (`refresh_take_profit(symbol, trail_level)`),
+  чтобы после смерти процесса позиция всё равно закрылась по трейлингу; докупка
+  сбрасывает состояние трейлинга (средняя сместилась, пик устарел); исчезновение
+  позиции при активном трейлинге без нашей команды трактуется как выход
+  `trailing` (на бирже стоит именно его уровень, а не обычный тейк).
+
+Причины выхода: `cycle_closed.exit_reason` дополнена значением `trailing`;
+`tools/stats_summary.py` разбирает его отдельной строкой «по трейлингу».
+
+Поведение: трейлинг проверяется раньше докупки — после активации откат закрывает
+цикл, а не ведёт к усреднению. В худшем случае трейлинг оставляет прибыль
+`trail_trigger_pct − trail_step_pct` выше средней. Тесты: `tests/test_bot.py`
+(активация, подтягивание уровня за пиком, закрытие по откату, шорт, порог 0,
+поля статуса).
+
 ## Что осталось непроверенным
 
 Исполнением проверены только чистая логика и поведение отправки: 48 проверок в `test_screener.py` (заглушки вместо `requests` и `websockets`, сеть не нужна). **Не проверялись**: подписка и разбор реальных сообщений WS Bybit, пагинация `instruments-info`, формат `turnover24h`, поведение при реальном обрыве сети, расход CPU и батареи в Termux при ~300 символах и 600 подписках.
