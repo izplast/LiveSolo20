@@ -495,6 +495,57 @@ requests): активация Dynamic SL после Level 2 (и её отсут�
 `tests/test_screener_spread.py` 37 ok, `tests/test_risk_controls.py` 25 ok —
 суммарно 440 ok, 0 fail.
 
+## Rank-фильтр ликвидности (MAX_VOLUME_RANK), TUTUSDT-блэклист и кулдаун 240 мин (2026-08-08)
+
+Три правки конфигурации и кода рабочей копии `~/bybit-dca-bot`.
+
+### 1. Rank-фильтр по 24h обороту (Top Volume Rank)
+
+Скринер берёт только первые `MAX_VOLUME_RANK = 600` монет по 24h обороту Bybit
+(Turnover) и полностью игнорирует символы с рангом выше порога. Ранг — позиция
+символа в списке `/v5/market/tickers`, отсортированном по `turnover24h` убыванием.
+
+- `core/screener.py`: константа `MAX_VOLUME_RANK = 600`, поле `Config.max_volume_rank`
+  (0 — фильтр выключен), чистая функция `volume_rank_exceeded(cfg, volume_rank)`,
+  валидация (отрицательное значение отклоняется). В `build_universe` фильтр
+  применяется двумя проходами: сначала все символы с рангом > порога помечаются
+  (метка в логе `[rank-filter] SYM rank X > N`, событие `universe_reject` с
+  `reason: volume_rank_exceeded`), затем отбор идёт по первым `max_volume_rank`.
+- `config/config.yml` (секция `screener`): `max_volume_rank: 600`.
+- Тесты: `tests/test_screener.py` (+6) — константа и дефолт 600, ранг 600 в
+  пределах порога / 601 отсечён, `0` выключает фильтр, отрицательный порог
+  отвергается валидацией, TUTUSDT в `symbol_blacklist` даёт `blacklisted_symbol`.
+
+### 2. TUTUSDT в symbol_blacklist
+
+`config/config.yml`: `symbol_blacklist: ["TUTUSDT"]` — ранее внесён владельцем,
+сохранён в конфиге (монета больше не попадает в пул скринера).
+
+### 3. Кулдаун после стоп-выхода увеличен до 240 минут
+
+`config/config.yml` (секция `dca`): `sl_cooldown_hours: 4` (= 240 мин вместо 120).
+Параметр остаётся `SL_COOLDOWN_MIN = 240` в минутах эквивалентно.
+
+## healthcheck.sh: автоперезапуск скринера (2026-08-08)
+
+`tools/healthcheck.sh` раньше проверял только HTTP-эндпоинт бота. Теперь:
+
+- `check_screener()` — проверяет процесс `core/screener.py` через
+  `ps aux | grep -v grep | grep screener.py`;
+- если процесс отсутствует — `restart_screener()` поднимает его автоматически
+  (`( cd <бот> && setsid nohup .venv/bin/python core/screener.py >> logs/screener-stdout.log 2>&1 < /dev/null & )`,
+  двойной форк через подоболочку, отдельная сессия `setsid`);
+- в `logs/healthcheck.log` пишутся `SCREENER OK` / `SCREENER DOWN` /
+  `SCREENER RESTART` / `SCREENER FAIL`;
+- код выхода разового запуска: 0 — всё в порядке, код curl при падении бота,
+  2 — скринер был поднят заново или не смог стартовать; отключается через
+  `HEALTHCHECK_SCREENER=0`;
+- оба варианта запуска (разовый и `--daemon-interval`) проверяют и скринер.
+
+Проверено вручную: остановка скринера → `SCREENER DOWN` → `SCREENER RESTART`,
+процесс поднят с новым кодом (205 записей `[rank-filter]` при старте, вселенная
+100 символов), `exit=0` при живом скринере.
+
 ## Что осталось непроверенным
 
 Исполнением проверены только чистая логика и поведение отправки: 48 проверок в `test_screener.py` (заглушки вместо `requests` и `websockets`, сеть не нужна). **Не проверялись**: подписка и разбор реальных сообщений WS Bybit, пагинация `instruments-info`, формат `turnover24h`, поведение при реальном обрыве сети, расход CPU и батареи в Termux при ~300 символах и 600 подписках.
