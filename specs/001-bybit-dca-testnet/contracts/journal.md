@@ -27,8 +27,9 @@ JSONL: одна строка JSON на событие, поля `kind` и `ts` �
 | order_filled | `signal_id, cycle_id, symbol, role (entry|dca|close), mode (entry|adjust|close), expected_price, avg_fill_price, ts_signal, ts_confirmed` |
 | cycle_opened | `cycle_id, symbol, open_ts` — открытие цикла: `open_ts` — точная метка начала цикла (epoch-мс, момент приёма сигнала, по которому бот завёл цикл) |
 | cycle_recovered | `cycle_id, symbol, open_ts` — восстановленный после перезапуска цикл; `open_ts` берётся из `createdTime` позиции |
-| cycle_closed | `cycle_id, symbol, exit_reason (take_profit|hard_sl|trailing|time_exit|manual), pnl, open_ts, close_ts, duration_ms` — `close_ts` — точная метка закрытия, `duration_ms = close_ts − open_ts` (длительность удержания) |
+| cycle_closed | `cycle_id, symbol, exit_reason (take_profit|hard_sl|be_stop|trailing|time_exit|manual), pnl, open_ts, close_ts, duration_ms` — `close_ts` — точная метка закрытия, `duration_ms = close_ts − open_ts` (длительность удержания). `be_stop` — выход по стопу безубытка в режиме Smart Timeout (break_even) |
 | trail_activated | `cycle_id, symbol, avg_price, trigger_pct, peak_price, trail_level` — трейлинг-тейк-профит достиг порога прибыли; после этого выход при откате на `trail_step_pct` от пика |
+| timeout_smart | `cycle_id, symbol, mode (break_even|passive_wait), held_sec, avg_price, price, gross_pnl_pct, net_pnl_pct, be_stop, be_fee_pct, threshold_pct, dca_locked` — Smart Timeout (FR-014): истёк `max_hold_hours`, позиция НЕ сбрасывается по рынку. `break_even` — прибыль после комиссий выше порога, стоп подтянут к безубытку `be_stop`; `passive_wait` — просадка, доливки запрещены (`dca_locked: true`), ждём TP или Hard SL |
 | stream_down / stream_up | «слепые» интервалы бота |
 
 `open_ts`/`close_ts` — epoch-мс на часовой шкале биржи (с поправкой `skew_ms`), а
