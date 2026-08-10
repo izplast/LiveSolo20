@@ -584,3 +584,84 @@ TP растёт с глубиной лестницы: каждая доливк�
 Исполнением проверены только чистая логика и поведение отправки: 48 проверок в `test_screener.py` (заглушки вместо `requests` и `websockets`, сеть не нужна). **Не проверялись**: подписка и разбор реальных сообщений WS Bybit, пагинация `instruments-info`, формат `turnover24h`, поведение при реальном обрыве сети, расход CPU и батареи в Termux при ~300 символах и 600 подписках.
 
 Первое, что стоит сделать на устройстве: запустить на 15–20 минут с `top_n_turnover: 20` и убедиться по `logs/screener-events.jsonl`, что приходят закрытые свечи по обоим ТФ, считается NATR, а `detection_lag_ms` держится в пределах десятков-сотен миллисекунд. Только после этого поднимать вселенную до 300 и запускать 72-часовой прогон.
+
+## Mock-исполнение, DCA-цикл и полный конвейер в reference (2026-08-10)
+
+Автономный симулятор исполнения без сети и зависимостей: снапшотный матчинг
+ордеров, драйвер DCA-цикла на нём и интеграционные проверки со скринером.
+Исполнение честно по трём осям — символ, price-time приоритет, защита
+`EPSILON` от микрофиллов; все филлы TAKER (снапшотный матчинг не моделирует
+resting-ордера).
+
+- **`reference/mock_execution.py`** — контракт движка: чистая
+  `match_snapshot_pure(symbol, orderbook, active_orders, maker_fee, taker_fee)`
+  → `(fills, новое состояние)` без мутации входов; `MockExecutionManager`
+  (создание ордеров с bounded-кэшем `client_ids`, `apply_snapshot` с переносом
+  завершённых ордеров в `history`, `cancel_order`, маркет-ордера гасятся по
+  IOC — `expired`/`rejected`); `drain_to_latest(queue, timeout)` — свежий
+  снимок из очереди. ccxt не импортируется на верхнем уровне.
+- **`reference/dca_cycle.py`** — `DcaCycle(params, symbol, side, ...)` на
+  `MockExecutionManager`: `open(стакан, now_ms)` — рыночный вход и построение
+  сетки (TP-лимитка + докупка на `next_level`); `step(стакан, now_ms)` —
+  сведение снимка, разбор филлов (`entry`/`so_N`/`tp_N`/`close_<reason>`),
+  пересчёт TP от средней по эскалации `take_profit_pct_at` (cancel+replace с
+  уникальными `tp_N`), стоп и выход по времени. Параметры — те же
+  `backtest.DcaParams` (лестница с Мартингейлом).
+- **`reference/test_mock_execution.py`** (44), **`reference/test_dca_integration.py`**
+  (38, синтетический стакан: TP после 2 доливок с эскалацией до Level-2, стоп,
+  time_exit, TP без доливок), **`reference/test_full_pipeline.py`** (20,
+  скринер на синтетическом тренде → `Buy` → сетка → доливки на падающем стакане
+  → TP-закрытие). Итог reference-слоя без сети: 235 ok, 0 fail.
+- **`reference/bot.py`** — `take_profit_pct_at(params, level)` (эскалация TP),
+  `backtest.DcaParams` расширен полями `multiplier` и `tp_escalation`.
+- **`reference/book_streamer.py`** — мост «стакан Bybit → симулятор» на
+  стандартной библиотеке: `fetch_orderbook` (REST `/v5/market/orderbook` с
+  ретраями), `parse_orderbook` (float + сортировка уровней под контракт
+  матчинга), `poll_orderbook` (фоновый опрос в `asyncio.Queue`, сбойный
+  backoff, остановка после `max_failures`), `write_record`/`read_records`
+  (JSONL для оффлайн-реплея). **`reference/test_book_streamer.py`** (20) — на
+  поддельном HTTP, без сети.
+- **`reference/bot_config.py`** — маппер конфига бота → `DcaParams` без yaml:
+  `steps→max_docups`, `hard_sl_pct→stop_pct`, `max_hold_hours→max_hold_minutes`,
+  `take_profit_pct→tp_pct`, `tp_escalation`, `multiplier`; минимальный парсер
+  секции `dca` из `config/config.yml` (`read_dca_section`).
+  **`reference/test_bot_config.py`** (26) — разбор реального конфига зеркала.
+- **`reference/run_sim.py`** — CLI «скринер/стакан → симулятор»: `record`
+  (запись стакана), `replay` (прогон `DcaCycle` по записи без сети), `live`
+  (опрос и прогон одновременно). Параметры по умолчанию — из `config/config.yml`
+  бота, переопределяются флагами.
+- **`config/config.yml`** (секция `dca`): добавлен `tp_escalation: [1.2, 1.5, 2.0]`
+  (поуровневый TP), `take_profit_pct: 1.2` остаётся фолбэком.
+
+Проверено на живом стакане BTCUSDT (mainnet): `run_sim record --seconds 75`
+→ 24 снимка, `run_sim replay` открыл цикл по конфигу (TP +1.2% Level-0, стоп
+5%), при `--max-hold-minutes 1` закрыл по времени с PnL −0.097 USDT (спред +
+комиссии) — мост REST → матчинг → сетка работает. Итог reference-слоя: 281 ok,
+0 fail.
+
+## Скринер выбирает направление в run_sim (2026-08-10)
+
+`run_sim` больше не открывает цикл по умолчанию: направление сделки решает
+скринер (`reference/screener.py`), ровно как в связке «скринер → бот». Сторону
+можно переопределить флагом `--side {auto|Buy|Sell}`.
+
+- **`books_to_rows`** — восстановление минутных свечей из снимков стакана
+  (mid-цена снимка, бакет выровнен к началу минуты), чтобы `replay` мог решать
+  по свечам без сети.
+- **`screener_side`/`screener_reason`/`screener_decisions`** — обход решений
+  скринера в том же порядке, в каком он трактует своё состояние (повтор того же
+  цвета не новый сигнал, `uhlo_no_color` сбрасывает направление); возвращается
+  последний валидный цвет → `Buy`/`Sell`. `screener_reason` объясняет, почему
+  направления нет: `insufficient_history {fast_bars, slow_bars}`, фильтр по
+  NATR, `uhlo_no_color`/`uhlo_slow_missing`.
+- **`load_screener_cfg`** — секция `screener` из `config/config.yml` через
+  `bot_config.read_section` (без pyyaml); незнакомые ключи игнорируются.
+- **CLI**: `replay` — направление по восстановленным свечам либо по
+  `--candles CSV`; `live` — прогрев скринера klines с биржи (`--seed-hours`,
+  по умолчанию 6 ч) и при `--universe N` выбор монеты из топ-N по обороту,
+  первой давшей сигнал. Параметры сетки по умолчанию — из конфига бота.
+- **`reference/test_run_sim.py`** (18) — без сети: свечи из стакана (бакеты,
+  OHLC, сортировка), направление скринера на восходящем/нисходящем тренде,
+  флэте и короткой истории, диагностика `screener_reason`, разбор конфига
+  скринера без pyyaml. Итог reference-слоя без сети: 462 ok, 0 fail.
+
