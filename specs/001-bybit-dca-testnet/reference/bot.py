@@ -14,6 +14,11 @@ reference/bot.py — логика ордеров DCA-бота (FR-008…FR-018).
   CLOSE  — закрытие позиции целиком по тейку или выходу по времени
            (FR-012, FR-014): reduce-only на встречной стороне.
 
+Поуровневый тейк-профит (эскалация): процент TP выбирается по числу
+выполненных докупок (уровень = cycle.dca_done) через take_profit_pct_at —
+Level 0 → 1.2%, Level 1 → 1.5%, Level 2 → 2.0%; выше последнего уровня
+удерживается максимум, пустая эскалация — фиксированный take_profit_pct.
+
 Сетевые вызовы передаются инъекцией (callable apply), поэтому поведение
 проверяется заглушками без сети (см. test_bot.py).
 
@@ -102,7 +107,8 @@ def set_take_profit(symbol: str, side: str, avg_entry: float, tp_pct: float,
     Первая установка — режим CLOSE (reduce-only лимит на встречной стороне
     по уровню TP). Повторный вызов после докупки (has_existing=True) — режим
     ADJUST: старый TP-ордер отменяется, выставляется новый на пересчитанном
-    уровне от новой средней цены входа.
+    уровне от новой средней цены входа. Процент выбирает вызывающая сторона
+    по уровню лестницы через take_profit_pct_at (см. поуровневый TP).
     """
     mode = OrderMode.ADJUST if has_existing else OrderMode.CLOSE
     return OrderRequest(
@@ -114,6 +120,29 @@ def set_take_profit(symbol: str, side: str, avg_entry: float, tp_pct: float,
         order_link_id=order_link_id,
         price=tp_price(avg_entry, side, tp_pct, tick_size),
     )
+
+
+def take_profit_pct_at(params, level: int) -> float:
+    """Процент TP для уровня лестницы (эскалация от бэктеста).
+
+    Уровень = число выполненных докупок (`cycle.dca_done`); вход без доливок —
+    Level 0. Уровень N возвращает элемент эскалации (params.tp_escalation),
+    выше последнего удерживается максимум; пустой список — фиксированный
+    params.take_profit_pct (прежнее поведение). Параметр принимается как
+    объект с полями tp_escalation и take_profit_pct (фолбэк tp_pct
+    совместим с backtest.DcaParams).
+    """
+    escalation = getattr(params, "tp_escalation", ())
+    fallback = getattr(params, "take_profit_pct", None)
+    if fallback is None:
+        fallback = getattr(params, "tp_pct", 1.0)
+    if not escalation:
+        return fallback
+    if level < 0:
+        level = 0
+    if level >= len(escalation):
+        level = len(escalation) - 1
+    return escalation[level]
 
 
 class LeverageSetter:

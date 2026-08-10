@@ -124,6 +124,8 @@ class DcaParams:
     fee_rate: float = 0.00055       # тейкер Bybit USDT-perp (0.055%)
     slippage_pct: float = 0.0005    # проскальзывание на филл, %
     max_concurrent: int = 3         # лимит одновременных циклов (FR-015)
+    multiplier: float = 2.0         # множитель объёма Мартингейла: докупка k = entry * multiplier^k
+    tp_escalation: tuple[float, ...] = ()  # поуровневый TP: элемент по числу докупок
 
     def validate(self) -> None:
         problems = []
@@ -145,6 +147,10 @@ class DcaParams:
             problems.append("slippage_pct в [0, 5%]")
         if self.max_concurrent < 1:
             problems.append("max_concurrent >= 1")
+        if not self.multiplier > 0:
+            problems.append("multiplier > 0")
+        if any(pct <= 0 for pct in self.tp_escalation):
+            problems.append("tp_escalation: все элементы > 0")
         if problems:
             raise ValueError("некорректные параметры DCA:\n- " + "\n- ".join(problems))
 

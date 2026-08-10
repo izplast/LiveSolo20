@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+from types import SimpleNamespace
 
 _ref = os.path.dirname(os.path.abspath(__file__))
 
@@ -106,6 +107,27 @@ ok("ADJUST — уровень от новой средней (100.5 → 101.51)"
 ok("ADJUST — встречная сторона", tp2.side == "Sell")
 ok("order_link_id пробрасывается в обоих режимах",
    tp1.order_link_id == tp2.order_link_id == "c1:tp")
+
+# ── take_profit_pct_at: поуровневый TP (эскалация от бэктеста) ───────────────
+
+print("\ntake_profit_pct_at")
+_esc = SimpleNamespace(take_profit_pct=1.2, tp_escalation=(1.2, 1.5, 2.0))
+ok("Level 0 (вход без доливок) → 1.2%",
+   bot.take_profit_pct_at(_esc, 0) == 1.2)
+ok("Level 1 (после 1-й доливки) → 1.5%",
+   bot.take_profit_pct_at(_esc, 1) == 1.5)
+ok("Level 2 (после 2-й доливки) → 2.0%",
+   bot.take_profit_pct_at(_esc, 2) == 2.0)
+ok("выше последнего уровня удерживается максимум",
+   bot.take_profit_pct_at(_esc, 3) == 2.0
+   and bot.take_profit_pct_at(_esc, 9) == 2.0)
+ok("отрицательный уровень зажимается в Level 0",
+   bot.take_profit_pct_at(_esc, -1) == 1.2)
+ok("пустая эскалация → фиксированный take_profit_pct (фолбэк)",
+   bot.take_profit_pct_at(SimpleNamespace(take_profit_pct=1.2,
+                                          tp_escalation=()), 5) == 1.2)
+ok("фолбэк через tp_pct совместим с backtest.DcaParams",
+   bot.take_profit_pct_at(SimpleNamespace(tp_pct=1.0, tp_escalation=()), 2) == 1.0)
 
 # ── set_leverage_once (US1, FR-018) ───────────────────────────────────────────
 
