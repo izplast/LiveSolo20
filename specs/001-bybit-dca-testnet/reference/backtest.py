@@ -671,9 +671,12 @@ def _parse_date(value: str) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--symbol", default="BTCUSDT", help="пара (или несколько через запятую)")
+    ap.add_argument("--symbol", default=None,
+                    help="пара (или несколько через запятую); без --universe и без "
+                         "--symbol — весь топ из конфига (top_n_turnover, 600)")
     ap.add_argument("--universe", type=int, default=None,
-                    help="вместо --symbol: топ-N по turnover24h, как build_universe скринера")
+                    help="топ-N по turnover24h, как build_universe скринера; "
+                         "по умолчанию — весь топ из конфига (top_n_turnover, 600)")
     ap.add_argument("--cache-dir", default=None,
                     help="каталог для кэша загруженных klines (ускоряет повторные прогоны)")
     ap.add_argument("--days", type=int, default=None, help="глубина истории в днях")
@@ -727,13 +730,17 @@ def main(argv: list[str] | None = None) -> int:
         cfg.natr_max = args.natr_max
     sc.validate_config(cfg)
 
-    if args.universe is not None:
-        sys.stderr.write("[backtest] отбор вселенной (как build_universe скринера)…\n")
+    if args.csv:
+        symbols = [args.symbol or "BTCUSDT"]  # имя в отчёте; данные из CSV
+    elif args.universe is not None:
         symbols = fetch_universe(args.universe, cfg.required_leverage)
-        sys.stderr.write(f"[backtest] вселенная: {len(symbols)} символов, "
-                         f"первые: {', '.join(symbols[:5])}…\n")
-    else:
+    elif args.symbol:
         symbols = [s.strip() for s in args.symbol.split(",") if s.strip()]
+    else:
+        # без явного --symbol/--universe — весь топ из конфига (top_n_turnover, 600)
+        symbols = fetch_universe(cfg.top_n_turnover, cfg.required_leverage)
+    sys.stderr.write(f"[backtest] вселенная: {len(symbols)} символов, "
+                     f"первые: {', '.join(symbols[:5])}…\n")
     summaries = []
     for symbol in symbols:
         sys.stderr.write(f"[backtest] {symbol}: загрузка данных…\n")

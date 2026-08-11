@@ -11,7 +11,9 @@ NATR-14 + UHLO-20 на 1м и 15м), как в связке «скринер →
   * replay — по свечам, восстановленным из записанного стакана (mid-цена
     снимков, одна минута = один бар), либо по истории из --candles CSV;
   * live   — по загруженным с биржи klines (прогрев скринера, --seed-hours)
-    и, при --universe N, скринер сам выбирает монету из топ-N по обороту.
+    и, при --universe N, скринер сам выбирает монету из топ-N по обороту
+    (по умолчанию — весь топ из конфига: top_n_turnover, 600); прогрев klines
+    по вселенной идёт параллельно.
 Флаг --side {auto|Buy|Sell} позволяет принудительно задать сторону вместо
 решения скринера.
 
@@ -27,12 +29,13 @@ NATR-14 + UHLO-20 на 1м и 15м), как в связке «скринер →
       /tmp/btc-book.jsonl --candles /tmp/btc.csv
   python3 specs/001-bybit-dca-testnet/reference/run_sim.py live --seconds 120
   python3 specs/001-bybit-dca-testnet/reference/run_sim.py live \
-      --universe 10 --seconds 300
+      --seconds 300   # без --symbol/--universe — скан топ-600 из конфига
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import importlib.util
 import os
 import sys
@@ -159,35 +162,43 @@ def screener_decisions(rows: list[list], cfg: "sc.Config"):
         yield sc.evaluate(list(state.fast), list(state.slow), cfg)
 
 
-def screener_side(rows: list[list], cfg: "sc.Config") -> str | None:
-    """Направление, на котором скринер сейчас стоит: 'Buy'/'Sell' либо None.
+def _side_and_reason(rows: list[list], cfg: "sc.Config") -> tuple[str | None, str]:
+    """Один проход решений скринера → (сторона, причина).
 
-    Возвращает сторону последнего прошедшего цвета (повтор того же цвета не
-    считается новым сигналом, уход в none сбрасывает направление) — ровно как
-    скринер трактует своё состояние в связке с ботом.
+    Сторона — последний валидный цвет (повтор того же цвета не считается новым
+    сигналом, уход в none сбрасывает направление) — ровно как скринер трактует
+    своё состояние в связке с ботом. Причина — почему направления нет (для
+    диагностики в CLI).
     """
+    last: "sc.Decision | None" = None
     last_color: str | None = None
     for d in screener_decisions(rows, cfg):
+        last = d
         if not d.passed:
             if d.reason in ("uhlo_no_color", "uhlo_slow_missing"):
                 last_color = None
             continue
         if d.color != last_color:
             last_color = d.color
-    return sc.color_to_side(last_color) if last_color else None
+    side = sc.color_to_side(last_color) if last_color else None
+    if side is not None:
+        return side, f"прошёл (цвет {last.color})"
+    if last is None:
+        return None, "недостаточно закрытых свечей (NATR и UHLO нужна история)"
+    extra = f" NATR={last.natr:.4f}" if last.natr is not None else ""
+    return None, f"{last.reason}{extra} {last.details or ''}".strip()
+
+
+def screener_side(rows: list[list], cfg: "sc.Config") -> str | None:
+    """Направление, на котором скринер сейчас стоит: 'Buy'/'Sell' либо None."""
+    side, _ = _side_and_reason(rows, cfg)
+    return side
 
 
 def screener_reason(rows: list[list], cfg: "sc.Config") -> str:
     """Почему скринер не даёт направления — для диагностики в CLI."""
-    last = None
-    for d in screener_decisions(rows, cfg):
-        last = d
-    if last is None:
-        return "недостаточно закрытых свечей (NATR и UHLO нужна история)"
-    if last.passed:
-        return f"прошёл (цвет {last.color})"
-    extra = f" NATR={last.natr:.4f}" if last.natr is not None else ""
-    return f"{last.reason}{extra} {last.details or ''}".strip()
+    _, reason = _side_and_reason(rows, cfg)
+    return reason
 
 
 def seed_rows(symbol: str, seed_hours: int) -> list[list]:
@@ -291,7 +302,8 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--seed-hours", type=int, default=24,
                    help="глубина прогрев klines скринера, ч")
     l.add_argument("--universe", type=int, default=None,
-                   help="вместо --symbol: скринер выбирает монету из топ-N по обороту")
+                   help="скринер выбирает монету из топ-N по обороту; "
+                        "по умолчанию — весь топ из конфига (top_n_turnover, 600)")
     return ap
 
 
@@ -345,11 +357,14 @@ def cmd_live(args) -> int:
     import asyncio
 
     cfg = load_screener_cfg(args.config)
-    if args.universe is not None:
-        symbol, side = _pick_by_universe(cfg, args.universe, args.seed_hours)
+    top_n = args.universe if args.universe is not None else cfg.top_n_turnover
+    if top_n:
+        symbol, side, reasons = _pick_by_universe(cfg, top_n, args.seed_hours)
         if symbol is None:
-            print(f"[screener] в топ-{args.universe} ни одна монета не дала направления "
-                  f"(по всем причинам: {screener_reason([], cfg)})")
+            print(f"[screener] в топ-{top_n} ни одна монета не дала "
+                  f"направления; по проверенным монетам (в порядке оборота):")
+            for reason in reasons:
+                print(f"  {reason}")
             return 1
         print(f"[screener] выбрана монета: {symbol} ({side})")
     else:
@@ -391,15 +406,55 @@ def cmd_live(args) -> int:
     return 0
 
 
-def _pick_by_universe(cfg: "sc.Config", top_n: int, seed_hours: int) -> tuple[str | None, str | None]:
-    """Скринер выбирает монету из топ-N: первая, давшая направление по klines."""
+_SCAN_WORKERS = 12  # прогрев klines по вселенной идёт параллельно
+
+
+def _seed_rows_for(symbol: str, start_ms: int, end_ms: int) -> list[list]:
+    """Закрытые минутные свечи символа за окно (для фонового прогрева)."""
+    return [r for r in bt.fetch_klines(symbol, start_ms, end_ms, "1")
+            if r[0] + 60_000 <= end_ms]
+
+
+def _pick_by_universe(cfg: "sc.Config", top_n: int,
+                      seed_hours: int) -> tuple[str | None, str | None, list[str]]:
+    """Скринер выбирает монету из топ-N по обороту (по умолчанию — топ из
+    конфига, top_n_turnover=600): возвращается первая монета, давшая
+    направление по klines. Прогрев идёт параллельно (как в проде скринер
+    срабатывает на первом прошедшем сигнале вселенной).
+
+    Возвращает (символ, сторона, причины-отказов по проверенным монетам топ-N)
+    — причины нужны для честной диагностики, когда сигнала нет ни у кого.
+    """
     symbols = bt.fetch_universe(top_n, cfg.required_leverage)
-    for symbol in symbols:
-        rows = seed_rows(symbol, seed_hours)
-        side = screener_side(rows, cfg)
-        if side is not None:
-            return symbol, side
-    return None, None
+    if not symbols:
+        return None, None, ["вселенная пуста: fetch_universe не вернул монет"]
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - seed_hours * 3_600_000
+    rank = {s: i for i, s in enumerate(symbols)}
+    reasons: dict[str, str] = {}
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as ex:
+        futures = {ex.submit(_seed_rows_for, s, start_ms, now_ms): s
+                   for s in symbols}
+        for fut in concurrent.futures.as_completed(futures):
+            symbol = futures[fut]
+            rows = fut.result()
+            side, reason = _side_and_reason(rows, cfg)
+            reasons[symbol] = reason
+            done += 1
+            sys.stderr.write(f"\r[screener] проверено {done}/{len(symbols)} "
+                             f"топ-{top_n} по обороту    ")
+            sys.stderr.flush()
+            if side is not None:
+                sys.stderr.write("\n")
+                return symbol, side, _ordered_reasons(reasons, rank)
+    sys.stderr.write("\n")
+    return None, None, _ordered_reasons(reasons, rank)
+
+
+def _ordered_reasons(reasons: dict[str, str], rank: dict[str, int]) -> list[str]:
+    """Причины в порядке топ-N (по обороту), для читаемого вывода."""
+    return [f"{s}: {reasons[s]}" for s in sorted(reasons, key=lambda s: rank[s])]
 
 
 def main(argv: list[str] | None = None) -> int:

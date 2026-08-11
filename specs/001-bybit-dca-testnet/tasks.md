@@ -99,6 +99,7 @@
 - [x] T015 Автотест бэктеста в reference/test_backtest.py (синтетические свечи, без сети): DcaParams.validate, read_csv, aggregate_minutes, пагинация/кэш klines, fetch_instrument/fetch_universe через заглушку _http_get, полный цикл entry→dca→TP (лонг и шорт), time_exit, стоп, лимит циклов (FR-015), summarize/render, CLI --csv/--json — 93 проверки, 0 fail
 - [x] T016 Полный сквозной пайплайн в reference/test_full_pipeline.py (синтетические свечи и стакан, без сети): скринер (бычий сигнал на тренде → Buy) → выставление сетки (рыночный вход + TP-лимитка + докупка so_1) → исполнение в mock-симуляторе (доливки на падающем стакане, пересчёт TP по эскалации) → закрытие по TP на отскоке (US1, US2, FR-009/010/011/012, FR-017) — 20 проверок, 0 fail
 - [x] T017 Связка «скринер → симулятор» в reference/run_sim.py (без сети): направление сделки выбирает скринер (screener_side — последний валидный цвет, повтор цвета не сигнал), восстановление минутных свечей из снимков стакана (books_to_rows), диагностика отсутствия сигнала (screener_reason: insufficient_history/NATR/цвет), разбор секции screener из config.yml без pyyaml (load_screener_cfg), CLI --side auto|Buy|Sell, --candles, --seed-hours, --universe N; reference/test_run_sim.py — 18 проверок, 0 fail
+- [x] T018 Накопление сделок в reference/scan_universe.py: скан всего топа из конфига (top_n_turnover, 600) за --days дней, параллельная загрузка klines (--workers 8, кэш, окно заякорено на начало UTC-суток), скринер → Backtest (параметры бота из config.yml), стоп при --target закрытых сделок, сделки в --out JSONL. Прогон: 67/600 символов, 32 закрытые сделки, win-rate 96.9%, PnL +8.81 USDT — цель 30 сделок достигнута
 
 ---
 
@@ -140,3 +141,5 @@
 - `mode CLOSE/ADJUST` → T008
 - `set_take_profit` / `set_leverage_once` → T009, T005
 - WS-цикл скринера → T003 (реализован), T004 (тесты)
+- Метрики прогона → reference/metrics.py + test_metrics.py (21 проверка, 0 fail)
+  — снапшоты скринера/симулятора, CSV в logs/test_metrics.csv, MetricsMonitor

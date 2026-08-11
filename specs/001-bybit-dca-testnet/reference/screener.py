@@ -94,7 +94,7 @@ BOUNDARY_EPS = 1e-9
 @dataclass
 class Config:
     bot_api_url: str = "http://127.0.0.1:8000"
-    top_n_turnover: int = 300
+    top_n_turnover: int = 600   # топ по обороту, из которого скринер ловит сигналы
     natr_period: int = 14
     natr_min: float = 0.9
     natr_max: float = 2.5          # отсечение «слишком рискованно»
