@@ -506,5 +506,85 @@ ok("JSON: данные из CSV без сети, candles = 2000",
    data["candles"] == 2000 and data["closed"] >= 1, data)
 shutil.rmtree(_tmp, ignore_errors=True)
 
+# ── 18. Адаптивные шаг/стоп и эскалация TP в бэктесте ─────────────────────────
+
+print("\nадаптивные шаг/стоп от NATR и эскалация TP")
+
+ok("clamp зажимает значения в диапазон",
+   bt.clamp(5.0, 1.0, 3.0) == 3.0 and bt.clamp(0.5, 1.0, 3.0) == 1.0
+   and bt.clamp(2.0, 1.0, 3.0) == 2.0)
+
+_ad = bt.DcaParams(entry_usdt=50, dca_step_pct=1.2, stop_pct=5.0,
+                   step_atr_mult=1.0, step_min_pct=0.9, step_max_pct=3.0,
+                   sl_atr_mult=2.5, sl_min_pct=1.0, sl_max_pct=8.0)
+ok("шаг: NATR 4.0% × 1.0 → зажат до 3.0%",
+   abs(bt.effective_step_pct(_ad, 4.0) - 3.0) < 1e-9)
+ok("шаг: NATR 0.5% × 1.0 → зажат до 0.9%",
+   abs(bt.effective_step_pct(_ad, 0.5) - 0.9) < 1e-9)
+ok("шаг: NATR 1.6% × 1.0 → 1.6% (внутри диапазона)",
+   abs(bt.effective_step_pct(_ad, 1.6) - 1.6) < 1e-9)
+ok("шаг: без NATR → фиксированный dca_step_pct",
+   abs(bt.effective_step_pct(_ad, None) - 1.2) < 1e-9)
+ok("шаг: step_atr_mult=0 → фиксированный (адаптив выключен)",
+   abs(bt.effective_step_pct(bt.DcaParams(), 3.0) - 0.8) < 1e-9)
+ok("стоп: NATR 1.0% × 2.5 → 2.5% (внутри диапазона)",
+   abs(bt.effective_stop_pct(_ad, 1.0) - 2.5) < 1e-9)
+ok("стоп: NATR 4.0% × 2.5 → зажат до 8.0%",
+   abs(bt.effective_stop_pct(_ad, 4.0) - 8.0) < 1e-9)
+ok("стоп: NATR 0.2% × 2.5 → зажат до 1.0%",
+   abs(bt.effective_stop_pct(_ad, 0.2) - 1.0) < 1e-9)
+ok("стоп: без NATR → фиксированный stop_pct",
+   abs(bt.effective_stop_pct(_ad, None) - 5.0) < 1e-9)
+ok("валидация: адаптив с неверными зажимами отвергается",
+   raises(lambda: bt.DcaParams(step_atr_mult=1.0, step_min_pct=3.0,
+                               step_max_pct=0.9).validate())
+   and raises(lambda: bt.DcaParams(sl_atr_mult=1.0, sl_min_pct=0.0,
+                                   sl_max_pct=8.0).validate()))
+
+_pA = bt.DcaParams(entry_usdt=50, dca_step_pct=1.2, max_docups=2, tp_pct=1.2,
+                   tp_escalation=(1.2, 1.5, 2.0), stop_pct=5.0,
+                   step_atr_mult=1.0, step_min_pct=0.9, step_max_pct=3.0,
+                   sl_atr_mult=2.5, sl_min_pct=1.0, sl_max_pct=8.0)
+b18 = bt.Backtest(sc.Config(), _pA, "BTCUSDT", INST)
+T18 = 18 * 10 ** 12
+b18._open_cycle("Buy", T18, 100.0, natr=1.6)
+c18 = b18.open[0]
+ok("NATR сигнала сохранён в цикле", abs(c18.natr - 1.6) < 1e-9, c18.natr)
+ok("TP Level-0 по эскалации (1.2%)",
+   abs(c18.tp_level - bt.tp_price(c18.avg_entry, "Buy", 1.2, 0.01)) < 1e-9,
+   c18.tp_level)
+ok("шаг докупки адаптивный: NATR 1.6% × 1.0 = 1.6%",
+   abs(c18.next_level - c18.fills[0]["price"] * (1 - 1.6 / 100)) < 1e-9,
+   c18.next_level)
+ok("стоп адаптивный: NATR 1.6% × 2.5 = 4.0%",
+   abs(c18.stop_level - c18.avg_entry * (1 - 4.0 / 100)) < 1e-9,
+   c18.stop_level)
+b18._update_cycles([T18 + 60_000, 100.0, 100.05, 98.0, 99.3, 1.0], T18 + 60_000)
+ok("после докупки TP пересчитан по эскалации Level-1 (1.5%)",
+   abs(c18.tp_level - bt.tp_price(c18.avg_entry, "Buy", 1.5, 0.01)) < 1e-9,
+   c18.tp_level)
+
+# без NATR (восстановленные циклы) — фолбэк на фиксированные шаг/стоп
+b19 = bt.Backtest(sc.Config(), _pA, "BTCUSDT", INST)
+b19._open_cycle("Buy", T18, 100.0)
+c19 = b19.open[0]
+ok("без NATR шаг — фиксированный 1.2%",
+   abs(c19.next_level - c19.fills[0]["price"] * (1 - 1.2 / 100)) < 1e-9,
+   c19.next_level)
+ok("без NATR стоп — фиксированный 5.0%",
+   abs(c19.stop_level - c19.avg_entry * (1 - 5.0 / 100)) < 1e-9,
+   c19.stop_level)
+
+b20 = bt.Backtest(sc.Config(cooldown_sec=0), _pA, "BTCUSDT", INST)
+b20._on_decision(sc.Decision(True, color="green", natr=2.0), T18, None)
+ok("NATR из решения скринера попадает в ожидаемый сигнал",
+   b20._pending_side == "Buy" and abs(b20._pending_natr - 2.0) < 1e-9,
+   (b20._pending_side, b20._pending_natr))
+b20.run([[T18, 100.0, 100.0, 100.0, 100.0, 1.0],
+         [T18 + 60_000, 100.0, 100.0, 100.0, 100.0, 1.0]])
+ok("NATR доходит до открытого цикла через run()",
+   len(b20.open) == 1 and abs(b20.open[0].natr - 2.0) < 1e-9,
+   [c.natr for c in b20.open])
+
 print(f"\nитог: {PASS} ok, {FAIL} fail")
 sys.exit(1 if FAIL else 0)

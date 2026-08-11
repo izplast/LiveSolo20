@@ -58,6 +58,8 @@ quantize_qty = backtest.quantize_qty
 bot = backtest.bot
 tp_price = bot.tp_price
 take_profit_pct_at = bot.take_profit_pct_at
+effective_step_pct = backtest.effective_step_pct
+effective_stop_pct = backtest.effective_stop_pct
 
 
 class DcaCycle:
@@ -69,12 +71,14 @@ class DcaCycle:
     """
 
     def __init__(self, params: DcaParams, symbol: str, side: str,
-                 qty_step: float, min_qty: float, tick_size: float) -> None:
+                 qty_step: float, min_qty: float, tick_size: float,
+                 natr: float | None = None) -> None:
         if side not in ("Buy", "Sell"):
             raise ValueError(f"side должен быть Buy или Sell, получено {side!r}")
         self.p = params
         self.symbol = symbol
         self.side = side
+        self.natr = natr               # NATR-14 сигнала скринера (адаптив шага/стопа)
         self.qty_step = qty_step
         self.min_qty = min_qty
         self.tick_size = tick_size
@@ -196,16 +200,18 @@ class DcaCycle:
 
     def _after_position_change(self) -> None:
         p = self.p
+        step_pct = effective_step_pct(p, self.natr)
+        stop_pct = effective_stop_pct(p, self.natr)
         self.tp_level = tp_price(self.avg_entry, self.side,
                                  take_profit_pct_at(p, self.docups),
                                  self.tick_size)
         self._replace_tp()
-        if p.stop_pct:
-            factor = 1 - p.stop_pct / 100 if self.side == "Buy" else 1 + p.stop_pct / 100
+        if stop_pct:
+            factor = 1 - stop_pct / 100 if self.side == "Buy" else 1 + stop_pct / 100
             self.stop_level = self.avg_entry * factor
         self.next_level = self.last_fill_price * (
-            1 - p.dca_step_pct / 100 if self.side == "Buy"
-            else 1 + p.dca_step_pct / 100)
+            1 - step_pct / 100 if self.side == "Buy"
+            else 1 + step_pct / 100)
         if self.docups < p.max_docups:
             qty = quantize_qty(
                 p.entry_usdt * p.multiplier ** (self.docups + 1) / self.next_level,

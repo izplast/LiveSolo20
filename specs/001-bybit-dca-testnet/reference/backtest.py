@@ -106,6 +106,7 @@ bot = _load_sibling("bot")
 
 quantize_qty = pricing.quantize_qty
 tp_price = bot.tp_price
+take_profit_pct_at = bot.take_profit_pct_at
 
 # ---------------------------------------------------------------------------
 # Параметры DCA
@@ -126,6 +127,19 @@ class DcaParams:
     max_concurrent: int = 3         # лимит одновременных циклов (FR-015)
     multiplier: float = 2.0         # множитель объёма Мартингейла: докупка k = entry * multiplier^k
     tp_escalation: tuple[float, ...] = ()  # поуровневый TP: элемент по числу докупок
+    # Адаптивный шаг сетки от NATR-14 (сигнала скринера):
+    # эффективный шаг = clamp(NATR * step_atr_mult, step_min_pct, step_max_pct);
+    # step_atr_mult: 0 — фиксированный dca_step_pct (как в базовом боте).
+    step_atr_mult: float = 0.0
+    step_min_pct: float = 0.0
+    step_max_pct: float = 0.0
+    # Адаптивный аварийный стоп от NATR-14:
+    # эффективный стоп = clamp(NATR * sl_atr_mult, sl_min_pct, sl_max_pct);
+    # sl_atr_mult: 0 — фиксированный stop_pct; при шумных проколах стоп
+    # отодвигается от входа, в спокойном рынке — подтягивается.
+    sl_atr_mult: float = 0.0
+    sl_min_pct: float = 0.0
+    sl_max_pct: float = 0.0
 
     def validate(self) -> None:
         problems = []
@@ -151,8 +165,40 @@ class DcaParams:
             problems.append("multiplier > 0")
         if any(pct <= 0 for pct in self.tp_escalation):
             problems.append("tp_escalation: все элементы > 0")
+        if not self.step_atr_mult >= 0:
+            problems.append("step_atr_mult >= 0")
+        if self.step_atr_mult and not (0 < self.step_min_pct <= self.step_max_pct):
+            problems.append("шаг: 0 < step_min_pct <= step_max_pct при адаптиве")
+        if not self.sl_atr_mult >= 0:
+            problems.append("sl_atr_mult >= 0")
+        if self.sl_atr_mult and not (0 < self.sl_min_pct <= self.sl_max_pct):
+            problems.append("стоп: 0 < sl_min_pct <= sl_max_pct при адаптиве")
         if problems:
             raise ValueError("некорректные параметры DCA:\n- " + "\n- ".join(problems))
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    """Зажим значения в диапазон [lo, hi]."""
+    return max(lo, min(hi, x))
+
+
+def effective_step_pct(p: DcaParams, natr: float | None) -> float:
+    """Эффективный шаг докупки, %: адаптив от NATR-14 или фиксированный.
+
+    NATR из сигнала скринера — уже в процентах (compute_natr: ATR/close*100);
+    при выключенном адаптиве (step_atr_mult=0) или отсутствии NATR в сигнале
+    (восстановленные циклы) возвращается dca_step_pct.
+    """
+    if p.step_atr_mult > 0 and natr is not None:
+        return clamp(natr * p.step_atr_mult, p.step_min_pct, p.step_max_pct)
+    return p.dca_step_pct
+
+
+def effective_stop_pct(p: DcaParams, natr: float | None) -> float:
+    """Эффективный аварийный стоп, %: адаптив от NATR-14 или фиксированный."""
+    if p.sl_atr_mult > 0 and natr is not None:
+        return clamp(natr * p.sl_atr_mult, p.sl_min_pct, p.sl_max_pct)
+    return p.stop_pct
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +408,7 @@ class Cycle:
     exit_price: float = 0.0
     exit_reason: str = ""
     pnl: float = 0.0
+    natr: float | None = None      # NATR-14 сигнала, открывшего цикл (для адаптива)
 
     @property
     def duration_minutes(self) -> float:
@@ -387,6 +434,7 @@ class Backtest:
         self.signals = 0
         self.rejected_limit = 0
         self._pending_side: str | None = None
+        self._pending_natr: float | None = None
 
     # ── основной цикл ─────────────────────────────────────────────────────
 
@@ -403,8 +451,9 @@ class Backtest:
                 slow_ptr += 1
             # сигнал предыдущей свечи исполняется по открытию текущей
             if self._pending_side is not None:
-                self._open_cycle(self._pending_side, ts, o)
+                self._open_cycle(self._pending_side, ts, o, self._pending_natr)
                 self._pending_side = None
+                self._pending_natr = None
             is_new = self.state.push("fast", row[:5])
             if is_new:
                 d = sc.evaluate(list(self.state.fast), list(self.state.slow), self.cfg)
@@ -445,10 +494,12 @@ class Backtest:
             self.rejected_limit += 1
             return
         self._pending_side = sc.color_to_side(d.color)
+        self._pending_natr = d.natr
 
     # ── исполнение ─────────────────────────────────────────────────────────
 
-    def _open_cycle(self, side: str, ts: int, open_price: float) -> None:
+    def _open_cycle(self, side: str, ts: int, open_price: float,
+                    natr: float | None = None) -> None:
         p = self.p
         fill = open_price * (1 + p.slippage_pct if side == "Buy" else 1 - p.slippage_pct)
         cyc = Cycle(
@@ -456,6 +507,7 @@ class Backtest:
             qty_step=self.instrument["qty_step"],
             min_qty=self.instrument["min_qty"],
             tick_size=self.instrument["tick_size"],
+            natr=natr,
         )
         self._fill(cyc, fill, "entry", ts)
         self.open.append(cyc)
@@ -478,13 +530,17 @@ class Backtest:
         cyc.qty = new_qty
         cyc.fee += qty * price * p.fee_rate
         cyc.fills.append({"ts": ts, "role": role, "side": side, "qty": qty, "price": price})
-        # уровни пересчитываются после каждого филла (FR-011)
-        cyc.tp_level = tp_price(cyc.avg_entry, side, p.tp_pct, cyc.tick_size)
-        if p.stop_pct:
+        # уровни пересчитываются после каждого филла (FR-011): поуровневый TP
+        # от средней (эскалация по числу докупок), адаптивный шаг и стоп от NATR
+        cyc.tp_level = tp_price(cyc.avg_entry, side,
+                                take_profit_pct_at(p, cyc.docups), cyc.tick_size)
+        stop_pct = effective_stop_pct(p, cyc.natr)
+        if stop_pct:
             cyc.stop_level = cyc.avg_entry * (
-                1 - p.stop_pct / 100 if side == "Buy" else 1 + p.stop_pct / 100)
+                1 - stop_pct / 100 if side == "Buy" else 1 + stop_pct / 100)
         cyc.next_level = price * (
-            1 - p.dca_step_pct / 100 if side == "Buy" else 1 + p.dca_step_pct / 100)
+            1 - effective_step_pct(p, cyc.natr) / 100 if side == "Buy"
+            else 1 + effective_step_pct(p, cyc.natr) / 100)
 
     def _close(self, cyc: Cycle, price: float, reason: str, ts: int) -> None:
         p = self.p
@@ -513,7 +569,7 @@ class Backtest:
                 while cyc.docups < p.max_docups and l <= cyc.next_level + eps:
                     fill = cyc.next_level * (1 + p.slippage_pct)
                     self._fill(cyc, fill, "dca", ts)
-                if p.stop_pct and l <= cyc.stop_level:
+                if cyc.stop_level and l <= cyc.stop_level:
                     self._close(cyc, cyc.stop_level * (1 - p.slippage_pct), "stop", ts)
                 elif h >= cyc.tp_level:
                     self._close(cyc, cyc.tp_level * (1 - p.slippage_pct), "take_profit", ts)
@@ -523,7 +579,7 @@ class Backtest:
                 while cyc.docups < p.max_docups and h >= cyc.next_level - eps:
                     fill = cyc.next_level * (1 - p.slippage_pct)
                     self._fill(cyc, fill, "dca", ts)
-                if p.stop_pct and h >= cyc.stop_level:
+                if cyc.stop_level and h >= cyc.stop_level:
                     self._close(cyc, cyc.stop_level * (1 + p.slippage_pct), "stop", ts)
                 elif l <= cyc.tp_level:
                     self._close(cyc, cyc.tp_level * (1 + p.slippage_pct), "take_profit", ts)
@@ -639,6 +695,15 @@ def render(m: dict, params: DcaParams, verbose: bool = False) -> str:
                  f"удержание {_fmt_dur(params.max_hold_minutes)}, "
                  f"комиссия {params.fee_rate * 100:.3f}%, "
                  f"слиппедж {params.slippage_pct * 100:.3f}%")
+    if params.step_atr_mult > 0:
+        lines.append(f"Адаптивный шаг: NATR × {params.step_atr_mult:g} в "
+                     f"[{params.step_min_pct:g}%, {params.step_max_pct:g}%]")
+    if params.sl_atr_mult > 0:
+        lines.append(f"Адаптивный стоп: NATR × {params.sl_atr_mult:g} в "
+                     f"[{params.sl_min_pct:g}%, {params.sl_max_pct:g}%] "
+                     f"(фолбэк {params.stop_pct:g}%)")
+    if params.tp_escalation:
+        lines.append("Поуровневый TP: " + "/".join(f"{x:g}%" for x in params.tp_escalation))
     lines.append(f"Сигналы: {m['signals']} (отклонено по лимиту циклов: {m['rejected_limit']})")
     lines.append(f"Циклы: закрыто {m['closed']} из {m['n_cycles']} "
                  f"(открыто к концу: {m['open_at_end']})")

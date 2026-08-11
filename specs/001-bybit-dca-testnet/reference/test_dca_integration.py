@@ -230,5 +230,47 @@ ok("D: неисполненная докупка отменена при зак�
    _d.manager.orders.get("so_1", {}).get("status") == "canceled")
 ok("D: открытых ордеров не осталось", no_open_orders(_d))
 
+# ── сценарий E: адаптивные шаг/стоп от NATR сигнала ─────────────────────────
+
+print("\nсценарий E: адаптивные шаг/стоп от NATR (100 → уровни)")
+
+def new_cycle_natr(natr, **over):
+    p = base_params(stop_pct=5.0, step_atr_mult=1.0, step_min_pct=0.9,
+                    step_max_pct=3.0, sl_atr_mult=2.5, sl_min_pct=1.0,
+                    sl_max_pct=8.0)
+    for k, v in over.items():
+        setattr(p, k, v)
+    p.validate()
+    return dc.DcaCycle(p, SYMBOL, "Buy", INST["qty_step"],
+                       INST["min_qty"], INST["tick_size"], natr=natr)
+
+_e1 = new_cycle_natr(2.0)
+_e1.open(book(100.0), T0)
+ok("E: NATR сохранён в цикле", _e1.natr == 2.0)
+ok("E: шаг = NATR 2.0% → следующая докупка на 98.0049",
+   near(_e1.next_level, 98.0049, 1e-4), _e1.next_level)
+ok("E: стоп = NATR 2.0% × 2.5 = 5.0% → 95.0047",
+   near(_e1.stop_level, 95.0047, 1e-4), _e1.stop_level)
+
+_e2 = new_cycle_natr(4.0)
+_e2.open(book(100.0), T0)
+ok("E: шаг зажат сверху (3.0% при NATR 4.0) → 97.0048",
+   near(_e2.next_level, 97.0048, 1e-4), _e2.next_level)
+ok("E: стоп зажат сверху (8.0% при NATR 4.0) → 92.0046",
+   near(_e2.stop_level, 92.0046, 1e-4), _e2.stop_level)
+
+_e3 = new_cycle_natr(None)
+_e3.open(book(100.0), T0)
+ok("E: без NATR шаг фолбэк 1.2% → 98.8049",
+   near(_e3.next_level, 98.8049, 1e-4), _e3.next_level)
+ok("E: без NATR стоп фолбэк 5.0% → 95.0047",
+   near(_e3.stop_level, 95.0047, 1e-4), _e3.stop_level)
+
+_e4 = new_cycle_natr(2.0)
+_e4.open(book(100.0), T0)
+_e4.step(book(97.9), T0 + 60_000)
+ok("E: при NATR 2.0 цена 97.9 пробивает адаптивный уровень → докупка",
+   _e4.docups == 1, _e4.docups)
+
 print(f"\nитог: {PASS} ok, {FAIL} fail")
 sys.exit(1 if FAIL else 0)

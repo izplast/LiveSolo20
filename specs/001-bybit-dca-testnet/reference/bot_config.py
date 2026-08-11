@@ -18,6 +18,12 @@ max_hold_minutes). Этот модуль — маппер между ними, �
   max_hold_hours    → max_hold_minutes (×60)
   leverage          → leverage
   fee_rate          → fee_rate
+  step_atr_mult     → step_atr_mult (адаптивный шаг от NATR, 0 — фиксированный step_pct)
+  step_min_pct      → step_min_pct  (нижний зажим адаптивного шага, %)
+  step_max_pct      → step_max_pct  (верхний зажим адаптивного шага, %)
+  sl_atr_mult       → sl_atr_mult   (адаптивный стоп от NATR, 0 — фиксированный hard_sl_pct)
+  sl_min_pct        → sl_min_pct    (нижний зажим адаптивного стопа, %)
+  sl_max_pct        → sl_max_pct    (верхний зажим адаптивного стопа, %)
 
 Запуск проверок:
     python3 specs/001-bybit-dca-testnet/reference/test_bot_config.py
@@ -137,11 +143,17 @@ def dca_params_from_config(dca: dict) -> DcaParams:
         tp_pct=float(dca.get("take_profit_pct", DEFAULTS["take_profit_pct"])),
         tp_escalation=tuple(
             float(x) for x in dca.get("tp_escalation", DEFAULTS["tp_escalation"])),
-        stop_pct=float(dca.get("hard_sl_pct", DEFAULTS["hard_sl_pct"])),
-        max_hold_minutes=int(float(dca.get("max_hold_hours",
-                                           DEFAULTS["max_hold_hours"])) * 60),
-        leverage=float(dca.get("leverage", DEFAULTS["leverage"])),
-        fee_rate=float(dca.get("fee_rate", DEFAULTS["fee_rate"])),
-    )
+    stop_pct=float(dca.get("hard_sl_pct", DEFAULTS["hard_sl_pct"])),
+    max_hold_minutes=int(float(dca.get("max_hold_hours",
+                                       DEFAULTS["max_hold_hours"])) * 60),
+    leverage=float(dca.get("leverage", DEFAULTS["leverage"])),
+    fee_rate=float(dca.get("fee_rate", DEFAULTS["fee_rate"])),
+    step_atr_mult=float(dca.get("step_atr_mult", 0.0)),
+    step_min_pct=float(dca.get("step_min_pct", 0.0)),
+    step_max_pct=float(dca.get("step_max_pct", 0.0)),
+    sl_atr_mult=float(dca.get("sl_atr_mult", 0.0)),
+    sl_min_pct=float(dca.get("sl_min_pct", 0.0)),
+    sl_max_pct=float(dca.get("sl_max_pct", 0.0)),
+)
     p.validate()
     return p

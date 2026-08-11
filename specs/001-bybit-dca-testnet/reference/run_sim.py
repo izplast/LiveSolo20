@@ -165,42 +165,52 @@ def screener_decisions(rows: list[list], cfg: "sc.Config"):
         yield sc.evaluate(list(state.fast), list(state.slow), cfg)
 
 
-def _side_and_reason(rows: list[list], cfg: "sc.Config") -> tuple[str | None, str]:
-    """Один проход решений скринера → (сторона, причина).
+def _side_and_reason(rows: list[list], cfg: "sc.Config") -> tuple[str | None, str, float | None]:
+    """Один проход решений скринера → (сторона, причина, NATR-14).
 
     Сторона — последний валидный цвет (повтор того же цвета не считается новым
     сигналом, уход в none сбрасывает направление) — ровно как скринер трактует
     своё состояние в связке с ботом. Причина — почему направления нет (для
-    диагностики в CLI).
+    диагностики в CLI). NATR — индикатор решения, зафиксировавшего направление
+    (нужен для адаптивного шага/стопа цикла).
     """
     last: "sc.Decision | None" = None
     last_color: str | None = None
+    last_natr: float | None = None
     for d in screener_decisions(rows, cfg):
         last = d
         if not d.passed:
             if d.reason in ("uhlo_no_color", "uhlo_slow_missing"):
                 last_color = None
+                last_natr = None
             continue
         if d.color != last_color:
             last_color = d.color
+            last_natr = d.natr
     side = sc.color_to_side(last_color) if last_color else None
     if side is not None:
-        return side, f"прошёл (цвет {last.color})"
+        return side, f"прошёл (цвет {last.color})", last_natr
     if last is None:
-        return None, "недостаточно закрытых свечей (NATR и UHLO нужна история)"
+        return None, "недостаточно закрытых свечей (NATR и UHLO нужна история)", None
     extra = f" NATR={last.natr:.4f}" if last.natr is not None else ""
-    return None, f"{last.reason}{extra} {last.details or ''}".strip()
+    return None, f"{last.reason}{extra} {last.details or ''}".strip(), None
 
 
 def screener_side(rows: list[list], cfg: "sc.Config") -> str | None:
     """Направление, на котором скринер сейчас стоит: 'Buy'/'Sell' либо None."""
-    side, _ = _side_and_reason(rows, cfg)
+    side, _, _ = _side_and_reason(rows, cfg)
     return side
+
+
+def screener_natr(rows: list[list], cfg: "sc.Config") -> float | None:
+    """NATR-14 сигнала, давшего направление (для адаптивного шага/стопа)."""
+    _, _, natr = _side_and_reason(rows, cfg)
+    return natr
 
 
 def screener_reason(rows: list[list], cfg: "sc.Config") -> str:
     """Почему скринер не даёт направления — для диагностики в CLI."""
-    _, reason = _side_and_reason(rows, cfg)
+    _, reason, _ = _side_and_reason(rows, cfg)
     return reason
 
 
@@ -231,10 +241,11 @@ def resolve_inst_params(symbol: str, qty_step: float | None, min_qty: float | No
 
 
 def run_cycle(books: list[dict], params: DcaParams, symbol: str, side: str,
-              qty_step: float, min_qty: float, tick_size: float) -> "dc.DcaCycle":
+              qty_step: float, min_qty: float, tick_size: float,
+              natr: float | None = None) -> "dc.DcaCycle":
     if not books:
         raise SystemExit("пустой стакан: нечего прогонять")
-    cycle = DcaCycle(params, symbol, side, qty_step, min_qty, tick_size)
+    cycle = DcaCycle(params, symbol, side, qty_step, min_qty, tick_size, natr=natr)
     t0 = books[0]["ts"]
     cycle.open(books[0], t0)
     for book in books[1:]:
@@ -336,6 +347,7 @@ def cmd_replay(args) -> int:
     params = resolve_params(args)
 
     cfg = load_screener_cfg(args.config)
+    natr: float | None = None
     if args.side == "auto":
         if args.candles:
             rows = bt.read_csv(args.candles, None, None)
@@ -347,14 +359,16 @@ def cmd_replay(args) -> int:
             print("[screener] запись слишком короткая или флэтовая — увеличьте --seconds"
                   " при record либо укажите --candles с историей свечей")
             return 1
-        print(f"[screener] направление {symbol}: {side}")
+        natr = screener_natr(rows, cfg)
+        print(f"[screener] направление {symbol}: {side}"
+              + (f" (NATR {natr:.4f}%)" if natr is not None else ""))
     else:
         side = args.side
 
     qty_step, min_qty, tick_size = resolve_inst_params(symbol, args.qty_step,
                                                        args.min_qty, args.tick_size,
                                                        fetch=False)
-    run_cycle(books, params, symbol, side, qty_step, min_qty, tick_size)
+    run_cycle(books, params, symbol, side, qty_step, min_qty, tick_size, natr=natr)
     return 0
 
 
@@ -363,15 +377,17 @@ def cmd_live(args) -> int:
 
     cfg = load_screener_cfg(args.config)
     top_n = args.universe if args.universe is not None else cfg.top_n_turnover
+    natr: float | None = None
     if top_n:
-        symbol, side, reasons = _pick_by_universe(cfg, top_n, args.seed_hours)
+        symbol, side, natr, reasons = _pick_by_universe(cfg, top_n, args.seed_hours)
         if symbol is None:
             print(f"[screener] в топ-{top_n} ни одна монета не дала "
                   f"направления; по проверенным монетам (в порядке оборота):")
             for reason in reasons:
                 print(f"  {reason}")
             return 1
-        print(f"[screener] выбрана монета: {symbol} ({side})")
+        print(f"[screener] выбрана монета: {symbol} ({side})"
+              + (f", NATR {natr:.4f}%" if natr is not None else ""))
     else:
         symbol = args.symbol or "BTCUSDT"
         if args.side == "auto":
@@ -381,7 +397,9 @@ def cmd_live(args) -> int:
                 print(f"[screener] по {symbol} направления нет: "
                       f"{screener_reason(rows, cfg)}")
                 return 1
-            print(f"[screener] направление {symbol}: {side}")
+            natr = screener_natr(rows, cfg)
+            print(f"[screener] направление {symbol}: {side}"
+                  + (f" (NATR {natr:.4f}%)" if natr is not None else ""))
         else:
             side = args.side
 
@@ -403,14 +421,31 @@ def cmd_live(args) -> int:
         poller = asyncio.create_task(
             bs.poll_orderbook(q, args.base, symbol, interval_sec=args.interval))
         current: DcaCycle | None = None
+        stalls = 0
         try:
             while time.monotonic() < stop:
-                book = await m.drain_to_latest(q, timeout=args.interval + 2)
+                try:
+                    book = await m.drain_to_latest(q, timeout=args.interval + 2)
+                except asyncio.TimeoutError:
+                    stalls += 1
+                    if poller.done():
+                        exc = poller.exception() or bs.BookStreamerError(
+                            "опрос стакана прекратился без объяснения")
+                        raise SystemExit(f"связь с биржей потеряна: {exc}") from exc
+                    if stalls % 5 == 0:
+                        print(f"[live] стакан не приходит {stalls * (args.interval + 2):.0f} c — "
+                              f"пауза в опросе", file=sys.stderr, flush=True)
+                    if stalls >= 60:
+                        raise SystemExit(
+                            f"стакан не приходит {stalls * (args.interval + 2):.0f} c подряд — "
+                            "останавливаю зависший прогон")
+                    continue
+                stalls = 0
                 books.append(book)
                 now = int(book["ts"])
                 if current is None:
                     current = DcaCycle(params, symbol, side,
-                                       qty_step, min_qty, tick_size)
+                                       qty_step, min_qty, tick_size, natr=natr)
                     try:
                         current.open(book, now)
                     except RuntimeError:
@@ -425,6 +460,7 @@ def cmd_live(args) -> int:
             pass
         finally:
             poller.cancel()
+            await asyncio.gather(poller, return_exceptions=True)
 
     async def run() -> None:
         poll_task = asyncio.create_task(collect())
@@ -468,18 +504,19 @@ def _seed_rows_for(symbol: str, start_ms: int, end_ms: int) -> list[list]:
 
 
 def _pick_by_universe(cfg: "sc.Config", top_n: int,
-                      seed_hours: int) -> tuple[str | None, str | None, list[str]]:
+                      seed_hours: int) -> tuple[str | None, str | None, float | None, list[str]]:
     """Скринер выбирает монету из топ-N по обороту (по умолчанию — топ из
     конфига, top_n_turnover=600): возвращается первая монета, давшая
     направление по klines. Прогрев идёт параллельно (как в проде скринер
     срабатывает на первом прошедшем сигнале вселенной).
 
-    Возвращает (символ, сторона, причины-отказов по проверенным монетам топ-N)
-    — причины нужны для честной диагностики, когда сигнала нет ни у кого.
+    Возвращает (символ, сторона, NATR-14 сигнала, причины-отказов по
+    проверенным монетам топ-N) — причины нужны для честной диагностики, когда
+    сигнала нет ни у кого; NATR — для адаптивного шага/стопа выбранного цикла.
     """
     symbols = bt.fetch_universe(top_n, cfg.required_leverage)
     if not symbols:
-        return None, None, ["вселенная пуста: fetch_universe не вернул монет"]
+        return None, None, None, ["вселенная пуста: fetch_universe не вернул монет"]
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - seed_hours * 3_600_000
     rank = {s: i for i, s in enumerate(symbols)}
@@ -491,7 +528,7 @@ def _pick_by_universe(cfg: "sc.Config", top_n: int,
         for fut in concurrent.futures.as_completed(futures):
             symbol = futures[fut]
             rows = fut.result()
-            side, reason = _side_and_reason(rows, cfg)
+            side, reason, natr = _side_and_reason(rows, cfg)
             reasons[symbol] = reason
             done += 1
             sys.stderr.write(f"\r[screener] проверено {done}/{len(symbols)} "
@@ -499,9 +536,9 @@ def _pick_by_universe(cfg: "sc.Config", top_n: int,
             sys.stderr.flush()
             if side is not None:
                 sys.stderr.write("\n")
-                return symbol, side, _ordered_reasons(reasons, rank)
+                return symbol, side, natr, _ordered_reasons(reasons, rank)
     sys.stderr.write("\n")
-    return None, None, _ordered_reasons(reasons, rank)
+    return None, None, None, _ordered_reasons(reasons, rank)
 
 
 def _ordered_reasons(reasons: dict[str, str], rank: dict[str, int]) -> list[str]:
