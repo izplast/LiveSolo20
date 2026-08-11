@@ -30,6 +30,8 @@ NATR-14 + UHLO-20 на 1м и 15м), как в связке «скринер →
   python3 specs/001-bybit-dca-testnet/reference/run_sim.py live --seconds 120
   python3 specs/001-bybit-dca-testnet/reference/run_sim.py live \
       --seconds 300   # без --symbol/--universe — скан топ-600 из конфига
+  python3 specs/001-bybit-dca-testnet/reference/run_sim.py live \
+      --seconds 3600 --metrics-interval 15   # + авто-лог metrics.py каждые 15 мин
 """
 
 from __future__ import annotations
@@ -60,6 +62,7 @@ bc = _load_sibling("bot_config")
 m = dc.mock_execution
 bt = dc.backtest
 sc = sys.modules["screener"]        # скринер зарегистрирован backtest'ом
+mt = _load_sibling("metrics")       # периодический контроль прогона (metrics.py)
 
 DcaCycle = dc.DcaCycle
 DcaParams = dc.DcaParams
@@ -304,6 +307,8 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--universe", type=int, default=None,
                    help="скринер выбирает монету из топ-N по обороту; "
                         "по умолчанию — весь топ из конфига (top_n_turnover, 600)")
+    l.add_argument("--metrics-interval", type=float, default=30.0,
+                   help="авто-лог metrics.py каждые N минут (0 — выключено)")
     return ap
 
 
@@ -383,26 +388,73 @@ def cmd_live(args) -> int:
     qty_step, min_qty, tick_size = resolve_inst_params(symbol, args.qty_step,
                                                        args.min_qty, args.tick_size,
                                                        fetch=True)
+    params = resolve_params(args)
 
     q = asyncio.Queue()
     books: list[dict] = []
+    cycles: list = []
     stop = time.monotonic() + args.seconds
+    monitor = (mt.MetricsMonitor(screener_getter=lambda: None,
+                                 cycles_getter=lambda: list(cycles),
+                                 interval_min=args.metrics_interval)
+               if args.metrics_interval > 0 else None)
 
     async def collect() -> None:
         poller = asyncio.create_task(
             bs.poll_orderbook(q, args.base, symbol, interval_sec=args.interval))
+        current: DcaCycle | None = None
         try:
             while time.monotonic() < stop:
                 book = await m.drain_to_latest(q, timeout=args.interval + 2)
                 books.append(book)
+                now = int(book["ts"])
+                if current is None:
+                    current = DcaCycle(params, symbol, side,
+                                       qty_step, min_qty, tick_size)
+                    try:
+                        current.open(book, now)
+                    except RuntimeError:
+                        current = None
+                        continue
+                    cycles.append(current)
+                else:
+                    current.step(book, now)
+                    if current.closed:
+                        current = None
         except asyncio.TimeoutError:
             pass
         finally:
             poller.cancel()
 
-    asyncio.run(collect())
-    params = resolve_params(args)
-    run_cycle(books, params, symbol, side, qty_step, min_qty, tick_size)
+    async def run() -> None:
+        poll_task = asyncio.create_task(collect())
+        monitor_task = None
+        if monitor:
+            monitor_task = asyncio.create_task(monitor.run())
+        await poll_task
+        if monitor_task:
+            monitor_task.cancel()
+            await asyncio.gather(monitor_task, return_exceptions=True)
+
+    asyncio.run(run())
+    if monitor is not None:
+        monitor.snapshot_and_report()
+    if not cycles:
+        raise SystemExit("пустой стакан: нечего прогонять")
+
+    dur = (books[-1]["ts"] - books[0]["ts"]) / 60_000
+    print(f"символ {symbol} ({side}), снимков {len(books)}, интервал {dur:.1f} мин")
+    for i, cycle in enumerate(cycles, 1):
+        state = "ЗАКРЫТ" if cycle.closed else "открыт"
+        print(f"цикл {i}: {state}, причина: {cycle.exit_reason or '-'}")
+        print(f"  qty={cycle.qty:.6f}  avg={cycle.avg_entry:.4f}  docups={cycle.docups}")
+        print(f"  TP={cycle.tp_level:.4f} (дист. {cycle.tp_level - cycle.avg_entry:+.4f})")
+        if cycle.closed:
+            print(f"  выход={cycle.exit_price:.4f}  PnL={cycle.pnl:+.4f} USDT  "
+                   f"(длит. {cycle.duration_minutes:.1f} мин)")
+        else:
+            print(f"  следующая докупка на {cycle.next_level:.4f}, "
+                   f"стоп {cycle.stop_level or 0:.4f}")
     return 0
 
 
