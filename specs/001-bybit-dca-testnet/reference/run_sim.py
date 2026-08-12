@@ -165,14 +165,15 @@ def screener_decisions(rows: list[list], cfg: "sc.Config"):
         yield sc.evaluate(list(state.fast), list(state.slow), cfg)
 
 
-def _side_and_reason(rows: list[list], cfg: "sc.Config") -> tuple[str | None, str, float | None]:
-    """Один проход решений скринера → (сторона, причина, NATR-14).
+def _side_and_reason(rows: list[list], cfg: "sc.Config") -> tuple[str | None, str, float | None, str | None]:
+    """Один проход решений скринера → (сторона, причина, NATR-14, цвет UHLO).
 
     Сторона — последний валидный цвет (повтор того же цвета не считается новым
     сигналом, уход в none сбрасывает направление) — ровно как скринер трактует
     своё состояние в связке с ботом. Причина — почему направления нет (для
     диагностики в CLI). NATR — индикатор решения, зафиксировавшего направление
-    (нужен для адаптивного шага/стопа цикла).
+    (нужен для адаптивного шага/стопа цикла). Цвет — тренд на момент входа:
+    green = бычий (Buy), red = медвежий (Sell).
     """
     last: "sc.Decision | None" = None
     last_color: str | None = None
@@ -189,28 +190,34 @@ def _side_and_reason(rows: list[list], cfg: "sc.Config") -> tuple[str | None, st
             last_natr = d.natr
     side = sc.color_to_side(last_color) if last_color else None
     if side is not None:
-        return side, f"прошёл (цвет {last.color})", last_natr
+        return side, f"прошёл (цвет {last.color})", last_natr, last_color
     if last is None:
-        return None, "недостаточно закрытых свечей (NATR и UHLO нужна история)", None
+        return None, "недостаточно закрытых свечей (NATR и UHLO нужна история)", None, None
     extra = f" NATR={last.natr:.4f}" if last.natr is not None else ""
-    return None, f"{last.reason}{extra} {last.details or ''}".strip(), None
+    return None, f"{last.reason}{extra} {last.details or ''}".strip(), None, None
 
 
 def screener_side(rows: list[list], cfg: "sc.Config") -> str | None:
     """Направление, на котором скринер сейчас стоит: 'Buy'/'Sell' либо None."""
-    side, _, _ = _side_and_reason(rows, cfg)
+    side, _, _, _ = _side_and_reason(rows, cfg)
     return side
 
 
 def screener_natr(rows: list[list], cfg: "sc.Config") -> float | None:
     """NATR-14 сигнала, давшего направление (для адаптивного шага/стопа)."""
-    _, _, natr = _side_and_reason(rows, cfg)
+    _, _, natr, _ = _side_and_reason(rows, cfg)
     return natr
+
+
+def screener_color(rows: list[list], cfg: "sc.Config") -> str | None:
+    """Цвет UHLO сигнала, давшего направление: green/red (тренд на входе)."""
+    _, _, _, color = _side_and_reason(rows, cfg)
+    return color
 
 
 def screener_reason(rows: list[list], cfg: "sc.Config") -> str:
     """Почему скринер не даёт направления — для диагностики в CLI."""
-    _, reason, _ = _side_and_reason(rows, cfg)
+    _, reason, _, _ = _side_and_reason(rows, cfg)
     return reason
 
 
@@ -242,10 +249,11 @@ def resolve_inst_params(symbol: str, qty_step: float | None, min_qty: float | No
 
 def run_cycle(books: list[dict], params: DcaParams, symbol: str, side: str,
               qty_step: float, min_qty: float, tick_size: float,
-              natr: float | None = None) -> "dc.DcaCycle":
+              natr: float | None = None, trend: str = "") -> "dc.DcaCycle":
     if not books:
         raise SystemExit("пустой стакан: нечего прогонять")
-    cycle = DcaCycle(params, symbol, side, qty_step, min_qty, tick_size, natr=natr)
+    cycle = DcaCycle(params, symbol, side, qty_step, min_qty, tick_size,
+                     natr=natr, trend=trend)
     t0 = books[0]["ts"]
     cycle.open(books[0], t0)
     for book in books[1:]:
@@ -348,6 +356,7 @@ def cmd_replay(args) -> int:
 
     cfg = load_screener_cfg(args.config)
     natr: float | None = None
+    color: str | None = None
     if args.side == "auto":
         if args.candles:
             rows = bt.read_csv(args.candles, None, None)
@@ -360,6 +369,7 @@ def cmd_replay(args) -> int:
                   " при record либо укажите --candles с историей свечей")
             return 1
         natr = screener_natr(rows, cfg)
+        color = screener_color(rows, cfg)
         print(f"[screener] направление {symbol}: {side}"
               + (f" (NATR {natr:.4f}%)" if natr is not None else ""))
     else:
@@ -368,7 +378,8 @@ def cmd_replay(args) -> int:
     qty_step, min_qty, tick_size = resolve_inst_params(symbol, args.qty_step,
                                                        args.min_qty, args.tick_size,
                                                        fetch=False)
-    run_cycle(books, params, symbol, side, qty_step, min_qty, tick_size, natr=natr)
+    run_cycle(books, params, symbol, side, qty_step, min_qty, tick_size,
+              natr=natr, trend=color or "")
     return 0
 
 
@@ -378,8 +389,9 @@ def cmd_live(args) -> int:
     cfg = load_screener_cfg(args.config)
     top_n = args.universe if args.universe is not None else cfg.top_n_turnover
     natr: float | None = None
+    color: str | None = None
     if top_n:
-        symbol, side, natr, reasons = _pick_by_universe(cfg, top_n, args.seed_hours)
+        symbol, side, natr, color, reasons = _pick_by_universe(cfg, top_n, args.seed_hours)
         if symbol is None:
             print(f"[screener] в топ-{top_n} ни одна монета не дала "
                   f"направления; по проверенным монетам (в порядке оборота):")
@@ -398,6 +410,7 @@ def cmd_live(args) -> int:
                       f"{screener_reason(rows, cfg)}")
                 return 1
             natr = screener_natr(rows, cfg)
+            color = screener_color(rows, cfg)
             print(f"[screener] направление {symbol}: {side}"
                   + (f" (NATR {natr:.4f}%)" if natr is not None else ""))
         else:
@@ -445,7 +458,8 @@ def cmd_live(args) -> int:
                 now = int(book["ts"])
                 if current is None:
                     current = DcaCycle(params, symbol, side,
-                                       qty_step, min_qty, tick_size, natr=natr)
+                                       qty_step, min_qty, tick_size,
+                                       natr=natr, trend=color or "")
                     try:
                         current.open(book, now)
                     except RuntimeError:
@@ -504,19 +518,20 @@ def _seed_rows_for(symbol: str, start_ms: int, end_ms: int) -> list[list]:
 
 
 def _pick_by_universe(cfg: "sc.Config", top_n: int,
-                      seed_hours: int) -> tuple[str | None, str | None, float | None, list[str]]:
+                      seed_hours: int) -> tuple[str | None, str | None, float | None, str | None, list[str]]:
     """Скринер выбирает монету из топ-N по обороту (по умолчанию — топ из
     конфига, top_n_turnover=600): возвращается первая монета, давшая
     направление по klines. Прогрев идёт параллельно (как в проде скринер
     срабатывает на первом прошедшем сигнале вселенной).
 
-    Возвращает (символ, сторона, NATR-14 сигнала, причины-отказов по
+    Возвращает (символ, сторона, NATR-14, цвет UHLO, причины-отказов по
     проверенным монетам топ-N) — причины нужны для честной диагностики, когда
-    сигнала нет ни у кого; NATR — для адаптивного шага/стопа выбранного цикла.
+    сигнала нет ни у кого; NATR и цвет — для адаптивного шага/стопа и тренда
+    выбранного цикла.
     """
     symbols = bt.fetch_universe(top_n, cfg.required_leverage)
     if not symbols:
-        return None, None, None, ["вселенная пуста: fetch_universe не вернул монет"]
+        return None, None, None, None, ["вселенная пуста: fetch_universe не вернул монет"]
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - seed_hours * 3_600_000
     rank = {s: i for i, s in enumerate(symbols)}
@@ -528,7 +543,7 @@ def _pick_by_universe(cfg: "sc.Config", top_n: int,
         for fut in concurrent.futures.as_completed(futures):
             symbol = futures[fut]
             rows = fut.result()
-            side, reason, natr = _side_and_reason(rows, cfg)
+            side, reason, natr, color = _side_and_reason(rows, cfg)
             reasons[symbol] = reason
             done += 1
             sys.stderr.write(f"\r[screener] проверено {done}/{len(symbols)} "
@@ -536,9 +551,9 @@ def _pick_by_universe(cfg: "sc.Config", top_n: int,
             sys.stderr.flush()
             if side is not None:
                 sys.stderr.write("\n")
-                return symbol, side, natr, _ordered_reasons(reasons, rank)
+                return symbol, side, natr, color, _ordered_reasons(reasons, rank)
     sys.stderr.write("\n")
-    return None, None, None, _ordered_reasons(reasons, rank)
+    return None, None, None, None, _ordered_reasons(reasons, rank)
 
 
 def _ordered_reasons(reasons: dict[str, str], rank: dict[str, int]) -> list[str]:

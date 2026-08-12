@@ -91,7 +91,7 @@ print("\nread_section: секция screener из config.yml")
 _screener = bc.read_section(REPO_CONFIG, "screener")
 ok("секция screener разобрана", isinstance(_screener, dict) and len(_screener) > 5,
    _screener)
-ok("числовые пороги — числа", _screener.get("natr_min") == 1.5
+ok("числовые пороги — числа", _screener.get("natr_min") == 0.95
    and _screener.get("natr_max") == 5.0, _screener)
 ok("tf остаются строками", _screener.get("tf_fast") == "1"
    and _screener.get("tf_slow") == "15", _screener)

@@ -119,6 +119,8 @@ def cycle_metrics(cycles, mark_price=None) -> dict:
                 "close_ts": c.exit_ts,
                 "duration_minutes": round(c.duration_minutes, 2),
                 "exit_reason": c.exit_reason,
+                "trend": getattr(c, "trend", ""),
+                "entry_natr": getattr(c, "natr", None),
                 "pnl_usdt": round(c.pnl, 6),
                 "pnl_pct": round(c.pnl / invested * 100, 4) if invested > 0 else 0.0,
                 "fees_usdt": round(c.fee, 6),
@@ -200,7 +202,8 @@ def console_summary(sm: dict, cm: dict, ts_ms: int) -> str:
     for t in cm["closed_trades_list"]:
         o = time.strftime("%m-%d %H:%M", time.gmtime(t["open_ts"] / 1000))
         cl = time.strftime("%m-%d %H:%M", time.gmtime(t["close_ts"] / 1000))
-        lines.append(f"  закрыта {t['symbol']:12s} {t['side']:4s} {o}→{cl} "
+        trend = f" ({t.get('trend', '')})" if t.get("trend") else ""
+        lines.append(f"  закрыта {t['symbol']:12s} {t['side']:4s}{trend} {o}→{cl} "
                      f"({t['duration_minutes']} мин, {t['exit_reason']}) "
                      f"PnL={t['pnl_usdt']:+.4f} USDT")
     return "\n".join(lines)

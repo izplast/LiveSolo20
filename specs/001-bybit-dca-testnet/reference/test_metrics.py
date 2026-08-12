@@ -61,7 +61,8 @@ class FakeState:
 class FakeCycle:
     def __init__(self, symbol="BTCUSDT", side="Buy", closed=False, pnl=0.42,
                  avg_entry=100.0, qty=0.2, docups=1, open_ts=0, exit_ts=60_000,
-                 exit_reason="take_profit", fee=0.03, tp_level=101.2):
+                 exit_reason="take_profit", fee=0.03, tp_level=101.2,
+                 trend="green", natr=1.6):
         self.symbol = symbol
         self.side = side
         self.closed = closed
@@ -74,6 +75,8 @@ class FakeCycle:
         self.exit_reason = exit_reason
         self.fee = fee
         self.tp_level = tp_level
+        self.trend = trend
+        self.natr = natr
 
     @property
     def duration_minutes(self):
@@ -130,6 +133,11 @@ ok("среднее время в позиции = (2+1)/2 = 1.5 мин",
    abs(cm["avg_duration_min"] - 1.5) < 1e-9, cm["avg_duration_min"])
 ok("в сделках есть open_ts/close_ts",
    all("open_ts" in t and "close_ts" in t for t in cm["closed_trades_list"]), cm["closed_trades_list"])
+ok("в сделках фиксируется тренд и NATR на входе",
+   all("trend" in t and "entry_natr" in t for t in cm["closed_trades_list"])
+   and cm["closed_trades_list"][0]["trend"] == "green"
+   and cm["closed_trades_list"][1]["entry_natr"] == 1.6,
+   cm["closed_trades_list"])
 inv = win_cyc.avg_entry * win_cyc.qty + loss_cyc.avg_entry * loss_cyc.qty
 ok("реализованный PnL % = 0.32 / вложенное",
    abs(cm["realized_pnl_pct"] - 0.32 / inv * 100) < 1e-9, cm["realized_pnl_pct"])

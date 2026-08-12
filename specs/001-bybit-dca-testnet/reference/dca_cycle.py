@@ -72,13 +72,14 @@ class DcaCycle:
 
     def __init__(self, params: DcaParams, symbol: str, side: str,
                  qty_step: float, min_qty: float, tick_size: float,
-                 natr: float | None = None) -> None:
+                 natr: float | None = None, trend: str = "") -> None:
         if side not in ("Buy", "Sell"):
             raise ValueError(f"side должен быть Buy или Sell, получено {side!r}")
         self.p = params
         self.symbol = symbol
         self.side = side
         self.natr = natr               # NATR-14 сигнала скринера (адаптив шага/стопа)
+        self.trend = trend             # цвет UHLO скринера на входе: green (бычий) / red (медвежий)
         self.qty_step = qty_step
         self.min_qty = min_qty
         self.tick_size = tick_size
