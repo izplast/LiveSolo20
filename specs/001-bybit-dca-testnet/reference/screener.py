@@ -95,9 +95,21 @@ BOUNDARY_EPS = 1e-9
 class Config:
     bot_api_url: str = "http://127.0.0.1:8000"
     top_n_turnover: int = 600   # топ по обороту, из которого скринер ловит сигналы
+    # Первые N символов по обороту пропускаются: это низковолатильные гиганты
+    # (BTC, ETH...), на которых входная волатильность NATR почти никогда не
+    # доходит до порога, а подписка на их потоки тратит ресурсы впустую.
+    skip_top_volume: int = 30
     natr_period: int = 14
     natr_min: float = 0.9
     natr_max: float = 2.5          # отсечение «слишком рискованно»
+    # Базовая монета из этого списка исключается из вселенной целиком:
+    # индекс-токены (INXUSDT → INX), bStocks и прочее, что не ложится под
+    # стоп из-за гэпов. Дополняет встроенный DEFAULT_STOCK_BLACKLIST
+    # продакшн-скринера, не заменяет.
+    base_coin_blacklist: list[str] = field(default_factory=list)
+    # Явный blacklist символов по полному имени (INXUSDT, ...). Расширяемый:
+    # каждый символ исключается из вселенной при подборе.
+    blacklist: list[str] = field(default_factory=list)
     uhlo_length: int = 20
     tf_fast: str = "1"
     tf_slow: str = "15"
@@ -182,6 +194,8 @@ def validate_config(cfg: Config) -> None:
         problems.append("tf_slow должен быть старше tf_fast")
     if cfg.top_n_turnover < 1:
         problems.append("top_n_turnover >= 1")
+    if cfg.skip_top_volume < 0:
+        problems.append("skip_top_volume >= 0")
     if cfg.ws_topics_per_conn < 2:
         problems.append("ws_topics_per_conn >= 2 (по 2 топика на символ)")
     if problems:
@@ -529,12 +543,19 @@ class Screener:
 
         ranked = sorted(turnover.items(), key=lambda kv: kv[1], reverse=True)
         selected: list[str] = []
-        for symbol, turn in ranked:
+        for i, (symbol, turn) in enumerate(ranked):
+            if i < self.cfg.skip_top_volume:
+                continue
             info = mainnet.get(symbol)
             if info is None:
                 continue
             reason = None
-            if info["status"] != "Trading":
+            base = symbol[:-4] if symbol.endswith("USDT") else symbol
+            if symbol in self.cfg.blacklist:
+                reason = "symbol_blacklisted"
+            elif base in self.cfg.base_coin_blacklist:
+                reason = "base_coin_blacklisted"
+            elif info["status"] != "Trading":
                 reason = "not_trading"
             elif symbol not in testnet:
                 # Самая коварная из отсечённых причин: символ есть на mainnet,
@@ -847,9 +868,10 @@ class Screener:
 
 async def amain() -> int:
     cfg = load_config()
-    logger.info("скринер запущен: NATR %.2f..%.2f (период %d), UHLO %d, ТФ %s/%s, топ-%d по обороту",
+    logger.info("скринер запущен: NATR %.2f..%.2f (период %d), UHLO %d, ТФ %s/%s, топ-%d по обороту, "
+                "пропуск первых %d по объёму",
                 cfg.natr_min, cfg.natr_max, cfg.natr_period, cfg.uhlo_length,
-                cfg.tf_fast, cfg.tf_slow, cfg.top_n_turnover)
+                cfg.tf_fast, cfg.tf_slow, cfg.top_n_turnover, cfg.skip_top_volume)
 
     screener = Screener(cfg)
     loop = asyncio.get_running_loop()

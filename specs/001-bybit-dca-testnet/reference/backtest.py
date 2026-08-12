@@ -140,6 +140,12 @@ class DcaParams:
     sl_atr_mult: float = 0.0
     sl_min_pct: float = 0.0
     sl_max_pct: float = 0.0
+    # Жёсткий лимит убытка цикла в USDT (независимо от ценового стопа):
+    # при unrealized-убытке >= значения цикл закрывается рыночно с причиной
+    # hard_loss_limit. 0 — выключен. Цена срабатывания = цена, при которой
+    # убыток достигает лимита; если она ближе к входу, чем стоп, лимит
+    # срабатывает раньше.
+    max_cycle_loss_usdt: float = 0.0
 
     def validate(self) -> None:
         problems = []
@@ -173,6 +179,8 @@ class DcaParams:
             problems.append("sl_atr_mult >= 0")
         if self.sl_atr_mult and not (0 < self.sl_min_pct <= self.sl_max_pct):
             problems.append("стоп: 0 < sl_min_pct <= sl_max_pct при адаптиве")
+        if not self.max_cycle_loss_usdt >= 0:
+            problems.append("max_cycle_loss_usdt >= 0")
         if problems:
             raise ValueError("некорректные параметры DCA:\n- " + "\n- ".join(problems))
 
@@ -290,9 +298,18 @@ def fetch_instrument(symbol: str) -> dict:
     return {"symbol": symbol, "qty_step": 0.001, "min_qty": 0.001, "tick_size": 0.01}
 
 
-def fetch_universe(top_n: int, required_leverage: float) -> list[str]:
+def fetch_universe(top_n: int, required_leverage: float,
+                   skip_top_volume: int = 0,
+                   base_coin_blacklist: Sequence[str] = ()) -> list[str]:
     """Топ-N по turnover24h, как build_universe скринера (screener.py:521):
-    торгуемые на mainnet и Testnet, с max_leverage >= required_leverage."""
+    торгуемые на mainnet и Testnet, с max_leverage >= required_leverage.
+
+    skip_top_volume — пропустить первые N символов по обороту (низковолатильные
+    гиганты: BTC, ETH...), как skip_top_volume скринера.
+
+    base_coin_blacklist — исключить инструменты по базовой монете (INXUSDT →
+    INX), как base_coin_blacklist скринера.
+    """
     def _instruments(base: str) -> dict[str, dict]:
         out: dict[str, dict] = {}
         cursor: str | None = None
@@ -321,9 +338,14 @@ def fetch_universe(top_n: int, required_leverage: float) -> list[str]:
 
     ranked = sorted(turnover.items(), key=lambda kv: kv[1], reverse=True)
     selected: list[str] = []
-    for symbol, turn in ranked:
+    for i, (symbol, turn) in enumerate(ranked):
+        if i < skip_top_volume:
+            continue
         info = mainnet.get(symbol)
         if info is None or info["status"] != "Trading":
+            continue
+        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        if base in base_coin_blacklist:
             continue
         if symbol not in testnet or testnet[symbol]["status"] != "Trading":
             continue
@@ -557,6 +579,15 @@ class Backtest:
                           "qty": cyc.qty, "price": price})
         cyc.closed = True
 
+    def _hard_loss_price(self, cyc: Cycle, p: DcaParams) -> float | None:
+        """Цена, при которой unrealized-убыток цикла достигает
+        max_cycle_loss_usdt. None — лимит выключен."""
+        if not p.max_cycle_loss_usdt or cyc.qty <= 0:
+            return None
+        per_qty = p.max_cycle_loss_usdt / cyc.qty
+        return (cyc.avg_entry - per_qty if cyc.side == "Buy"
+                else cyc.avg_entry + per_qty)
+
     def _update_cycles(self, row: list, ts: int) -> None:
         o, h, l, c = row[1], row[2], row[3], row[4]
         eps = 1e-9
@@ -569,7 +600,14 @@ class Backtest:
                 while cyc.docups < p.max_docups and l <= cyc.next_level + eps:
                     fill = cyc.next_level * (1 + p.slippage_pct)
                     self._fill(cyc, fill, "dca", ts)
-                if cyc.stop_level and l <= cyc.stop_level:
+                # жёсткий лимит убытка в USDT считается после докупок (по новой
+                # средней); из стопа и лимита срабатывает тот, кто ближе к входу.
+                hard = self._hard_loss_price(cyc, p)
+                stop_hit = bool(cyc.stop_level and l <= cyc.stop_level)
+                hard_hit = hard is not None and l <= hard
+                if hard_hit and (not stop_hit or hard > cyc.stop_level):
+                    self._close(cyc, hard * (1 - p.slippage_pct), "hard_loss_limit", ts)
+                elif stop_hit:
                     self._close(cyc, cyc.stop_level * (1 - p.slippage_pct), "stop", ts)
                 elif h >= cyc.tp_level:
                     self._close(cyc, cyc.tp_level * (1 - p.slippage_pct), "take_profit", ts)
@@ -579,7 +617,12 @@ class Backtest:
                 while cyc.docups < p.max_docups and h >= cyc.next_level - eps:
                     fill = cyc.next_level * (1 - p.slippage_pct)
                     self._fill(cyc, fill, "dca", ts)
-                if cyc.stop_level and h >= cyc.stop_level:
+                hard = self._hard_loss_price(cyc, p)
+                stop_hit = bool(cyc.stop_level and h >= cyc.stop_level)
+                hard_hit = hard is not None and h >= hard
+                if hard_hit and (not stop_hit or hard < cyc.stop_level):
+                    self._close(cyc, hard * (1 + p.slippage_pct), "hard_loss_limit", ts)
+                elif stop_hit:
                     self._close(cyc, cyc.stop_level * (1 + p.slippage_pct), "stop", ts)
                 elif l <= cyc.tp_level:
                     self._close(cyc, cyc.tp_level * (1 + p.slippage_pct), "take_profit", ts)
@@ -702,6 +745,8 @@ def render(m: dict, params: DcaParams, verbose: bool = False) -> str:
         lines.append(f"Адаптивный стоп: NATR × {params.sl_atr_mult:g} в "
                      f"[{params.sl_min_pct:g}%, {params.sl_max_pct:g}%] "
                      f"(фолбэк {params.stop_pct:g}%)")
+    if params.max_cycle_loss_usdt > 0:
+        lines.append(f"Жёсткий лимит убытка цикла: {params.max_cycle_loss_usdt:g} USDT")
     if params.tp_escalation:
         lines.append("Поуровневый TP: " + "/".join(f"{x:g}%" for x in params.tp_escalation))
     lines.append(f"Сигналы: {m['signals']} (отклонено по лимиту циклов: {m['rejected_limit']})")

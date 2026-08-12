@@ -6,6 +6,9 @@ __pycache__/
 logs/
 signals_inbox.json
 
+# Кэш загруженных свечей (backtest / ab_sl)
+data/cache/
+
 # Виртуальные окружения
 .venv/
 .venv-screener/

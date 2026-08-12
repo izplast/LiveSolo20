@@ -259,6 +259,12 @@ ok("топ-N по turnover24h", bt.fetch_universe(2, 3.0) == ["BTCUSDT", "ETHUSD
 u5 = bt.fetch_universe(5, 3.0)
 ok("отсекаются Suspended, отсутствующие на Testnet и с малым плечом",
    u5 == ["BTCUSDT", "ETHUSDT", "XUSDT"], u5)
+u_skip = bt.fetch_universe(5, 3.0, skip_top_volume=2)
+ok("skip_top_volume пропускает первых N по обороту",
+   u_skip == ["XUSDT"], u_skip)
+u_bl = bt.fetch_universe(5, 3.0, base_coin_blacklist=["ETH"])
+ok("base_coin_blacklist исключает по базовой монете",
+   u_bl == ["BTCUSDT", "XUSDT"], u_bl)
 
 
 def fake_empty(url: str) -> dict:
@@ -396,6 +402,45 @@ b13._update_cycles([T4 + 60_000, 100.0, 100.05, 97.0, 98.0, 1.0], T4 + 60_000)
 ok("пробой стопа → закрытие по стопу", st.exit_reason == "stop", st.exit_reason)
 ok("стоп — убыток с учётом комиссий",
    st.pnl < 0 and [f["role"] for f in st.fills] == ["entry", "close"])
+
+# ── 13a. Жёсткий лимит убытка цикла (max_cycle_loss_usdt) ─────────────────────
+
+print("\nжёсткий лимит убытка цикла")
+ok("отрицательный max_cycle_loss_usdt отвергается",
+   raises(lambda: bt.DcaParams(max_cycle_loss_usdt=-1).validate()))
+hl = bt.DcaParams(entry_usdt=50, stop_pct=5.0, max_docups=0,
+                  max_cycle_loss_usdt=2.0)  # 50/100 = 0.5 → лимит на 96.0
+b13a = bt.Backtest(sc.Config(), hl, "BTCUSDT", INST)
+T5 = 5 * 10 ** 12
+b13a._open_cycle("Buy", T5, 100.0)
+st_a = b13a.open[0]
+b13a._update_cycles([T5 + 60_000, 100.0, 100.05, 95.5, 98.0, 1.0], T5 + 60_000)
+ok("лимит ближе к входу, чем стоп 5% (96.0 > 95.0) → закрытие по hard_loss_limit",
+   st_a.exit_reason == "hard_loss_limit", st_a.exit_reason)
+ok("убыток лимита ≈ 2 USDT (с slippage и комиссиями)",
+   1.5 < -st_a.pnl < 2.5, st_a.pnl)
+
+b13b = bt.Backtest(sc.Config(), bt.DcaParams(entry_usdt=50, stop_pct=2.0,
+                                             max_docups=0,
+                                             max_cycle_loss_usdt=5.0),
+                   "BTCUSDT", INST)
+T6 = 6 * 10 ** 12
+b13b._open_cycle("Buy", T6, 100.0)
+st_b = b13b.open[0]
+b13b._update_cycles([T6 + 60_000, 100.0, 100.05, 97.0, 98.0, 1.0], T6 + 60_000)
+ok("стоп 2% ближе к входу, чем лимит 5 USDT → обычный stop",
+   st_b.exit_reason == "stop", st_b.exit_reason)
+
+b13c = bt.Backtest(sc.Config(), bt.DcaParams(entry_usdt=50, stop_pct=0.0,
+                                             max_docups=0,
+                                             max_cycle_loss_usdt=2.0),
+                   "BTCUSDT", INST)
+T7 = 7 * 10 ** 12
+b13c._open_cycle("Buy", T7, 100.0)
+st_c = b13c.open[0]
+b13c._update_cycles([T7 + 60_000, 100.0, 100.05, 95.5, 98.0, 1.0], T7 + 60_000)
+ok("лимит работает и при выключенном ценовом стопе",
+   st_c.exit_reason == "hard_loss_limit", st_c.exit_reason)
 
 # ── 14. Подавление повтора и лимит циклов (FR-015) ───────────────────────────
 

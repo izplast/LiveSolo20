@@ -529,7 +529,8 @@ def _pick_by_universe(cfg: "sc.Config", top_n: int,
     сигнала нет ни у кого; NATR и цвет — для адаптивного шага/стопа и тренда
     выбранного цикла.
     """
-    symbols = bt.fetch_universe(top_n, cfg.required_leverage)
+    symbols = bt.fetch_universe(top_n, cfg.required_leverage, cfg.skip_top_volume,
+                                cfg.base_coin_blacklist)
     if not symbols:
         return None, None, None, None, ["вселенная пуста: fetch_universe не вернул монет"]
     now_ms = int(time.time() * 1000)
