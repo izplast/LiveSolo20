@@ -24,6 +24,7 @@ max_hold_minutes). Этот модуль — маппер между ними, �
   sl_atr_mult       → sl_atr_mult   (адаптивный стоп от NATR, 0 — фиксированный hard_sl_pct)
   sl_min_pct        → sl_min_pct    (нижний зажим адаптивного стопа, %)
   sl_max_pct        → sl_max_pct    (верхний зажим адаптивного стопа, %)
+  max_cycle_loss_usdt → max_cycle_loss_usdt (жёсткий лимит убытка цикла в USDT)
 
 Запуск проверок:
     python3 specs/001-bybit-dca-testnet/reference/test_bot_config.py
@@ -154,6 +155,7 @@ def dca_params_from_config(dca: dict) -> DcaParams:
     sl_atr_mult=float(dca.get("sl_atr_mult", 0.0)),
     sl_min_pct=float(dca.get("sl_min_pct", 0.0)),
     sl_max_pct=float(dca.get("sl_max_pct", 0.0)),
+    max_cycle_loss_usdt=float(dca.get("max_cycle_loss_usdt", 0.0)),
 )
     p.validate()
     return p

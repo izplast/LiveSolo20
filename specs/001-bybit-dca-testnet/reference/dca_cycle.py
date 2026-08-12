@@ -152,6 +152,17 @@ class DcaCycle:
         if stop_hit:
             self._market_close(orderbook, "stop", now_ms)
             return
+        # Жёсткий лимит убытка цикла в USDT: страховка от глубокого убытка,
+        # когда ценовой стоп не успел/не смог выйти (проскальзывание, гэп).
+        hard = self._hard_loss_price()
+        if hard is not None:
+            if self.side == "Buy":
+                hard_hit = best_bid <= hard
+            else:
+                hard_hit = best_ask >= hard
+            if hard_hit:
+                self._market_close(orderbook, "hard_loss_limit", now_ms)
+                return
         if now_ms - self.open_ts >= self.p.max_hold_minutes * 60_000:
             self._market_close(orderbook, "time_exit", now_ms)
 
@@ -198,6 +209,16 @@ class DcaCycle:
         self._cancel_aux_orders()
 
     # ── пересчёт уровней после филла входа/докупки (FR-011) ───────────────────
+
+    def _hard_loss_price(self) -> float | None:
+        """Цена, при которой unrealized-убыток цикла достигает
+        max_cycle_loss_usdt. None — лимит выключен."""
+        p = self.p
+        if not p.max_cycle_loss_usdt or self.qty <= 0:
+            return None
+        per_qty = p.max_cycle_loss_usdt / self.qty
+        return (self.avg_entry - per_qty if self.side == "Buy"
+                else self.avg_entry + per_qty)
 
     def _after_position_change(self) -> None:
         p = self.p
