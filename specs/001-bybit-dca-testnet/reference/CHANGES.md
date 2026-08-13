@@ -774,6 +774,38 @@ params/grid, apply_overrides, rank/top-k, таблица, resolve_combos/window,
 
 Суммарно по reference-слою без сети: 624 ok, 0 fail.
 
+## Единый автораннер tools/run_tests.py (2026-08-13)
+
+Раньше проверки запускались по одному: `python3 reference/test_*.py` по очереди.
+Теперь есть одна точка входа — `tools/run_tests.py` (T020) с тремя секциями:
+
+- **`--unit`** — прогон всех `reference/test_*.py` (юнит-, интеграционные и
+  A/B), сводка по фазам (A/B / интеграционные / юнит), итог ok/fail;
+- **`--config`** — валидация `config/config.yml` на совпадение параметров с
+  логикой бэктеста/бота: секция dca → `DcaParams` (`ab_common.build_params`,
+  тот же путь, что у бэктеста и бота), секция screener → `Config` скринера
+  (`ab_common.load_screener_cfg`), согласованность `dca.leverage` ==
+  `screener.required_leverage` и границ `natr_min` < `natr_max`;
+- **`--journal`** — разбор журналов Testnet (`logs/bot-events.jsonl`,
+  `logs/screener-events.jsonl`; пути берутся из config.yml) сводкой
+  `reference/report.py`: вердикты SC-001..SC-005, отчёт об ошибках (битые
+  строки) и простоях (слепые интервалы), плюс опциональный текстовый
+  `--app-log logs/app.log`.
+
+Секции по умолчанию включены все (отключаются флагами). Код выхода 0 — всё
+прошло, 1 — есть провалы. Журналов нет — «нет данных», а не провал. Внешних
+зависимостей нет: reference-модули импортируются через importlib по пути, как
+в `test_*.py`.
+
+Покрытие: **`reference/test_run_tests.py`** — 37 проверок, 0 fail (фазы,
+discover/run/parse итогов, unit_summary, validate_config на реальном и битом
+конфиге, SC-вердикты по синтетическим журналам, битые строки, scan_text_log;
+без сети).
+
+Суммарно по reference-слою без сети: 661 ok, 0 fail.
+
+
+
 
 
 

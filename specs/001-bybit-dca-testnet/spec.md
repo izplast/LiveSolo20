@@ -239,3 +239,19 @@ python3 specs/001-bybit-dca-testnet/reference/ab_grid.py --days 30 --universe 40
 Сводные метрики и ранжирование выводятся таблицей; полные результаты (все
 комбинации, без ограничения `--top-k`) пишутся в `--out`. Покрытие:
 `reference/test_ab_tools.py` — 89 проверок без сети.
+
+## Единый автораннер (Phase 8, расширение этапа)
+
+Все проверки проекта запускаются одной командой — `tools/run_tests.py` (T020).
+Три секции, по умолчанию включены все:
+
+| Секция | Что проверяет |
+|--------|---------------|
+| `--unit` | прогон всех `reference/test_*.py` (юнит-, интеграционные и A/B), сводка по фазам и итог ok/fail |
+| `--config` | валидация `config/config.yml` на совпадение с логикой бэктеста/бота: секция `dca` → `DcaParams` (тот же путь, что у бэктеста и бота), секция `screener` → `Config` скринера, согласованность `dca.leverage` == `screener.required_leverage` и `natr_min` < `natr_max` |
+| `--journal` | разбор журналов Testnet (`logs/bot-events.jsonl`, `logs/screener-events.jsonl`; пути из config.yml) сводкой `reference/report.py`: вердикты SC-001..SC-005, отчёт об ошибках (битые строки) и простоях (слепые интервалы); опционально `--app-log logs/app.log` |
+
+Запуск: `python3 tools/run_tests.py` (всё), `--unit`/`--config`/`--journal`
+по отдельности, `--json` — машиночитаемый вывод. Код выхода 0 — всё прошло, 1 —
+есть провалы; отсутствие журналов — «нет данных», а не провал. Покрытие:
+`reference/test_run_tests.py` — 37 проверок без сети.
