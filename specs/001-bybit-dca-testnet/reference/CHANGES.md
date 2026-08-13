@@ -730,6 +730,50 @@ BLESS, AKE, ACE, GWEI, EPIC, BTW, MUBARAK…): мейджоры за 30 дней
 
 Прогон: `python3 reference/run_sim.py live --seconds 3600 --metrics-interval 15`.
 
+## Формализация A/B-инструментов: общий каркас ab_common.py (2026-08-13)
+
+`ab_sl.py` и `ab_grid.py` раньше дублировали логику (метрики, таблицы, разбор
+грида). Теперь оба построены на общем каркасе `reference/ab_common.py`, а CLI
+и вывод приведены к единому виду (T019).
+
+**`reference/ab_common.py`** — метрики (`METRICS`: total_pnl/wr/total/avg_tp/
+avg_sl/mdd с направлением «лучше-меньше»), типизация значений (`coerce`:
+bool/кортеж/список/int/float), разбор комбинаций (`parse_params` — одна
+конфигурация через `;`, `parse_grid` — декартово произведение через `,`),
+применение переопределений к свежим DcaParams/Config (`apply_overrides`),
+подписи (`label`), сводка по закрытым циклам (`aggregate`), таблица
+(`render_table`), ранжирование и топ (`rank_results`/`take_top`), выбор
+комбинаций с Baseline (`resolve_combos`), окно периода, инвариантное к
+перезапускам (`resolve_window`), параллельная загрузка данных (`load_data`),
+прогон всех комбинаций (`run_combos`).
+
+**Единый CLI обоих скриптов** (прежние `--sort`/`--json-out` сохранены как
+синонимы `--metric`/`--out`):
+
+- `--params "bot.поле=з;..."` — одна конкретная конфигурация (повторяемый,
+  с `--grid` несовместим);
+- `--grid "bot.поле=з1,з2"` — перебираемый параметр (произведение);
+- `--metric` — метрика рейтинга (по умолчанию total_pnl);
+- `--top-k N` — только топ-N строк таблицы;
+- `--out FILE` — полные результаты в JSON;
+- `--no-baseline` — без строки с дефолтами config.yml.
+
+**`ab_sl.py`** — прежние 4 гипотезы SL (`CONFIGS`) остались значениями по
+умолчанию и выражаются теперь как переопределения `bot.max_docups` /
+`bot.sl_atr_mult` / `bot.max_cycle_loss_usdt`; свои гипотезы задаются
+`--params`/`--grid`.
+
+**`ab_grid.py`** — добавлены `--params` (отдельные конфигурации) и `--top-k`;
+`--metric`/`--out` — синонимы прежних `--sort`/`--json-out`.
+
+Сводные метрики и ранжирование выводятся таблицей; `--out` пишет все комбинации
+в ранжированном виде без ограничения топа. Покрытие:
+**`reference/test_ab_tools.py`** — 89 проверок, 0 fail (метрики, coerce, разбор
+params/grid, apply_overrides, rank/top-k, таблица, resolve_combos/window, CLI
+обоих скриптов; без сети).
+
+Суммарно по reference-слою без сети: 624 ok, 0 fail.
+
 
 
 
