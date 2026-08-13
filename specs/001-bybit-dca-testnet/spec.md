@@ -255,3 +255,22 @@ python3 specs/001-bybit-dca-testnet/reference/ab_grid.py --days 30 --universe 40
 по отдельности, `--json` — машиночитаемый вывод. Код выхода 0 — всё прошло, 1 —
 есть провалы; отсутствие журналов — «нет данных», а не провал. Покрытие:
 `reference/test_run_tests.py` — 37 проверок без сети.
+
+## Визуальные отчёты: графики по эквити и просадкам (Phase 8, расширение этапа)
+
+`reference/report_charts.py` (T021) строит графики без внешних библиотек
+(SVG — вручную как XML, PNG — собственным растровым writer'ом на zlib/struct).
+
+| Режим | Что рисует | Вход |
+|-------|------------|------|
+| `--kind equity` | кривая эквити (кумулятивный PnL по закрытым циклам) и просадка от пика, двумя панелями | сделки бэктеста: `backtest.Cycle` или JSON `[{exit_ts, pnl}]` / `{"cycles": [...]}` |
+| `--kind metrics` | сводная столбчатая диаграмма по метрике `--metric` (по умолчанию `total_pnl`) | результаты ab_grid (`--out` JSON: `[{label, metrics}]`) |
+
+Запуск:
+
+```bash
+python3 reference/report_charts.py --kind equity --input trades.json --out equity.svg
+python3 reference/report_charts.py --kind metrics --input ab_grid.json --metric wr --out metrics.png
+```
+
+Покрытие: `reference/test_report_charts.py` — 36 проверок без сети.

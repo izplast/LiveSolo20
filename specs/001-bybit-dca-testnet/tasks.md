@@ -109,7 +109,7 @@
 
 - [x] T019 Формализовать инструменты A/B-тестирования и грид-свипа (reference/ab_sl.py, reference/ab_grid.py) в архитектуру проекта: общий каркас reference/ab_common.py (метрики, parse_params/parse_grid, coerce, apply_overrides, aggregate, render_table, rank_results/take_top, resolve_combos, resolve_window, load_data, run_combos); единый CLI обоих скриптов (--params, --grid, --metric/--sort, --top-k, --out/--json-out, --no-baseline) с выводом итоговых метрик и ранжирования; описание в spec.md и data-model.md, раздел в reference/CHANGES.md; reference/test_ab_tools.py — 89 проверок, 0 fail
 - [x] T020 Интегрировать единый автораннер tools/run_tests.py для комплексной проверки юнит-тестов reference/ и анализа логов Testnet: прогон всех test_*.py, сводка по фазам, разбор JSONL-журналов cycle_journal/metrics, отчёт об ошибках и простоях; валидация config.yml против логики бэктеста/бота (dca → DcaParams, screener → Config, согласованность leverage/NATR); журналы → SC-001..SC-005 через reference/report.py; reference/test_run_tests.py — 37 проверок, 0 fail; суммарно 661 ok, 0 fail
-- [ ] T021 Добавить генератор визуал-отчётов / графиков по эквити и просадкам (reference/report_charts.py): экспорт PNG/SVG из бэктестов (backtest.py) и грид-свипа (ab_grid.py), кривые эквити, drawdown, сводные столбчатые диаграммы по метрикам
+- [x] T021 Добавить генератор визуал-отчётов / графиков по эквити и просадкам (reference/report_charts.py): экспорт PNG/SVG из бэктестов (backtest.py) и грид-свипа (ab_grid.py), кривые эквити, drawdown, сводные столбчатые диаграммы по метрикам; без внешних библиотек (SVG вручную, PNG — собственный writer на zlib/struct); reference/test_report_charts.py — 36 проверок, 0 fail; суммарно 697 ok, 0 fail
 
 ---
 
