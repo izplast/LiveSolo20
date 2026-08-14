@@ -1069,3 +1069,38 @@ render/to_dict).
 
 Суммарно по reference-слою без сети: 897 ok, 0 fail.
 
+## T030 — Exponential Backoff & Circuit Breaker
+
+Раньше обработка сетевых сбоев была точечной (`_http_get` в backtest.py с
+фиксированными паузами, reconnect в screener.py без предохранителя): при
+продолжительном сбое API клиент долбил бы Bybit и рисковал баном по IP или
+rate-limit. T030 добавляет общий слой устойчивости `reference/resilience.py`:
+
+- **`ExponentialBackoff`** — задержка между попытками растёт экспоненциально
+  (`base * factor^(attempt-1)`), ограничена `max_delay`; опциональный `jitter`
+  умножает задержку на `(1 - jitter*u)`, `u ∈ [0,1)`, чтобы параллельные
+  клиенты не синхронизировали «волну» повторных запросов после общего сбоя;
+- **`CircuitBreaker`** — предохранитель в трёх состояниях: `closed` (норма,
+  сбой увеличивает счётчик, при `failure_threshold` — размыкание), `open`
+  (`allow_request()` = False — вызовы мгновенно отклоняются, API отдыхает
+  `cooldown` секунд), `half_open` (после cooldown пропускается до
+  `half_open_limit` пробных запросов; `record_success` закрывает, сбой снова
+  размыкает). Часы инъектируемы (`clock`) — проверяется без реальных пауз;
+- **`ResilientCaller`** — обёртка вызова: `call(fn)` повторяет `fn()` на
+  сетевых ошибках (`ConnectionError`/`TimeoutError`/`OSError`) и 5xx/429
+  (`ResponseError(status)`), между попытками ждёт `backoff.delay(attempt)`
+  (пауза — инъекция `sleep`), и пропускает через предохранитель. Результат —
+  значение `fn()`; иначе `CircuitOpenError` (разомкнут) или `MaxRetriesError`
+  (попытки исчерпаны, причина в `__cause__`). Не-retryable исключения
+  (400, ValueError и пр.) всплывают без ретраев;
+- `is_retryable_status(429/5xx)` и `default_retryable` — единый решатель,
+  кастомный предикат и `max_attempts` передаются в `call()`.
+
+Покрытие: `reference/test_resilience.py` — 33 проверки (математика backoff
+и jitter, состояния предохранителя с управляемыми часами, ретраи сетевых
+ошибок/429/5xx до успеха, не-retryable без ретраев, исчерпание попыток,
+мгновенное отклонение при open, восстановление через half_open, кастомный
+предикат), все — с моками сбоев без сети.
+
+Суммарно по reference-слою без сети: 930 ok, 0 fail.
+

@@ -440,3 +440,23 @@ python3 tools/run_tests.py --history-path logs/test_runs.jsonl --history-version
 `to_dict()` для журнала. API — инъекция, тесты без сети.
 
 Покрытие: `reference/test_reconcile.py` — 24 проверки.
+
+### Exponential Backoff & Circuit Breaker (Phase 10, Live Integration)
+
+`reference/resilience.py` (T030) — слой устойчивости к сетевым сбоям, без
+внешних зависимостей:
+
+| Компонент | Что даёт |
+|-----------|----------|
+| `ExponentialBackoff` | задержка `base * factor^(attempt-1)` ≤ `max_delay`, опциональный jitter для дерандомизации параллельных клиентов |
+| `CircuitBreaker` | `closed`/`open`/`half_open`: после `failure_threshold` сбоев — размыкание на `cooldown`, затем пробные запросы; успех закрывает, сбой снова размыкает |
+| `ResilientCaller.call(fn)` | ретраи на сетевых ошибках и 5xx/429 (`ResponseError`), пауза по backoff (инъекция `sleep`), пропуск через предохранитель; `CircuitOpenError` / `MaxRetriesError` / не-retryable всплывают без ретраев |
+
+HTTP-слой бросает `ResponseError(status, ...)`; `is_retryable_status`
+(429/5xx) и `default_retryable` — единый решатель, кастомный предикат и
+`max_attempts` передаются в `call()`. Сетевые вызовы, паузы и часы —
+инъекция, поэтому проверяется без сети и без реальных ожиданий.
+
+Покрытие: `reference/test_resilience.py` — 33 проверки (backoff, состояния
+предохранителя, ретраи/исчерпание, мгновенное отклонение при open,
+восстановление через half_open), все — с моками сбоев.
