@@ -862,6 +862,31 @@ Testnet (которого может не быть месяцами), либо �
 
 Суммарно по reference-слою без сети: 733 ok, 0 fail.
 
+## Экспорт сделок из бэктеста: --out-cycles (2026-08-14)
+
+До T023 закрытые циклы бэктеста были видны только в текстовом отчёте и в
+`--json`-сводке без деталей сделок. Теперь `reference/backtest.py` (T023) умеет
+выгружать их для `reference/report_charts.py --kind equity`:
+
+```bash
+python3 reference/backtest.py --symbol BTCUSDT --days 30 --out-cycles trades.json
+python3 reference/backtest.py --symbol BTCUSDT --days 30 --out-cycles trades.jsonl
+```
+
+- `.json` — обёртка `{"cycles": [...], "title": "<символы>"}` — ровно тот вход,
+  который `report_charts.load_input` уже понимает;
+- `.jsonl` — одна строка JSON на цикл (для конвейера);
+- поля цикла: `exit_ts`, `pnl`, `symbol`, `side`, `open_ts`, `exit_reason`,
+  `exit_price`, `avg_entry`, `duration_ms`, `docups`, `fee` (минимальный набор
+  для equity-графика — `exit_ts`/`pnl`, остальное — диагностика);
+- циклы пишутся отсортированными по `exit_ts`; число выгруженных — в stderr.
+
+Покрытие: **`reference/test_backtest_out.py`** — 21 проверка, 0 fail
+(cycle_to_dict, write_cycles .json/.jsonl, сортировка, CLI --out-cycles,
+сквозной приём вывода report_charts.py; без сети).
+
+Суммарно по reference-слою без сети: 754 ok, 0 fail.
+
 
 
 

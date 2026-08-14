@@ -292,3 +292,23 @@ python3 reference/report_charts.py --kind metrics --input ab_grid.json --metric 
 ```
 
 Покрытие: `reference/test_report_charts.py` — 36 проверок без сети.
+
+### Экспорт сделок из бэктеста (Phase 9, Next Scope)
+
+`reference/backtest.py` (T023) выгружает закрытые циклы флагом `--out-cycles`:
+
+| Формат | Содержимое | Назначение |
+|--------|------------|------------|
+| `.json` | `{"cycles": [...], "title": "<символы>"}` | вход `report_charts.py --kind equity` напрямую |
+| `.jsonl` | одна строка JSON на цикл | конвейер/скрипты |
+
+Поля цикла: `exit_ts`, `pnl`, `symbol`, `side`, `open_ts`, `exit_reason`,
+`exit_price`, `avg_entry`, `duration_ms`, `docups`, `fee`. Минимальный набор
+для equity-графика — `exit_ts`/`pnl`; остальное — диагностика сделки.
+
+```bash
+python3 reference/backtest.py --symbol BTCUSDT --days 30 --out-cycles trades.json
+python3 reference/report_charts.py --kind equity --input trades.json --out equity.png
+```
+
+Покрытие: `reference/test_backtest_out.py` — 21 проверка без сети.

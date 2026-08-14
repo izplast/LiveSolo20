@@ -26,6 +26,9 @@ tools/backtest.py — прогон стратегии DCA-бота на исто
         --dca-step-pct 0.8 --max-docups 3 --tp-pct 1.0 --max-hold-minutes 240 \
         --fee-rate 0.00055 --slippage-pct 0.0005
     python3 tools/backtest.py --csv data/btc-1m.csv --days 30
+    python3 tools/backtest.py --symbol BTCUSDT --days 30 \
+        --out-cycles trades.json            # JSON для report_charts.py --kind equity
+    python3 tools/backtest.py --symbol BTCUSDT --days 30 --out-cycles trades.jsonl
 
 CSV: одна строка на свечу, заголовок с колонками ts/open/high/low/close
 (ts — мс; допустим также epoch-секунды — определяются автоматически).
@@ -718,6 +721,43 @@ def summarize(result: RunResult) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def cycle_to_dict(cyc: Cycle) -> dict:
+    """Закрытый цикл → словарь для экспорта (совместим с report_charts.py).
+
+    Поля для equity-графика: exit_ts/pnl (минимальный набор); остальные —
+    диагностика сделки: symbol, side, open_ts, exit_reason, exit_price,
+    avg_entry, duration_ms, docups, fee.
+    """
+    return {
+        "exit_ts": cyc.exit_ts,
+        "pnl": round(cyc.pnl, 6),
+        "symbol": cyc.symbol,
+        "side": cyc.side,
+        "open_ts": cyc.open_ts,
+        "exit_reason": cyc.exit_reason,
+        "exit_price": round(cyc.exit_price, 8),
+        "avg_entry": round(cyc.avg_entry, 8),
+        "duration_ms": cyc.exit_ts - cyc.open_ts,
+        "docups": cyc.docups,
+        "fee": round(cyc.fee, 6),
+    }
+
+
+def write_cycles(closed: Sequence[Cycle], path: str, title: str = "") -> int:
+    """Экспорт закрытых циклов: .jsonl — строка на цикл; иначе JSON-обёртка
+    {"cycles": [...], "title": ...} — вход report_charts.py --kind equity."""
+    rows = [cycle_to_dict(c) for c in sorted(closed, key=lambda c: c.exit_ts)]
+    if path.endswith(".jsonl"):
+        with open(path, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"cycles": rows, "title": title}, f,
+                      ensure_ascii=False, indent=2)
+    return len(rows)
+
+
 def _fmt_dt(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
 
@@ -811,6 +851,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="верхняя граница NATR (по умолчанию — как у скринера: 2.5)")
     ap.add_argument("--verbose", action="store_true", help="детальный список сделок")
     ap.add_argument("--json", action="store_true", dest="as_json")
+    ap.add_argument("--out-cycles", default=None, metavar="PATH",
+                    help="экспорт закрытых циклов: .jsonl — строка на цикл, "
+                         "иначе JSON {\"cycles\": [...], \"title\": ...} для "
+                         "report_charts.py --kind equity")
     return ap
 
 
@@ -852,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
     sys.stderr.write(f"[backtest] вселенная: {len(symbols)} символов, "
                      f"первые: {', '.join(symbols[:5])}…\n")
     summaries = []
+    all_closed: list[Cycle] = []
     for symbol in symbols:
         sys.stderr.write(f"[backtest] {symbol}: загрузка данных…\n")
         if args.csv:
@@ -871,6 +916,7 @@ def main(argv: list[str] | None = None) -> int:
         # список со «спящими» закрытыми циклами — иначе сводка считает их открытыми.
         result.open = bt.open
         result.closed.sort(key=lambda c: c.exit_ts)
+        all_closed.extend(result.closed)
         m = summarize(result)
         m["_cycles"] = result.closed
         summaries.append(m)
@@ -895,6 +941,11 @@ def main(argv: list[str] | None = None) -> int:
               if closed else "Закрытых сделок нет")
         print(f"Суммарный PnL: {total:+.2f} USDT (комиссии {fees:.2f})")
         print(f"Макс. просадка по символам: {mdd:.2f} USDT")
+
+    if args.out_cycles:
+        title = ", ".join(m["symbol"] for m in summaries)
+        n = write_cycles(all_closed, args.out_cycles, title=title)
+        sys.stderr.write(f"[backtest] циклов экспортировано: {n} → {args.out_cycles}\n")
     return 0
 
 
