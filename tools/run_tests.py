@@ -13,7 +13,11 @@ tools/run_tests.py — единый автораннер проверок про
   --journal   разбор журналов Testnet (logs/bot-events.jsonl,
               logs/screener-events.jsonl и опционально logs/app.log):
               сводка reference/report.py, вердикты SC-001..SC-005, отчёт об
-              ошибках (битые строки) и простоях (слепые интервалы).
+              ошибках (битые строки) и простоях (слепые интервалы);
+  --journal-sim  прогон синтетических сценариев журналов (reference/
+              journal_sim.py): stable/violations/downtime/short — сводка
+              report.py по детерминированной генерации (seed) и сверка
+              вердиктов SC с ожидаемыми для каждого сценария.
 
 Запуск:
 
@@ -21,6 +25,7 @@ tools/run_tests.py — единый автораннер проверок про
     python3 tools/run_tests.py --unit                   # только тесты
     python3 tools/run_tests.py --config                 # только config
     python3 tools/run_tests.py --journal                # только журналы
+    python3 tools/run_tests.py --journal-sim            # только симуляция журналов
     python3 tools/run_tests.py --json                   # машиночитаемый вывод
     python3 tools/run_tests.py --ref-dir specs/001-bybit-dca-testnet/reference
     python3 tools/run_tests.py --config-path config/config.yml
@@ -61,6 +66,9 @@ DEFAULT_APP_LOG = os.path.join(_REPO_ROOT, "logs", "app.log")
 # Критерии приёмки, проверяемые по журналам (остальные SC-* требуют ручной
 # проверки или истории счёта и в автораннере только перечисляются).
 SC_JOURNAL_CODES = ("SC-001", "SC-002", "SC-003", "SC-004", "SC-005")
+
+# Сценарии синтетических журналов для секции journal-sim.
+JOURNAL_SIM_SCENARIOS = ("stable", "violations", "downtime", "short")
 
 # Фазы для сводки: тест → категория по имени файла.
 def _phase(name: str) -> str:
@@ -261,6 +269,32 @@ def journal_ok(res: dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Секция journal-sim: синтетические сценарии журналов
+# ---------------------------------------------------------------------------
+
+def journal_sim_section(scenarios: Sequence[str] = JOURNAL_SIM_SCENARIOS,
+                        seed: int = 0) -> dict[str, Any]:
+    """Прогон сценариев journal_sim.py и сверка вердиктов SC с ожидаемыми.
+
+    Возвращает {scenario: {ok, details}}; каждый detail — {код, ожидалось,
+    получено, ok}. Ошибка загрузки генератора помечается флагом error."""
+    js = load_reference("journal_sim")
+    results: dict[str, Any] = {}
+    for name in scenarios:
+        try:
+            ok, details = js.check_scenario(name, seed=seed)
+            results[name] = {"ok": bool(ok), "details": details}
+        except Exception as e:
+            results[name] = {"ok": False, "error": str(e)}
+    return results
+
+
+def journal_sim_ok(res: dict[str, Any]) -> bool:
+    """Секция journal-sim прошла: каждый сценарий сошёлся с ожидаемым."""
+    return all(r.get("ok") for r in res.values())
+
+
+# ---------------------------------------------------------------------------
 # Вывод
 # ---------------------------------------------------------------------------
 
@@ -327,6 +361,21 @@ def render_journal(res: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_journal_sim(res: dict[str, Any]) -> str:
+    lines = ["Симуляция журналов Testnet (journal_sim.py, вердикты SC)"]
+    for name, r in sorted(res.items()):
+        if "error" in r:
+            lines.append(f"  [{_mark(False)}] {name}: {r['error']}")
+            continue
+        status = "ok" if r["ok"] else "FAIL"
+        lines.append(f"  [{status}] {name}")
+        for d in r["details"]:
+            mark = _mark(d["ok"])
+            lines.append(f"       [{mark}] {d['код']}: ожидалось "
+                         f"{d['ожидалось']}, получено {d['получено']}")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -341,6 +390,8 @@ def run_sections(args: argparse.Namespace) -> dict[str, Any]:
         out["config"] = validate_config(args.config_path)
     if args.journal:
         out["journal"] = journal_section(args.journals, app_log=args.app_log)
+    if args.journal_sim:
+        out["journal_sim"] = journal_sim_section(seed=args.journal_sim_seed)
     return out
 
 
@@ -352,6 +403,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     help="валидировать config.yml против логики бэктеста/бота")
     ap.add_argument("--journal", action="store_true",
                     help="разобрать журналы Testnet, вердикты SC-001..SC-005")
+    ap.add_argument("--journal-sim", action="store_true",
+                    help="прогнать синтетические сценарии журналов "
+                         "(journal_sim.py) и сверить вердикты SC")
+    ap.add_argument("--journal-sim-seed", type=int, default=0,
+                    help="seed генерации сценариев (по умолчанию 0)")
     ap.add_argument("--ref-dir", default=DEFAULT_REF_DIR,
                     help=f"reference-каталог (по умолчанию {DEFAULT_REF_DIR})")
     ap.add_argument("--config-path", default=DEFAULT_CONFIG,
@@ -366,8 +422,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     # Если секции не указаны — запускаем все.
-    if not (args.unit or args.config or args.journal):
-        args.unit = args.config = args.journal = True
+    if not (args.unit or args.config or args.journal or args.journal_sim):
+        args.unit = args.config = args.journal = args.journal_sim = True
 
     # Журналы по умолчанию: из config.yml, иначе стандартные пути.
     if args.journal_files is None:
@@ -400,10 +456,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "broken": j["broken"], "verdicts": j["verdicts"],
                 "app_log": j["app_log"],
             }
+        if "journal_sim" in results:
+            payload["journal_sim"] = {
+                name: {"ok": r["ok"], "details": r.get("details")}
+                for name, r in results["journal_sim"].items()
+            }
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     else:
         sections = [("unit", render_unit), ("config", render_config),
-                    ("journal", render_journal)]
+                    ("journal", render_journal),
+                    ("journal_sim", render_journal_sim)]
         for key, render in sections:
             if key in results:
                 print(render(results[key]))
@@ -417,6 +479,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         failed |= any(not c["ok"] for c in results["config"])
     if "journal" in results:
         failed |= not journal_ok(results["journal"])
+    if "journal_sim" in results:
+        failed |= not journal_sim_ok(results["journal_sim"])
     return 1 if failed else 0
 
 

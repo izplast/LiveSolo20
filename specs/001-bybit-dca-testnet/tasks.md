@@ -113,6 +113,20 @@
 
 ---
 
+## Phase 9: Next Scope (эксплуатация и аналитика)
+
+**Purpose**: прочность прогона Testnet (проверяемость SC на синтетике), экспорт сделок из бэктеста, консистентность конфига между ботом и симулятором, аналитика метрик.
+
+- [x] T022 Сквозной прогон журналов на синтетике: reference/journal_sim.py — генератор JSONL за 72 ч (события скринера и бота по контракту contracts/journal.md) с разными сценариями (stable/violations/downtime/short), детерминирован seed; прогон через reference/report.py и сверка SC-001..SC-005/007 с ожидаемыми вердиктами; интеграция в tools/run_tests.py (секция --journal-sim, --journal-sim-seed); reference/test_journal_sim.py — 36 проверок, 0 fail; суммарно 733 ok, 0 fail
+- [ ] T023 Экспорт сделок из бэктеста: флаг --out-cycles в reference/backtest.py — запись закрытых циклов в JSONL/JSON (exit_ts, pnl, exit_reason, open_ts, duration), чтобы report_charts.py --kind equity принимал вывод бэктеста напрямую
+- [ ] T024 Лимит номинала и биржевые ограничения в бэктесте: применение max_notional_usdt и ограничений инструмента (min_qty, tick_size, max_leverage) в reference/backtest.py, как в живом боте (FR-017, FR-018); расхождение «бэктест vs бот» в этих проверках закрыть
+- [ ] T025 История прогонов автораннера: tools/run_tests.py пишет итоги в logs/test_runs.jsonl (дата, ok/fail по фазам, версия); автономная проверка парсинга/агрегации истории
+- [ ] T026 Расширенные метрики бэктеста: Sharpe/Sortino по закрытым циклам, гистограмма длительностей удержания; вывод в backtest.py и bar-чарт через report_charts.py
+- [ ] T027 Валидатор конфига в живом боте: загрузка config/config.yml (секции dca/bot/screener) через bot_config и валидация на старте бота; расхождение «конфиг vs логика» закрыть (фолбэки только при отсутствии файла)
+- [ ] T028 Сводка и графики по символам: stats_summary --by-symbol с выходом JSON для report_charts; equity по каждому символу (многосерийный график)
+
+---
+
 ## Dependencies & Execution Order
 
 ### Phase Dependencies
