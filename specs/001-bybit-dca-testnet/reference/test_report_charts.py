@@ -223,6 +223,43 @@ ok("metrics PNG: rc=0 и файл валиден", rcode == 0)
 parse_png(out_png2)
 os.unlink(out_png2)
 
+# ── гистограмма длительностей (T026) ─────────────────────────────────────────
+
+print("\nrender_hist_svg / render_hist_png")
+bins = [{"lo": 0.0, "hi": 30.0, "count": 2},
+        {"lo": 30.0, "hi": 60.0, "count": 0},
+        {"lo": 60.0, "hi": 90.0, "count": 5}]
+h_svg = rc.render_hist_svg(bins, title="Удержание", x_label="мин")
+ok("SVG: бары для ненулевых бинов",
+   h_svg.count("<rect") == 3 and "5" in h_svg and "2" in h_svg, h_svg.count("<rect"))
+h_empty = rc.render_hist_svg([], title="")
+ok("SVG: пусто → сообщение", "нет данных" in h_empty)
+
+p_hist = os.path.join(tempfile.gettempdir(), "rc_hist.png")
+with open(p_hist, "wb") as f:
+    f.write(rc.render_hist_png(bins, "Hold", 500, 300, x_label="min"))
+w_hist, h_hist, rawh = parse_png(p_hist)
+ok("PNG: размер совпадает", (w_hist, h_hist) == (500, 300))
+ok("PNG: есть синие столбцы",
+   any(rawh[i + 2] > 150 and rawh[i] < 120 for i in range(0, len(rawh), 3)))
+os.unlink(p_hist)
+
+print("\nmain --kind hist")
+h_json = write_json({"hist": bins, "title": "CLI hist"})
+out_h = os.path.join(tempfile.gettempdir(), "rc_cli_hist.svg")
+rcode = rc.main(["--kind", "hist", "--input", h_json, "--out", out_h,
+                 "--x-label", "мин"])
+ok("hist SVG: rc=0 и файл создан", rcode == 0 and os.path.exists(out_h))
+ET.parse(out_h)
+os.unlink(out_h)
+
+out_h2 = os.path.join(tempfile.gettempdir(), "rc_cli_hist.png")
+rcode = rc.main(["--kind", "hist", "--input", h_json, "--out", out_h2])
+ok("hist PNG: rc=0 и файл валиден", rcode == 0)
+parse_png(out_h2)
+os.unlink(out_h2)
+os.unlink(h_json)
+
 for p in (p, p2, p3, eq_json, m_json):
     try:
         os.unlink(p)

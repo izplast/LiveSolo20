@@ -730,7 +730,74 @@ def max_drawdown(pnls: list[float]) -> tuple[float, float]:
     return worst_abs, worst_pct * 100
 
 
-def summarize(result: RunResult) -> dict:
+def _std(values: Sequence[float]) -> float:
+    """Стандартное отклонение выборки (population), None не допускается."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    return (sum((v - mean) ** 2 for v in values) / n) ** 0.5
+
+
+def sharpe_ratio(pnls: Sequence[float], rf: float = 0.0) -> float | None:
+    """Sharpe по закрытым циклам: (mean - rf) / std * sqrt(N).
+
+    Безрисковая по умолчанию 0. None, если std == 0 (все PnL одинаковы) или
+    сделок меньше двух — делить на ноль нельзя.
+    """
+    pnls = [float(v) for v in pnls]
+    if len(pnls) < 2:
+        return None
+    mean = sum(pnls) / len(pnls)
+    s = _std(pnls)
+    if s <= 1e-12:
+        return None
+    return (mean - rf) / s * (len(pnls) ** 0.5)
+
+
+def sortino_ratio(pnls: Sequence[float], rf: float = 0.0) -> float | None:
+    """Sortino: (mean - rf) / downside_std * sqrt(N).
+
+    Downside-стандартное отклонение — по отклонениям только вниз от порога
+    rf (отрицательные относительно безрисковой). None, если downside_std == 0
+    или сделок меньше двух.
+    """
+    pnls = [float(v) for v in pnls]
+    if len(pnls) < 2:
+        return None
+    mean = sum(pnls) / len(pnls)
+    downside = [(v - rf) for v in pnls if v < rf]
+    if not downside:
+        return None
+    d_std = (sum(v ** 2 for v in downside) / len(downside)) ** 0.5
+    if d_std <= 1e-12:
+        return None
+    return (mean - rf) / d_std * (len(pnls) ** 0.5)
+
+
+def duration_histogram(closed: Sequence, bins: int = 10) -> list[dict]:
+    """Гистограмма длительностей удержания закрытых циклов, минуты.
+
+    Возвращает [{lo, hi, count}] по равномерным бинам от 0 до максимума;
+    пустой список — циклов нет или bins < 1. Верхняя граница включается в
+    последний бин (duration == hi не уходит в следующий пустой бин).
+    """
+    if not closed or bins < 1:
+        return []
+    durations = [float(c.duration_minutes) for c in closed]
+    lo_all, hi_all = 0.0, max(durations)
+    if hi_all <= 0:
+        return [{"lo": 0.0, "hi": 0.0, "count": len(durations)}]
+    step = hi_all / bins
+    out = [{"lo": round(i * step, 4), "hi": round((i + 1) * step, 4), "count": 0}
+           for i in range(bins)]
+    for d in durations:
+        idx = min(int(d // step), bins - 1)
+        out[idx]["count"] += 1
+    return out
+
+
+def summarize(result: RunResult, bins: int = 10) -> dict:
     closed = result.closed
     pnls = [c.pnl for c in closed]
     wins = [c for c in closed if c.pnl > 0]
@@ -766,6 +833,9 @@ def summarize(result: RunResult) -> dict:
         "avg_fill_count": (sum(len(c.fills) for c in closed) / len(closed)) if closed else 0.0,
         "max_notional_usdt": max((c.notional for c in closed), default=0.0),
         "max_margin_usdt": max((c.margin for c in closed), default=0.0),
+        "sharpe": sharpe_ratio(pnls),
+        "sortino": sortino_ratio(pnls),
+        "_duration_hist": duration_histogram(closed, bins=bins),
     }
 
 
@@ -863,6 +933,14 @@ def render(m: dict, params: DcaParams, verbose: bool = False) -> str:
     lines.append(f"Среднее число филлов на сделку: {m['avg_fill_count']:.1f}")
     lines.append(f"Макс. номинал цикла: {m['max_notional_usdt']:.2f} USDT, "
                  f"макс. маржа: {m['max_margin_usdt']:.2f} USDT")
+    if m["sharpe"] is not None:
+        lines.append(f"Sharpe: {m['sharpe']:.2f}, Sortino: "
+                     f"{m['sortino'] if m['sortino'] is not None else 'n/a'}")
+    if verbose and m.get("_duration_hist"):
+        lines.append("\nГистограмма длительностей удержания (мин):")
+        for b in m["_duration_hist"]:
+            bar = "#" * b["count"]
+            lines.append(f"  {b['lo']:8.1f}–{b['hi']:8.1f}  {b['count']:3d}  {bar}")
     if verbose:
         lines.append("\nСделки (роль, сторона, вход, выход, причина, PnL):")
         for c in m["_cycles"]:
@@ -919,6 +997,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="экспорт закрытых циклов: .jsonl — строка на цикл, "
                          "иначе JSON {\"cycles\": [...], \"title\": ...} для "
                          "report_charts.py --kind equity")
+    ap.add_argument("--hist-bins", type=int, default=10,
+                    help="число бинов гистограммы длительностей удержания "
+                         "(по умолчанию 10)")
     return ap
 
 
@@ -982,7 +1063,7 @@ def main(argv: list[str] | None = None) -> int:
         result.open = bt.open
         result.closed.sort(key=lambda c: c.exit_ts)
         all_closed.extend(result.closed)
-        m = summarize(result)
+        m = summarize(result, bins=args.hist_bins)
         m["_cycles"] = result.closed
         summaries.append(m)
 

@@ -375,3 +375,23 @@ python3 tools/run_tests.py --history-path logs/test_runs.jsonl --history-version
 секциям).
 
 Покрытие: `reference/test_run_tests_history.py` — 20 проверок без сети.
+
+### Расширенные метрики бэктеста (Phase 9, Next Scope)
+
+`reference/backtest.py` (T026) добавляет риск-метрики и гистограмму
+длительностей удержания:
+
+- `sharpe_ratio(pnls, rf=0)` — `(mean − rf) / std × √N`; `None` при < 2 сделок
+  или нулевом std;
+- `sortino_ratio(pnls, rf=0)` — знаменатель — downside-отклонение (только
+  значения ниже rf); `None` при отсутствии проигрышей;
+- `duration_histogram(closed, bins=10)` — `[{lo, hi, count}]` в минутах,
+  последний бин включает максимум;
+- сводка: `sharpe`, `sortino`, `_duration_hist`; число бинов через `--hist-bins`
+  (default 10); в `--verbose` — текстовая гистограмма.
+
+`reference/report_charts.py`: `--kind hist` — столбчатая диаграмма в SVG/PNG
+(без внешних библиотек), вход `{"hist": [...]}`, `--x-label` — подпись оси.
+
+Покрытие: `reference/test_backtest_metrics.py` — 28 проверок,
+`test_report_charts.py` — 42 проверки, без сети.

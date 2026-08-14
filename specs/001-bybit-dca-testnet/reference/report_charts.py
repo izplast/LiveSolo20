@@ -93,13 +93,13 @@ def drawdown_series(points: Sequence[tuple[int, float]]) -> list[tuple[int, floa
 
 def load_input(path: str) -> tuple[list, str]:
     """Читает JSON: возвращает (данные, title). Поддерживает обёртки
-    {"cycles": [...]}, {"results": [...]}, {"trades": [...]}."""
+    {"cycles": [...]}, {"results": [...]}, {"trades": [...]}, {"hist": [...]}."""
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     title = ""
     if isinstance(raw, dict):
         title = raw.get("title", "")
-        for key in ("cycles", "results", "trades"):
+        for key in ("cycles", "results", "trades", "hist"):
             if isinstance(raw.get(key), list):
                 return raw[key], title
         return [], title
@@ -300,9 +300,69 @@ def render_metrics_svg(results: Sequence[dict], metric: str = "total_pnl",
     return "".join(out)
 
 
-# ---------------------------------------------------------------------------
-# PNG (растровый writer, только stdlib)
-# ---------------------------------------------------------------------------
+def render_hist_svg(bins: Sequence[dict], title: str = "",
+                    width: int = 900, height: int = 420,
+                    x_label: str = "") -> str:
+    """SVG столбчатая диаграмма гистограммы: [{lo, hi, count}] → бары."""
+    rows = [(float(b.get("lo", 0)), float(b.get("hi", 0)), int(b.get("count", 0)))
+            for b in bins]
+    if not rows:
+        return (svg_header(width, height)
+                + f'  <text x="{width // 2}" y="{height // 2}" '
+                f'text-anchor="middle" font-family="monospace" font-size="14" '
+                f'fill="#333">нет данных для гистограммы</text>\n</svg>\n')
+
+    margin = {"l": 70, "r": 24, "t": 44, "b": 60}
+    x0, y0 = margin["l"], margin["t"]
+    x1, y1 = width - margin["r"], height - margin["b"]
+    counts = [c for _, _, c in rows]
+    v_max = max(counts)
+    if v_max == 0:
+        v_max = 1.0
+    pad = v_max * 0.1
+    v_min, v_max = 0.0, v_max + pad
+
+    def y_px(v: float) -> int:
+        return round(y0 + (v_max - v) / (v_max - v_min) * (y1 - y0))
+
+    out = [svg_header(width, height),
+           '  <rect width="100%" height="100%" fill="#ffffff"/>\n']
+    if title:
+        out.append(f'  <text x="{x0}" y="22" font-family="monospace" font-size="14" '
+                   f'fill="#222">{_esc(title)}</text>\n')
+
+    grid_y = [v_max * i / 4 for i in range(5)]
+    out += _axes_lines(x0, y0, x1, y1, grid_y, y_px)
+    for v in grid_y:
+        out.append(f'  <text x="{x0 - 6}" y="{y_px(v) + 4}" text-anchor="end" '
+                   f'font-family="monospace" font-size="10" fill="#666">'
+                   f'{_fmt(v)}</text>\n')
+
+    n = len(rows)
+    slot = (x1 - x0) / n
+    bar_w = max(6.0, slot * 0.72)
+    for i, (lo, hi, cnt) in enumerate(rows):
+        cx = x0 + slot * i + slot / 2
+        bx0 = round(cx - bar_w / 2)
+        by = y_px(cnt)
+        if by != y1:
+            out.append(f'  <rect x="{bx0}" y="{by}" '
+                       f'width="{round(bar_w)}" height="{y1 - by}" '
+                       f'fill="#2563eb" opacity="0.85"/>\n')
+        if cnt:
+            out.append(f'  <text x="{round(cx)}" y="{by - 4}" text-anchor="middle" '
+                       f'font-family="monospace" font-size="10" fill="#333">'
+                       f'{cnt}</text>\n')
+        lab = f"{lo:.1f}"
+        out.append(f'  <text x="{round(cx)}" y="{y1 + 14}" text-anchor="end" '
+                   f'transform="rotate(-55 {round(cx)} {y1 + 14})" '
+                   f'font-family="monospace" font-size="9" fill="#555">'
+                   f'{_esc(lab)}</text>\n')
+    if x_label:
+        out.append(f'  <text x="{x0}" y="{height - 4}" font-family="monospace" '
+                   f'font-size="10" fill="#666">{_esc(x_label)}</text>\n')
+    out.append("</svg>\n")
+    return "".join(out)
 
 # Минимальный точечный шрифт 5x7 для цифр и знаков подписей осей/значений.
 # Символ → 7 строк, каждая — 5 бит (бит 4 = левый пиксель).
@@ -557,6 +617,55 @@ def render_metrics_png(results: Sequence[dict], metric: str = "total_pnl",
     return cv.save()
 
 
+def render_hist_png(bins: Sequence[dict], title: str = "",
+                    width: int = 900, height: int = 420,
+                    x_label: str = "") -> bytes:
+    """PNG столбчатая диаграмма гистограммы (подписи — значения и № бина)."""
+    rows = [(i, float(b.get("lo", 0)), int(b.get("count", 0)))
+            for i, b in enumerate(bins)]
+    cv = Canvas(width, height)
+    if not rows:
+        cv.text(width // 2 - 60, height // 2, "NO HIST DATA", (51, 51, 51))
+        return cv.save()
+
+    l, r, t, b = 70, 24, 44, 60
+    x0, x1 = l, width - r
+    y0, y1 = t, height - b
+    v_max = max(c for _, _, c in rows)
+    if v_max == 0:
+        v_max = 1.0
+    pad = v_max * 0.1
+    v_max += pad
+
+    def m_y(v: float) -> int:
+        return round(y0 + (v_max - v) / v_max * (y1 - y0))
+
+    for i in range(5):
+        v = v_max * i / 4
+        yy = m_y(v)
+        cv.hline(x0, x1, yy, (221, 221, 221))
+        cv.text(x0 - 34, yy - 3, f"{v:.0f}", (102, 102, 102))
+    cv.line(x0, y0, x0, y1, (102, 102, 102))
+    cv.line(x0, y1, x1, y1, (102, 102, 102))
+
+    n = len(rows)
+    slot = (x1 - x0) / n
+    bar_w = max(6, round(slot * 0.72))
+    for i, lo, c in rows:
+        cx = round(x0 + slot * i + slot / 2)
+        bx0 = cx - bar_w // 2
+        by = m_y(c)
+        if by != y1:
+            cv.rect(bx0, by, bar_w, y1 - by, (37, 99, 235))
+        cv.text(cx - 10, by - 12, f"{c}", (51, 51, 51))
+        cv.text(bx0, y1 + 12, f"{lo:.0f}", (85, 85, 85))
+    if title:
+        cv.text(l, 12, _ascii_safe(title)[:40], (34, 34, 34))
+    if x_label:
+        cv.text(l, height - 10, _ascii_safe(x_label), (102, 102, 102))
+    return cv.save()
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -570,13 +679,16 @@ def _write(path: str, data: str | bytes) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Графики по бэктестам и A/B-свипам (SVG/PNG, без зависимостей)")
-    ap.add_argument("--kind", choices=("equity", "metrics"), required=True,
-                    help="equity — эквити и просадка; metrics — бар-диаграмма")
+    ap.add_argument("--kind", choices=("equity", "metrics", "hist"), required=True,
+                    help="equity — эквити и просадка; metrics — бар-диаграмма; "
+                         "hist — гистограмма длительностей")
     ap.add_argument("--input", required=True,
                     help="JSON: сделки [{exit_ts, pnl}] или результаты ab_grid")
     ap.add_argument("--out", required=True, help="файл .svg или .png")
     ap.add_argument("--metric", default="total_pnl",
                     help="метрика для --kind metrics (по умолчанию total_pnl)")
+    ap.add_argument("--x-label", default="",
+                    help="подпись оси X для --kind hist")
     ap.add_argument("--title", default="",
                     help="заголовок графика (по умолчанию из JSON или пусто)")
     ap.add_argument("--width", type=int, default=900)
@@ -593,6 +705,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write(args.out, data_bytes)
         else:
             _write(args.out, render_equity_svg(data, title, args.width, args.height))
+    elif args.kind == "hist":
+        if ext in (".png", ".PNG"):
+            data_bytes = render_hist_png(data, title, args.width, args.height,
+                                         x_label=args.x_label)
+            _write(args.out, data_bytes)
+        else:
+            _write(args.out, render_hist_svg(data, title, args.width, args.height,
+                                             x_label=args.x_label))
     else:
         if ext in (".png", ".PNG"):
             data_bytes = render_metrics_png(data, args.metric, title,
