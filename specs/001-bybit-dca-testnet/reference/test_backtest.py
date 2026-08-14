@@ -218,15 +218,19 @@ def fake_inst_http(url: str) -> dict:
         return {"list": []}
     return {"list": [{"symbol": "BTCUSDT", "contractType": "LinearPerpetual",
                       "lotSizeFilter": {"qtyStep": "0.001", "minOrderQty": "0.001"},
-                      "priceFilter": {"tickSize": "0.01"}}]}
+                      "priceFilter": {"tickSize": "0.01"},
+                      "leverageFilter": {"maxLeverage": "100"}}]}
 
 
 bt._http_get = fake_inst_http
 ok("ограничения инструмента разбираются",
    bt.fetch_instrument("BTCUSDT") == {"symbol": "BTCUSDT", "qty_step": 0.001,
-                                      "min_qty": 0.001, "tick_size": 0.01})
+                                      "min_qty": 0.001, "tick_size": 0.01,
+                                      "max_leverage": 100.0})
 ok("нет инструмента → безопасные значения по умолчанию",
    bt.fetch_instrument("NOEXIST")["tick_size"] == 0.01)
+ok("нет инструмента → плечо по умолчанию 100x",
+   bt.fetch_instrument("NOEXIST")["max_leverage"] == 100.0)
 bt._http_get = _orig_http
 
 # ── 7. fetch_universe ─────────────────────────────────────────────────────────

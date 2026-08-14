@@ -915,9 +915,41 @@ config.yml, `bot_config` подставлял дефолт, а живой бот
 (BotParams, bot_params_from_config, validate_config на реальном/неполном/
 отсутствующем конфиге, делегирование; без сети).
 
-Суммарно по reference-слою без сети: 774 ok, 0 fail.
+## Лимит номинала и биржевые ограничения в бэктесте (2026-08-14)
 
+Раньше `reference/backtest.py` игнорировал `max_notional_usdt` из config.yml и
+не учитывал ограничения инструмента при расчёте маржи — расхождение «бэктест
+vs бот» (FR-017/FR-018). T024 закрывает его:
 
+- **`DcaParams.max_notional_usdt`** — лимит суммарного номинала лестницы на
+  символ (0 = выключен). Новый `planned_ladder_notional()` считает план бота
+  (entry + докупки Мартингейлом: 20+40+80=140 USDT при entry=20, m=2, steps=2);
+- **проверка до открытия цикла** `_open_cycle`: если план лестницы превышает
+  `max_notional_usdt` — сигнал отклоняется с причиной (`rejected_notional`),
+  как в живом боте (config: предел 200 оставляет запас 60 USDT);
+- **максимальное плечо инструмента** `fetch_instrument` теперь возвращает
+  `max_leverage` (из `leverageFilter.maxLeverage`, фолбэк 100x). Если
+  настроенное плечо выше максимума инструмента — сигнал отклоняется
+  (`rejected_leverage`), маржа считается от эффективного плеча
+  `min(leverage, max_leverage)`;
+- **номинал и маржа в цикле**: `Cycle.notional` (Σ qty*price) и
+  `Cycle.margin` (notional / effective_leverage) — в сводке (`max_notional_usdt`,
+  `max_margin_usdt`) и в экспорте `cycle_to_dict`/`--out-cycles`;
+- **валидация**: `leverage > 0` и `max_notional_usdt >= 0` в `DcaParams.validate`;
+- **CLI**: флаг `--max-notional-usdt`.
+
+Замечание: размер докупок в бэктесте остаётся плоским (`entry_usdt / price`),
+в то время как живой бот наращивает объём Мартингейлом (`dca_cycle.py`).
+Лимит номинала проверяется по плану лестницы (как в боте), поэтому защита
+работает независимо от расхождения в исполнении — докупки не могут раздуть
+номинал выше плана.
+
+Покрытие: **`reference/test_backtest_limits.py`** — 24 проверки, 0 fail
+(валидация, planned_ladder_notional, эффективное плечо, отклонение сигнала по
+номиналу/плечу, номинал/маржа в цикле и сводке, CLI --max-notional-usdt;
+без сети). Обновлён `test_backtest.py` под `max_leverage` в fetch_instrument.
+
+Суммарно по reference-слою без сети: 799 ok, 0 fail.
 
 
 

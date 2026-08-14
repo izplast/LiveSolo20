@@ -149,6 +149,12 @@ class DcaParams:
     # убыток достигает лимита; если она ближе к входу, чем стоп, лимит
     # срабатывает раньше.
     max_cycle_loss_usdt: float = 0.0
+    # Жёсткий лимит суммарного номинала на символ в USDT (FR-017): если
+    # планируемый номинал лестницы (вход + докупки) превышает значение, план
+    # отклоняется — цикл не открывается. 0 — выключен. В живом боте такой же
+    # предел стоит в config.yml (max_notional_usdt), чтобы расхождение
+    # «бэктест vs бот» в этих проверках не оставалось незамеченным.
+    max_notional_usdt: float = 0.0
 
     def validate(self) -> None:
         problems = []
@@ -166,6 +172,8 @@ class DcaParams:
             problems.append("stop_pct в [0, 50)")
         if not self.fee_rate >= 0:
             problems.append("fee_rate >= 0")
+        if not self.leverage > 0:
+            problems.append("leverage > 0")
         if not 0 <= self.slippage_pct <= 0.05:
             problems.append("slippage_pct в [0, 5%]")
         if self.max_concurrent < 1:
@@ -184,6 +192,8 @@ class DcaParams:
             problems.append("стоп: 0 < sl_min_pct <= sl_max_pct при адаптиве")
         if not self.max_cycle_loss_usdt >= 0:
             problems.append("max_cycle_loss_usdt >= 0")
+        if not self.max_notional_usdt >= 0:
+            problems.append("max_notional_usdt >= 0")
         if problems:
             raise ValueError("некорректные параметры DCA:\n- " + "\n- ".join(problems))
 
@@ -210,6 +220,20 @@ def effective_stop_pct(p: DcaParams, natr: float | None) -> float:
     if p.sl_atr_mult > 0 and natr is not None:
         return clamp(natr * p.sl_atr_mult, p.sl_min_pct, p.sl_max_pct)
     return p.stop_pct
+
+
+def planned_ladder_notional(p: DcaParams) -> float:
+    """Суммарный номинал лестницы (вход + все докупки Мартингейлом), USDT.
+
+    entry + entry*m + entry*m^2 + ... = entry * (m^(max_docups+1) - 1)/(m - 1)
+    при m != 1, иначе entry * (max_docups + 1). Совпадает с планом бота
+    (config.yml: лестница 20+40+80=140 USDT) и используется для FR-017-проверки
+    max_notional_usdt до открытия цикла.
+    """
+    m = p.multiplier
+    if abs(m - 1.0) < 1e-12:
+        return p.entry_usdt * (p.max_docups + 1)
+    return p.entry_usdt * (m ** (p.max_docups + 1) - 1) / (m - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +311,7 @@ def fetch_klines(symbol: str, start_ms: int, end_ms: int, interval: str = "1",
 
 
 def fetch_instrument(symbol: str) -> dict:
-    """Ограничения инструмента: qtyStep, minOrderQty, tickSize."""
+    """Ограничения инструмента: qtyStep, minOrderQty, tickSize, maxLeverage."""
     query = urllib.parse.urlencode({"category": "linear", "symbol": symbol})
     res = _http_get(f"{BYBIT_REST}/v5/market/instruments-info?{query}")
     for it in res.get("list", []):
@@ -297,8 +321,10 @@ def fetch_instrument(symbol: str) -> dict:
                 "qty_step": float(it["lotSizeFilter"]["qtyStep"]),
                 "min_qty": float(it["lotSizeFilter"]["minOrderQty"]),
                 "tick_size": float(it["priceFilter"]["tickSize"]),
+                "max_leverage": float(it["leverageFilter"]["maxLeverage"]),
             }
-    return {"symbol": symbol, "qty_step": 0.001, "min_qty": 0.001, "tick_size": 0.01}
+    return {"symbol": symbol, "qty_step": 0.001, "min_qty": 0.001,
+            "tick_size": 0.01, "max_leverage": 100.0}
 
 
 def fetch_universe(top_n: int, required_leverage: float,
@@ -434,6 +460,8 @@ class Cycle:
     exit_reason: str = ""
     pnl: float = 0.0
     natr: float | None = None      # NATR-14 сигнала, открывшего цикл (для адаптива)
+    notional: float = 0.0          # суммарный номинал позиции: Σ qty*price филлов
+    margin: float = 0.0            # используемая маржа: notional / effective_leverage
 
     @property
     def duration_minutes(self) -> float:
@@ -458,6 +486,12 @@ class Backtest:
         self.closed: list[Cycle] = []
         self.signals = 0
         self.rejected_limit = 0
+        self.rejected_notional = 0
+        self.rejected_leverage = 0
+        # Эффективное плечо: не выше максимума инструмента (FR-017/FR-018).
+        # Если инструмент не тянет настроенное плечо — сигнал отклоняется ниже.
+        self.max_leverage = float(inst.get("max_leverage", 100.0))
+        self.effective_leverage = min(float(self.p.leverage), self.max_leverage)
         self._pending_side: str | None = None
         self._pending_natr: float | None = None
 
@@ -494,6 +528,8 @@ class Backtest:
             candles=len(rows),
             signals=self.signals,
             rejected_limit=self.rejected_limit,
+            rejected_notional=self.rejected_notional,
+            rejected_leverage=self.rejected_leverage,
             open=self.open,
             closed=self.closed,
         )
@@ -526,6 +562,15 @@ class Backtest:
     def _open_cycle(self, side: str, ts: int, open_price: float,
                     natr: float | None = None) -> None:
         p = self.p
+        # FR-017: проверки до открытия — плечо не выше максимума инструмента и
+        # планируемый номинал лестницы в пределах max_notional_usdt. Отклонение
+        # сигнала с явной причиной, как в живом боте (config: max_notional 200).
+        if float(p.leverage) > self.max_leverage:
+            self.rejected_leverage += 1
+            return
+        if p.max_notional_usdt and planned_ladder_notional(p) > p.max_notional_usdt:
+            self.rejected_notional += 1
+            return
         fill = open_price * (1 + p.slippage_pct if side == "Buy" else 1 - p.slippage_pct)
         cyc = Cycle(
             symbol=self.symbol, side=side, open_ts=ts,
@@ -554,6 +599,8 @@ class Backtest:
         cyc.avg_entry = (cyc.avg_entry * cyc.qty + price * qty) / new_qty
         cyc.qty = new_qty
         cyc.fee += qty * price * p.fee_rate
+        cyc.notional += qty * price
+        cyc.margin = cyc.notional / self.effective_leverage
         cyc.fills.append({"ts": ts, "role": role, "side": side, "qty": qty, "price": price})
         # уровни пересчитываются после каждого филла (FR-011): поуровневый TP
         # от средней (эскалация по числу докупок), адаптивный шаг и стоп от NATR
@@ -656,6 +703,8 @@ class RunResult:
     rejected_limit: int
     open: list
     closed: list
+    rejected_notional: int = 0
+    rejected_leverage: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +748,8 @@ def summarize(result: RunResult) -> dict:
         "candles": result.candles,
         "signals": result.signals,
         "rejected_limit": result.rejected_limit,
+        "rejected_notional": result.rejected_notional,
+        "rejected_leverage": result.rejected_leverage,
         "n_cycles": len(closed) + len(result.open),
         "closed": len(closed),
         "open_at_end": len(result.open),
@@ -713,6 +764,8 @@ def summarize(result: RunResult) -> dict:
         "max_drawdown_pct": mdd_pct,
         "avg_duration_min": avg_dur,
         "avg_fill_count": (sum(len(c.fills) for c in closed) / len(closed)) if closed else 0.0,
+        "max_notional_usdt": max((c.notional for c in closed), default=0.0),
+        "max_margin_usdt": max((c.margin for c in closed), default=0.0),
     }
 
 
@@ -740,6 +793,8 @@ def cycle_to_dict(cyc: Cycle) -> dict:
         "duration_ms": cyc.exit_ts - cyc.open_ts,
         "docups": cyc.docups,
         "fee": round(cyc.fee, 6),
+        "notional": round(cyc.notional, 6),
+        "margin": round(cyc.margin, 6),
     }
 
 
@@ -787,9 +842,14 @@ def render(m: dict, params: DcaParams, verbose: bool = False) -> str:
                      f"(фолбэк {params.stop_pct:g}%)")
     if params.max_cycle_loss_usdt > 0:
         lines.append(f"Жёсткий лимит убытка цикла: {params.max_cycle_loss_usdt:g} USDT")
+    if params.max_notional_usdt > 0:
+        lines.append(f"Лимит номинала лестницы: {params.max_notional_usdt:g} USDT")
+    if params.leverage:
+        lines.append(f"Плечо: {params.leverage:g}x (маржа = номинал / плечо)")
     if params.tp_escalation:
         lines.append("Поуровневый TP: " + "/".join(f"{x:g}%" for x in params.tp_escalation))
-    lines.append(f"Сигналы: {m['signals']} (отклонено по лимиту циклов: {m['rejected_limit']})")
+    lines.append(f"Сигналы: {m['signals']} (отклонено: лимит циклов {m['rejected_limit']}, "
+                 f"номинал {m['rejected_notional']}, плечо {m['rejected_leverage']})")
     lines.append(f"Циклы: закрыто {m['closed']} из {m['n_cycles']} "
                  f"(открыто к концу: {m['open_at_end']})")
     reasons = ", ".join(f"{k}: {v}" for k, v in sorted(m["exit_reasons"].items()))
@@ -801,6 +861,8 @@ def render(m: dict, params: DcaParams, verbose: bool = False) -> str:
                  f"({m['max_drawdown_pct']:.1f}% от пика)")
     lines.append(f"Средняя длительность удержания: {_fmt_dur(m['avg_duration_min'])}")
     lines.append(f"Среднее число филлов на сделку: {m['avg_fill_count']:.1f}")
+    lines.append(f"Макс. номинал цикла: {m['max_notional_usdt']:.2f} USDT, "
+                 f"макс. маржа: {m['max_margin_usdt']:.2f} USDT")
     if verbose:
         lines.append("\nСделки (роль, сторона, вход, выход, причина, PnL):")
         for c in m["_cycles"]:
@@ -842,6 +904,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--stop-pct", type=float, default=0.0,
                     help="ценовой стоп в процентах (0 = выключен)")
     ap.add_argument("--leverage", type=float, default=3.0)
+    ap.add_argument("--max-notional-usdt", type=float, default=0.0,
+                    help="лимит суммарного номинала лестницы на символ (0 = выключен)")
     ap.add_argument("--fee-rate", type=float, default=0.00055)
     ap.add_argument("--slippage-pct", type=float, default=0.0005)
     ap.add_argument("--max-concurrent", type=int, default=3)
@@ -866,6 +930,7 @@ def main(argv: list[str] | None = None) -> int:
         max_hold_minutes=args.max_hold_minutes, stop_pct=args.stop_pct,
         leverage=args.leverage, fee_rate=args.fee_rate,
         slippage_pct=args.slippage_pct, max_concurrent=args.max_concurrent,
+        max_notional_usdt=args.max_notional_usdt,
     )
     params.validate()
 

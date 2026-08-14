@@ -329,3 +329,21 @@ python3 reference/report_charts.py --kind equity --input trades.json --out equit
 ```
 
 Покрытие: `reference/test_backtest_out.py` — 21 проверка без сети.
+
+### Лимит номинала и биржевые ограничения в бэктесте (Phase 9, Next Scope)
+
+`reference/backtest.py` (T024) применяет те же проверки, что живой бот
+(FR-017/FR-018), до открытия цикла:
+
+| Ограничение | Проверка | Отклонение сигнала |
+|-------------|----------|--------------------|
+| `max_notional_usdt` | план лестницы (`planned_ladder_notional`: вход + докупки Мартингейлом) не должен превышать лимит | `rejected_notional` |
+| `max_leverage` инструмента | настроенное плечо `DcaParams.leverage` не должно быть выше `fetch_instrument.max_leverage` | `rejected_leverage` |
+| маржа | `Cycle.margin = notional / min(leverage, max_leverage)`, `Cycle.notional = Σ qty*price` | — |
+
+Лимит номинала проверяется по плану лестницы, а не по исполнению докупок —
+как в боте (config: лестница 20+40+80=140 USDT при пределе 200). Номинал и
+маржа попадают в сводку (`max_notional_usdt`, `max_margin_usdt`), экспорт
+`--out-cycles` и CLI-флаг `--max-notional-usdt`.
+
+Покрытие: `reference/test_backtest_limits.py` — 24 проверки без сети.
