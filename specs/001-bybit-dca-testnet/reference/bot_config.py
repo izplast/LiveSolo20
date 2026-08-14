@@ -35,6 +35,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+from dataclasses import dataclass, field
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -67,6 +68,56 @@ DEFAULTS = {
     "leverage": 3.0,
     "fee_rate": 0.00055,
 }
+
+
+@dataclass
+class BotParams:
+    """Секция bot конфига: сопровождение циклов и старт процесса (FR-015, FR-032)."""
+
+    max_cycles: int = 3            # одновременно открытых циклов
+    monitor_interval_sec: int = 3  # такт сопровождения циклов
+    fill_timeout_ms: int = 5000    # сколько ждать подтверждения исполнения
+    max_clock_skew_ms: int = 3000  # больше — старт запрещён (FR-032)
+    heartbeat_sec: int = 60        # периодичность журнала/файла инбокса
+    autostart: bool = True         # принимать сигналы сразу после старта
+    journal_path: str = "logs/bot-events.jsonl"
+
+    def validate(self) -> None:
+        problems = []
+        if self.max_cycles < 1:
+            problems.append("max_cycles >= 1")
+        if self.monitor_interval_sec < 1:
+            problems.append("monitor_interval_sec >= 1")
+        if self.fill_timeout_ms < 0:
+            problems.append("fill_timeout_ms >= 0")
+        if self.max_clock_skew_ms < 0:
+            problems.append("max_clock_skew_ms >= 0")
+        if self.heartbeat_sec < 1:
+            problems.append("heartbeat_sec >= 1")
+        if not self.journal_path:
+            problems.append("journal_path не пуст")
+        if problems:
+            raise ValueError("некорректная секция bot:\n- " + "\n- ".join(problems))
+
+
+# Значения по умолчанию секции bot (применяются только при отсутствии файла).
+BOT_DEFAULTS = {
+    "max_cycles": 3,
+    "monitor_interval_sec": 3,
+    "fill_timeout_ms": 5000,
+    "max_clock_skew_ms": 3000,
+    "heartbeat_sec": 60,
+    "autostart": True,
+    "journal_path": "logs/bot-events.jsonl",
+}
+
+# Обязательные ключи при существующем файле: их отсутствие — расхождение
+# «конфиг vs логика», а не повод для фолбэка на дефолт.
+REQUIRED_DCA_KEYS = ("entry_usdt", "step_pct", "steps", "take_profit_pct",
+                     "max_hold_hours", "leverage")
+REQUIRED_BOT_KEYS = ("max_cycles", "monitor_interval_sec",
+                     "max_clock_skew_ms", "heartbeat_sec")
+REQUIRED_SCREENER_KEYS = ("natr_min", "natr_max", "required_leverage")
 
 
 def _parse_scalar(value: str):
@@ -159,3 +210,113 @@ def dca_params_from_config(dca: dict) -> DcaParams:
 )
     p.validate()
     return p
+
+
+def bot_params_from_config(bot: dict) -> BotParams:
+    """Словарь секции bot → валидный BotParams. Дефолты — только для ключей,
+    которых нет в конфиге (при наличии файла полнота проверяется отдельно)."""
+    p = BotParams(
+        max_cycles=int(bot.get("max_cycles", BOT_DEFAULTS["max_cycles"])),
+        monitor_interval_sec=int(bot.get(
+            "monitor_interval_sec", BOT_DEFAULTS["monitor_interval_sec"])),
+        fill_timeout_ms=int(bot.get(
+            "fill_timeout_ms", BOT_DEFAULTS["fill_timeout_ms"])),
+        max_clock_skew_ms=int(bot.get(
+            "max_clock_skew_ms", BOT_DEFAULTS["max_clock_skew_ms"])),
+        heartbeat_sec=int(bot.get("heartbeat_sec", BOT_DEFAULTS["heartbeat_sec"])),
+        autostart=bool(bot.get("autostart", BOT_DEFAULTS["autostart"])),
+        journal_path=str(bot.get("journal_path", BOT_DEFAULTS["journal_path"])),
+    )
+    p.validate()
+    return p
+
+
+def load_screener_cfg(config_path: str):
+    """Конфиг скринера из config.yml (секция screener) → Config.
+
+    Единая точка загрузки для бота, симулятора и бэктеста (ранее — дубли
+    в ab_common/run_sim). Незнакомые ключи (блэклисты, pump-фильтры) игнорируются:
+    их знает только живой скринер.
+    """
+    sc = _load_sibling("screener")
+    raw = read_section(config_path, "screener")
+    cfg = sc.Config()
+    known = {f.name for f in sc.Config.__dataclass_fields__.values()}
+    for k, v in raw.items():
+        if k in known:
+            setattr(cfg, k, v)
+    sc.validate_config(cfg)
+    return cfg
+
+
+def validate_config(config_path: str) -> list[dict]:
+    """Полная проверка config.yml на старте бота (T027): секции dca/bot/screener,
+    полнота обязательных ключей, маппинг в DcaParams/BotParams/Config скринера,
+    консистентность leverage и NATR.
+
+    Возвращает список {name, ok, detail}. Фолбэки на дефолты допустимы только
+    при отсутствии файла: если файл есть, но обязательный ключ не задан — FAIL,
+    чтобы расхождение «конфиг vs логика» не оставалось незамеченным.
+    """
+    checks: list[dict] = []
+
+    def add(name: str, ok: bool, detail: str = "") -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    exists = os.path.exists(config_path)
+    add("config.yml существует", exists, config_path)
+    if not exists:
+        return checks  # фолбэки на дефолты — допустимы
+
+    dca = read_dca_section(config_path)
+    bot = read_section(config_path, "bot")
+    screener = read_section(config_path, "screener")
+
+    add("секция dca разобрана", len(dca) > 0, f"{len(dca)} ключей")
+    add("секция bot разобрана", len(bot) > 0, f"{len(bot)} ключей")
+    add("секция screener разобрана", len(screener) > 0, f"{len(screener)} ключей")
+
+    missing_dca = [k for k in REQUIRED_DCA_KEYS if k not in dca]
+    add("dca: обязательные ключи заданы", not missing_dca,
+        ", ".join(missing_dca) if missing_dca else f"{len(REQUIRED_DCA_KEYS)} ключей")
+    missing_bot = [k for k in REQUIRED_BOT_KEYS if k not in bot]
+    add("bot: обязательные ключи заданы", not missing_bot,
+        ", ".join(missing_bot) if missing_bot else f"{len(REQUIRED_BOT_KEYS)} ключей")
+    missing_sc = [k for k in REQUIRED_SCREENER_KEYS if k not in screener]
+    add("screener: обязательные ключи заданы", not missing_sc,
+        ", ".join(missing_sc) if missing_sc else f"{len(REQUIRED_SCREENER_KEYS)} ключей")
+
+    try:
+        p = dca_params_from_config(dca)
+        detail = (f"entry={p.entry_usdt} docups(steps)={p.max_docups} "
+                  f"tp={p.tp_pct} sl={p.stop_pct} hold={p.max_hold_minutes}м "
+                  f"lev={p.leverage}")
+        add("dca → DcaParams валиден (логика бэктеста/бота)", True, detail)
+    except Exception as e:
+        add("dca → DcaParams валиден (логика бэктеста/бота)", False, str(e))
+
+    try:
+        bp = bot_params_from_config(bot)
+        detail = (f"max_cycles={bp.max_cycles} monitor={bp.monitor_interval_sec}с "
+                  f"skew={bp.max_clock_skew_ms}мс heartbeat={bp.heartbeat_sec}с")
+        add("bot → BotParams валиден", True, detail)
+    except Exception as e:
+        add("bot → BotParams валиден", False, str(e))
+
+    try:
+        cfg = load_screener_cfg(config_path)
+        detail = (f"natr {cfg.natr_min}–{cfg.natr_max}% tf {cfg.tf_fast}/{cfg.tf_slow} "
+                  f"lev {cfg.required_leverage}")
+        add("screener → Config валиден", True, detail)
+    except Exception as e:
+        add("screener → Config валиден", False, str(e))
+
+    lev = dca.get("leverage")
+    req = screener.get("required_leverage")
+    add("dca.leverage == screener.required_leverage", lev == req, f"{lev} vs {req}")
+
+    nmin, nmax = screener.get("natr_min"), screener.get("natr_max")
+    ok_bounds = (isinstance(nmin, (int, float)) and isinstance(nmax, (int, float))
+                 and nmin < nmax)
+    add("screener.natr_min < natr_max", ok_bounds, f"{nmin} vs {nmax}")
+    return checks

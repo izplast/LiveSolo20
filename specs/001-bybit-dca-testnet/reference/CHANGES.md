@@ -887,6 +887,36 @@ python3 reference/backtest.py --symbol BTCUSDT --days 30 --out-cycles trades.jso
 
 Суммарно по reference-слою без сети: 754 ok, 0 fail.
 
+## Валидатор конфига на старте бота (2026-08-14)
+
+Раньше расхождение «конфиг vs логика» было молчаливым: если ключа нет в
+config.yml, `bot_config` подставлял дефолт, а живой бот мог работать на своих
+жёстких значениях, расходясь с файлом. `bot_config.py` (T027) закрывает это:
+
+- **`BotParams`** — датакласс секции `bot` (max_cycles, monitor_interval_sec,
+  fill_timeout_ms, max_clock_skew_ms, heartbeat_sec, autostart, journal_path)
+  с `validate()` и маппер `bot_params_from_config`;
+- **`validate_config(config.yml)`** — полная проверка на старте бота:
+  1. существование файла;
+  2. разбор секций dca/bot/screener;
+  3. **полнота обязательных ключей** — если файл есть, но ключ не задан,
+     это FAIL (фолбэки на дефолты допустимы ТОЛЬКО при отсутствии файла);
+  4. маппинг секций в `DcaParams`/`BotParams`/`Config` скринера (та же
+     логика, что у бэктеста/бота);
+  5. консистентность `dca.leverage == screener.required_leverage` и
+     `natr_min < natr_max`.
+
+- **`load_screener_cfg`** — единая точка загрузки секции screener; дубли в
+  `ab_common.py` и `run_sim.py` делегируют в `bot_config`.
+- **`tools/run_tests.py --config`** использует `bot_config.validate_config` —
+  проверки полноты и секции bot вошли в автораннер.
+
+Покрытие: **`reference/test_bot_config.py`** — 51 проверка, 0 fail
+(BotParams, bot_params_from_config, validate_config на реальном/неполном/
+отсутствующем конфиге, делегирование; без сети).
+
+Суммарно по reference-слою без сети: 774 ok, 0 fail.
+
 
 
 

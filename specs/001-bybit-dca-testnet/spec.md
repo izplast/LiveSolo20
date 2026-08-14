@@ -248,7 +248,7 @@ python3 specs/001-bybit-dca-testnet/reference/ab_grid.py --days 30 --universe 40
 | Секция | Что проверяет |
 |--------|---------------|
 | `--unit` | прогон всех `reference/test_*.py` (юнит-, интеграционные и A/B), сводка по фазам и итог ok/fail |
-| `--config` | валидация `config/config.yml` на совпадение с логикой бэктеста/бота: секция `dca` → `DcaParams` (тот же путь, что у бэктеста и бота), секция `screener` → `Config` скринера, согласованность `dca.leverage` == `screener.required_leverage` и `natr_min` < `natr_max` |
+| `--config` | валидация `config/config.yml` через `bot_config.validate_config`: секции `dca`/`bot`/`screener` → `DcaParams`/`BotParams`/`Config`, полнота обязательных ключей, согласованность `dca.leverage` == `screener.required_leverage` и `natr_min` < `natr_max` |
 | `--journal` | разбор журналов Testnet (`logs/bot-events.jsonl`, `logs/screener-events.jsonl`; пути из config.yml) сводкой `reference/report.py`: вердикты SC-001..SC-005, отчёт об ошибках (битые строки) и простоях (слепые интервалы); опционально `--app-log logs/app.log` |
 
 Запуск: `python3 tools/run_tests.py` (всё), `--unit`/`--config`/`--journal`
@@ -273,6 +273,23 @@ JSONL-журнал по контракту `contracts/journal.md` (событи�
 Секция `tools/run_tests.py --journal-sim` прогоняет все сценарии сводкой
 `reference/report.py` и сверяет вердикты с ожидаемыми (`--journal-sim-seed`).
 Покрытие: `reference/test_journal_sim.py` — 36 проверок без сети.
+
+### Валидатор конфига на старте бота (Phase 9, Next Scope)
+
+`reference/bot_config.py` (T027) закрывает расхождение «конфиг vs логика»:
+живой бот загружает config.yml через `validate_config(config.yml)` на старте.
+
+| Проверка | Что даёт |
+|----------|----------|
+| `BotParams` | датакласс секции `bot` (max_cycles, monitor_interval_sec, fill_timeout_ms, max_clock_skew_ms, heartbeat_sec, autostart, journal_path) с `validate()` |
+| полнота обязательных ключей | если файл есть, а ключ dca/bot/screener не задан — FAIL; **фолбэки на дефолты допустимы только при отсутствии файла** |
+| маппинг секций | `dca` → `DcaParams`, `bot` → `BotParams`, `screener` → `Config` (та же логика, что у бэктеста/бота) |
+| консистентность | `dca.leverage` == `screener.required_leverage`, `natr_min` < `natr_max` |
+
+`load_screener_cfg` — единая точка загрузки секции screener (`ab_common.py`
+и `run_sim.py` делегируют в `bot_config`). `tools/run_tests.py --config`
+использует `bot_config.validate_config`. Покрытие: `reference/test_bot_config.py`
+— 51 проверка без сети.
 
 ## Визуальные отчёты: графики по эквити и просадкам (Phase 8, расширение этапа)
 

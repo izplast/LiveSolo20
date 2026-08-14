@@ -127,5 +127,70 @@ ok("негативные steps отвергаются валидацией",
 ok("стоп >= 50% отвергается валидацией",
    raises(lambda: bc.dca_params_from_config({"hard_sl_pct": 50.0})))
 
+# ── BotParams: секция bot ────────────────────────────────────────────────────
+
+print("\nBotParams: секция bot из config.yml")
+_bot = bc.read_section(REPO_CONFIG, "bot")
+ok("секция bot разобрана", isinstance(_bot, dict) and len(_bot) > 3, _bot)
+bp = bc.bot_params_from_config(_bot)
+ok("bot → валидный BotParams", bp.validate() is None)
+ok("max_cycles → max_cycles", bp.max_cycles == 3, bp)
+ok("monitor_interval_sec → monitor_interval_sec", bp.monitor_interval_sec == 3)
+ok("heartbeat_sec → heartbeat_sec", bp.heartbeat_sec == 60)
+ok("max_clock_skew_ms → max_clock_skew_ms", bp.max_clock_skew_ms == 3000)
+ok("fill_timeout_ms → fill_timeout_ms", bp.fill_timeout_ms == 5000)
+ok("journal_path → journal_path", bp.journal_path.endswith("bot-events.jsonl"),
+   bp.journal_path)
+bd = bc.bot_params_from_config({})
+ok("пустой bot → дефолты", bd.max_cycles == 3 and bd.monitor_interval_sec == 3
+   and bd.heartbeat_sec == 60, bd)
+ok("max_cycles < 1 отвергается",
+   raises(lambda: bc.bot_params_from_config({"max_cycles": 0})))
+ok("heartbeat_sec < 1 отвергается",
+   raises(lambda: bc.bot_params_from_config({"heartbeat_sec": 0})))
+
+# ── validate_config: полная проверка на старте бота (T027) ──────────────────
+
+print("\nvalidate_config (config/config.yml)")
+_checks = bc.validate_config(REPO_CONFIG)
+ok("все проверки реального конфига прошли", all(c["ok"] for c in _checks),
+   [c["name"] for c in _checks if not c["ok"]])
+ok("есть проверки секции bot", any("bot" in c["name"] for c in _checks))
+ok("проверен leverage dca == screener",
+   any("leverage" in c["name"] for c in _checks))
+ok("проверена полнота dca-ключей",
+   any("обязательные ключи" in c["name"] and "dca" in c["name"] for c in _checks))
+
+print("\nvalidate_config: отсутствующий файл → фолбэк дефолтов допустим")
+_no = bc.validate_config("/no/such/config.yml")
+ok("нет файла → один FAIL (exists), без падения",
+   len(_no) == 1 and not _no[0]["ok"], _no)
+
+print("\nvalidate_config: неполный и противоречивый конфиг")
+_bad_dir = tempfile.mkdtemp(prefix="bc-test-")
+_bad = os.path.join(_bad_dir, "config.yml")
+with open(_bad, "w", encoding="utf-8") as f:
+    f.write("dca:\n"
+            "  entry_usdt: 20\n"
+            "  steps: 2\n"
+            "  leverage: 4\n"
+            "bot:\n"
+            "  max_cycles: 1\n"
+            "screener:\n"
+            "  natr_min: 0.95\n"
+            "  natr_max: 5.0\n"
+            "  required_leverage: 3\n")
+_ch = bc.validate_config(_bad)
+ok("неполный dca → FAIL по обязательным ключам",
+   any("обязательные ключи" in c["name"] and not c["ok"] for c in _ch))
+ok("неполный bot → FAIL по обязательным ключам",
+   any("bot: обязательные ключи" in c["name"] and not c["ok"] for c in _ch))
+ok("расхождение leverage отмечено",
+   any("leverage" in c["name"] and not c["ok"] for c in _ch))
+ok("неполный файл НЕ валится на DcaParams (фолбэк на дефолт работает)",
+   any("DcaParams" in c["name"] and c["ok"] for c in _ch))
+os.unlink(_bad)
+os.rmdir(_bad_dir)
+
 print("\nитог: {} ok, {} fail".format(PASS, FAIL))
 sys.exit(1 if FAIL else 0)

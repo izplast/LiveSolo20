@@ -169,49 +169,14 @@ def unit_summary(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 def validate_config(config_path: str) -> list[dict[str, Any]]:
     """Проверки config.yml: парсинг секций, DcaParams, Config скринера,
-    согласованность. Возвращает список {name, ok, detail}."""
-    ab = load_reference("ab_common")
-    checks: list[dict[str, Any]] = []
+    согласованность. Возвращает список {name, ok, detail}.
 
-    def add(name: str, ok: bool, detail: str = "") -> None:
-        checks.append({"name": name, "ok": bool(ok), "detail": detail})
-
-    exists = os.path.exists(config_path)
-    add("config.yml существует", exists, config_path)
-    if not exists:
-        return checks
-
-    dca = ab.bc.read_dca_section(config_path)
-    screener = ab.bc.read_section(config_path, "screener")
-    add("секция dca разобрана", len(dca) > 0, f"{len(dca)} ключей")
-    add("секция screener разобрана", len(screener) > 0, f"{len(screener)} ключей")
-
-    try:
-        params = ab.build_params(config_path)
-        detail = (f"entry={params.entry_usdt} docups(steps)={params.max_docups} "
-                  f"tp={params.tp_pct} sl={params.stop_pct} "
-                  f"hold={params.max_hold_minutes}м lev={params.leverage}")
-        add("dca → DcaParams валиден (логика бэктеста/бота)", True, detail)
-    except Exception as e:
-        add("dca → DcaParams валиден (логика бэктеста/бота)", False, str(e))
-
-    try:
-        cfg = ab.load_screener_cfg(config_path)
-        detail = (f"natr {cfg.natr_min}–{cfg.natr_max}% "
-                  f"tf {cfg.tf_fast}/{cfg.tf_slow} lev {cfg.required_leverage}")
-        add("screener → Config валиден", True, detail)
-    except Exception as e:
-        add("screener → Config валиден", False, str(e))
-
-    lev = dca.get("leverage")
-    req = screener.get("required_leverage")
-    add("dca.leverage == screener.required_leverage", lev == req, f"{lev} vs {req}")
-
-    nmin, nmax = screener.get("natr_min"), screener.get("natr_max")
-    ok_bounds = (isinstance(nmin, (int, float)) and isinstance(nmax, (int, float))
-                 and nmin < nmax)
-    add("screener.natr_min < natr_max", ok_bounds, f"{nmin} vs {nmax}")
-    return checks
+    Единый источник — bot_config.validate_config (T027): полнота обязательных
+    ключей, маппинг секций dca/bot/screener в объекты логики, консистентность
+    leverage и NATR. Фолбэки на дефолты допустимы только при отсутствии файла.
+    """
+    bc = load_reference("bot_config")
+    return bc.validate_config(config_path)
 
 
 # ---------------------------------------------------------------------------

@@ -88,15 +88,12 @@ bc = _load_sibling("bot_config")
 
 
 def load_screener_cfg(config_path: str) -> "sc.Config":
-    """Конфиг скринера из config.yml (секция screener) или значения по умолчанию."""
-    raw = bc.read_section(config_path, "screener")
-    cfg = sc.Config()
-    known = {f.name for f in sc.Config.__dataclass_fields__.values()}
-    for k, v in raw.items():
-        if k in known:
-            setattr(cfg, k, v)
-    sc.validate_config(cfg)
-    return cfg
+    """Конфиг скринера из config.yml (секция screener) или значения по умолчанию.
+
+    Делегирует в bot_config.load_screener_cfg — единая точка загрузки для
+    бота, симулятора и бэктеста (T027).
+    """
+    return bc.load_screener_cfg(config_path)
 
 
 def build_params(config_path: str) -> bt.DcaParams:

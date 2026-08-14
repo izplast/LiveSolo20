@@ -122,7 +122,7 @@
 - [ ] T024 Лимит номинала и биржевые ограничения в бэктесте: применение max_notional_usdt и ограничений инструмента (min_qty, tick_size, max_leverage) в reference/backtest.py, как в живом боте (FR-017, FR-018); расхождение «бэктест vs бот» в этих проверках закрыть
 - [ ] T025 История прогонов автораннера: tools/run_tests.py пишет итоги в logs/test_runs.jsonl (дата, ok/fail по фазам, версия); автономная проверка парсинга/агрегации истории
 - [ ] T026 Расширенные метрики бэктеста: Sharpe/Sortino по закрытым циклам, гистограмма длительностей удержания; вывод в backtest.py и bar-чарт через report_charts.py
-- [ ] T027 Валидатор конфига в живом боте: загрузка config/config.yml (секции dca/bot/screener) через bot_config и валидация на старте бота; расхождение «конфиг vs логика» закрыть (фолбэки только при отсутствии файла)
+- [x] T027 Валидатор конфига в живом боте: reference/bot_config.py — BotParams (секция bot: max_cycles, monitor_interval_sec, fill_timeout_ms, max_clock_skew_ms, heartbeat_sec, autostart, journal_path) + bot_params_from_config; единый load_screener_cfg (ab_common/run_sim делегируют); validate_config(config.yml) — полнота обязательных ключей dca/bot/screener (фолбэки только при отсутствии файла), маппинг в DcaParams/BotParams/Config, консистентность leverage/NATR; tools/run_tests.py --config использует bot_config.validate_config; reference/test_bot_config.py — 51 проверка, 0 fail; суммарно 774 ok, 0 fail
 - [ ] T028 Сводка и графики по символам: stats_summary --by-symbol с выходом JSON для report_charts; equity по каждому символу (многосерийный график)
 
 ---
