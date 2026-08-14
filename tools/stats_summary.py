@@ -8,7 +8,9 @@ tools/stats_summary.py — сводка по закрытым DCA-циклам �
 - совокупный PnL в USDT по закрытым циклам;
 - win-rate (доля прибыльных циклов);
 - средняя/медианная длительность удержания позиции;
-- опционально разбивку по символам (--by-symbol).
+- опционально разбивку по символам (--by-symbol);
+- в --json --by-symbol дополнительно equity-ряды по символам
+  (по_символам_эквити) — вход для reference/report_charts.py --kind equity-by-symbol.
 
 Запуск (зависимостей нет, только стандартная библиотека):
 
@@ -135,6 +137,33 @@ def median(values: Sequence[float]) -> float | None:
     return percentile(values, 50)
 
 
+def equity_by_symbol(cycles: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Кумулятивный PnL по каждому символу для report_charts --kind equity-by-symbol.
+
+    Возвращает [{"symbol": "BTCUSDT", "points": [[close_ts, equity], ...]}, ...],
+    отсортированные по символу и внутри — по времени закрытия. Циклы без
+    close_ts отбрасываются, pnl=None трактуется как 0 (как equity_points).
+    """
+    per: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    for c in cycles:
+        ts = c.get("close_ts")
+        if ts is None:
+            continue
+        pnl = c.get("pnl")
+        per[c.get("symbol", "?")].append((int(ts), float(pnl) if isinstance(pnl, (int, float)) else 0.0))
+
+    out: list[dict[str, Any]] = []
+    for sym in sorted(per):
+        rows = sorted(per[sym], key=lambda t: t[0])
+        points: list[list[Any]] = []
+        run = 0.0
+        for ts, pnl in rows:
+            run += pnl
+            points.append([ts, round(run, 6)])
+        out.append({"symbol": sym, "points": points})
+    return out
+
+
 def summarize(cycles: Sequence[dict[str, Any]],
               by_symbol: bool = False) -> dict[str, Any]:
     """Считает сводку по закрытым циклам. pnl=None (неизвестен) из
@@ -169,6 +198,7 @@ def summarize(cycles: Sequence[dict[str, Any]],
         out["по_символам"] = {
             sym: summarize(group, by_symbol=False) for sym, group in sorted(per.items())
         }
+        out["по_символам_эквити"] = equity_by_symbol(cycles)
     return out
 
 
@@ -258,7 +288,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--until", default=None,
                     help="включить циклы, закрытые не позже ISO-момента")
     ap.add_argument("--by-symbol", action="store_true",
-                    help="добавить разбивку по символам/парам")
+                    help="добавить разбивку по символам/парам "
+                         "(в --json — также equity-ряды для report_charts)")
     ap.add_argument("--json", action="store_true",
                     help="вывести машиночитаемый JSON")
     args = ap.parse_args(argv)

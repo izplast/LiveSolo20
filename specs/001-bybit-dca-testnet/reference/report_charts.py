@@ -8,11 +8,15 @@ reference/report_charts.py — графики по результатам бэк
 
 Графики:
   * эквити (кумулятивный PnL по закрытым циклам) и просадка от пика;
+  * эквити по каждому символу (многосерийный график);
   * сводная столбчатая диаграмма по метрикам грид-свипа (ab_grid.py).
 
 Вход (duck-typing, как в reference/metrics.py):
   * сделки бэктеста — итерация объектов/словарей с полями `exit_ts` и `pnl`
     (reference/backtest.Cycle или dict из JSON);
+  * многосерийные ряды — JSON tools/stats_summary.py --by-symbol:
+    {"по_символам_эквити": [{"symbol", "points": [[ts, equity], ...]}]} или
+    список/словарь symbol → [[ts, equity], ...];
   * результаты A/B — JSON из ab_grid.py `--out`: [{label, params, metrics}],
     metrics — из ab_common.aggregate (total_pnl, wr, total, n_sl, avg_tp,
     avg_sl, mdd).
@@ -23,6 +27,8 @@ reference/report_charts.py — графики по результатам бэк
         --input trades.json --out equity.svg
     python3 reference/report_charts.py --kind equity \\
         --input trades.json --out equity.png --width 900 --height 420
+    python3 reference/report_charts.py --kind equity-by-symbol \\
+        --input by_symbol.json --out multi.svg
     python3 reference/report_charts.py --kind metrics \\
         --input ab_grid.json --metric total_pnl --out metrics.png
     python3 reference/report_charts.py --kind metrics \\
@@ -91,15 +97,61 @@ def drawdown_series(points: Sequence[tuple[int, float]]) -> list[tuple[int, floa
     return out
 
 
+def multi_equity_series(data: Any) -> list[tuple[str, list[tuple[int, float]]]]:
+    """Нормализует вход для --kind equity-by-symbol в список (label, points).
+
+    Поддерживаемые формы:
+      * [{"symbol": "BTCUSDT", "points": [[ts, eq], ...]}, ...]
+        (выход tools/stats_summary.py --by-symbol --json);
+      * {"по_символам_эквити": [...]} / {"series": [...]} / {"results": [...]};
+      * {"BTCUSDT": [[ts, eq], ...], "ETHUSDT": [...]} (symbol → точки).
+    Точки с нечисловым ts отбрасываются.
+    """
+    if isinstance(data, dict):
+        for key in ("по_символам_эквити", "series", "results", "cycles"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+        else:
+            if all(isinstance(v, list) for v in data.values()):
+                items: list[tuple[str, list[tuple[int, float]]]] = []
+                for sym, pts in sorted(data.items()):
+                    items.append((str(sym), _norm_points(pts)))
+                return items
+    out: list[tuple[str, list[tuple[int, float]]]] = []
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("symbol") or item.get("label") or item.get("name") or "?"
+            pts = item.get("points") or item.get("series")
+            if isinstance(pts, list):
+                out.append((str(label), _norm_points(pts)))
+    return out
+
+
+def _norm_points(pts: Sequence) -> list[tuple[int, float]]:
+    """[[ts, eq], ...] → [(int(ts), float(eq)), ...], нечисловые ts — вон."""
+    out: list[tuple[int, float]] = []
+    for p in pts:
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            ts, eq = p[0], p[1]
+            if isinstance(ts, (int, float)) and isinstance(eq, (int, float)):
+                out.append((int(ts), float(eq)))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
 def load_input(path: str) -> tuple[list, str]:
     """Читает JSON: возвращает (данные, title). Поддерживает обёртки
-    {"cycles": [...]}, {"results": [...]}, {"trades": [...]}, {"hist": [...]}."""
+    {"cycles": [...]}, {"results": [...]}, {"trades": [...]}, {"hist": [...]},
+    {"series": [...]}, {"по_символам_эквити": [...]}."""
     with open(path, encoding="utf-8") as f:
         raw = json.load(f)
     title = ""
     if isinstance(raw, dict):
         title = raw.get("title", "")
-        for key in ("cycles", "results", "trades", "hist"):
+        for key in ("cycles", "results", "trades", "hist", "series", "по_символам_эквити"):
             if isinstance(raw.get(key), list):
                 return raw[key], title
         return [], title
@@ -232,6 +284,87 @@ def render_equity_svg(closed: Iterable, title: str = "",
                f'font-size="11" fill="#333">просадка, $</text>\n')
     out.append(f'  <text x="{margin["l"]}" y="{y0 - 4}" font-family="monospace" '
                f'font-size="11" fill="#333">эквити, $</text>\n')
+    out.append("</svg>\n")
+    return "".join(out)
+
+
+_SERIES_COLORS = ["#2563eb", "#16a34a", "#dc2626", "#d97706",
+                  "#7c3aed", "#0891b2", "#db2777", "#65a30d"]
+
+
+def render_equity_multi_svg(series: Sequence[tuple[str, Sequence[tuple[int, float]]]],
+                            title: str = "", width: int = 900,
+                            height: int = 420) -> str:
+    """SVG: многосерийный график эквити по символам (одна панель + легенда)."""
+    series = [(label, [(ts, float(v)) for ts, v in pts if pts])
+              for label, pts in series if pts]
+    if not series:
+        return (svg_header(width, height)
+                + f'  <text x="{width // 2}" y="{height // 2}" '
+                f'text-anchor="middle" font-family="monospace" font-size="14" '
+                f'fill="#333">нет данных по символам</text>\n</svg>\n')
+
+    all_pts = [p for _, pts in series for p in pts]
+    t_min = min(p[0] for p in all_pts)
+    t_max = max(p[0] for p in all_pts)
+    span_t = max(1, t_max - t_min)
+    v_min = min(p[1] for p in all_pts)
+    v_max = max(p[1] for p in all_pts)
+    if v_max == v_min:
+        v_max = v_min + 1.0
+    pad = (v_max - v_min) * 0.08
+    v_min, v_max = v_min - pad, v_max + pad
+
+    margin = {"l": 70, "r": 24, "t": 44, "b": 34}
+    x0, y0 = margin["l"], margin["t"]
+    x1, y1 = width - margin["r"], height - margin["b"]
+
+    def map_x(ts: int) -> int:
+        return round(x0 + (ts - t_min) / span_t * (x1 - x0))
+
+    def map_y(v: float) -> int:
+        return round(y1 + (v_max - v) / (v_max - v_min) * (y0 - y1))
+
+    out = [svg_header(width, height),
+           '  <rect width="100%" height="100%" fill="#ffffff"/>\n']
+    if title:
+        out.append(f'  <text x="{x0}" y="22" font-family="monospace" font-size="14" '
+                   f'fill="#222">{_esc(title)}</text>\n')
+
+    grid_y = [v_min + (v_max - v_min) * i / 4 for i in range(5)]
+    out += _axes_lines(x0, y0, x1, y1, grid_y, map_y)
+    for v in grid_y:
+        out.append(f'  <text x="{x0 - 6}" y="{map_y(v) + 4}" text-anchor="end" '
+                   f'font-family="monospace" font-size="10" fill="#666">'
+                   f'{_fmt(v)}</text>\n')
+    out.append(f'  <line x1="{x0}" y1="{map_y(0.0)}" x2="{x1}" y2="{map_y(0.0)}" '
+               f'stroke="#ccc" stroke-width="1" stroke-dasharray="3 3"/>\n')
+
+    for i, (label, pts) in enumerate(series):
+        color = _SERIES_COLORS[i % len(_SERIES_COLORS)]
+        line = " ".join(f"{map_x(ts)},{map_y(v)}" for ts, v in pts)
+        out.append(f'  <polyline points="{line}" fill="none" stroke="{color}" '
+                   f'stroke-width="2"/>\n')
+
+    t0 = datetime.fromtimestamp(t_min / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    t1s = datetime.fromtimestamp(t_max / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    out.append(f'  <text x="{x0}" y="{height - margin["b"] - 2}" font-family="monospace" '
+               f'font-size="10" fill="#666">{t0}</text>\n')
+    out.append(f'  <text x="{x1}" y="{height - margin["b"] - 2}" text-anchor="end" '
+               f'font-family="monospace" font-size="10" fill="#666">{t1s}</text>\n')
+
+    leg_x = x1 - 24
+    leg_y = y0 + 14
+    for i, (label, _) in enumerate(series):
+        color = _SERIES_COLORS[i % len(_SERIES_COLORS)]
+        lx = leg_x - 260
+        ly = leg_y + i * 16
+        if ly > y1:
+            break
+        out.append(f'  <line x1="{lx}" y1="{ly}" x2="{lx + 22}" y2="{ly}" '
+                   f'stroke="{color}" stroke-width="3"/>\n')
+        out.append(f'  <text x="{lx + 28}" y="{ly + 4}" font-family="monospace" '
+                   f'font-size="10" fill="#333">{_esc(label)}</text>\n')
     out.append("</svg>\n")
     return "".join(out)
 
@@ -566,6 +699,69 @@ def _ascii_safe(ms: int | str) -> str:
     return ms
 
 
+_SERIES_RGB = [(37, 99, 235), (22, 163, 74), (220, 38, 38), (217, 119, 6),
+               (124, 58, 237), (8, 145, 178), (219, 39, 119), (101, 163, 13)]
+
+
+def render_equity_multi_png(series: Sequence[tuple[str, Sequence[tuple[int, float]]]],
+                            title: str = "", width: int = 900,
+                            height: int = 420) -> bytes:
+    """PNG: многосерийный график эквити по символам (одна панель + легенда)."""
+    series = [(label, [(ts, float(v)) for ts, v in pts if pts])
+              for label, pts in series if pts]
+    cv = Canvas(width, height)
+    if not series:
+        cv.text(width // 2 - 60, height // 2, "NO SYMBOL DATA", (51, 51, 51))
+        return cv.save()
+
+    l, r, t, b = 70, 24, 44, 34
+    x0, x1 = l, width - r
+    y0, y1 = t, height - b
+
+    all_pts = [p for _, pts in series for p in pts]
+    t_min = min(p[0] for p in all_pts)
+    t_max = max(p[0] for p in all_pts)
+    span_t = max(1, t_max - t_min)
+    v_min = min(p[1] for p in all_pts)
+    v_max = max(p[1] for p in all_pts)
+    if v_max == v_min:
+        v_max = v_min + 1.0
+    pad = (v_max - v_min) * 0.08
+    v_min, v_max = v_min - pad, v_max + pad
+
+    def m_x(ts: int) -> int:
+        return round(x0 + (ts - t_min) / span_t * (x1 - x0))
+
+    def m_y(v: float) -> int:
+        return round(y1 + (v_max - v) / (v_max - v_min) * (y0 - y1))
+
+    for i in range(5):
+        v = v_min + (v_max - v_min) * i / 4
+        yy = m_y(v)
+        cv.hline(x0, x1, yy, (221, 221, 221))
+        cv.text(x0 - 34, yy - 3, f"{v:.2f}", (102, 102, 102))
+    cv.line(x0, y0, x0, y1, (102, 102, 102))
+    cv.line(x0, y1, x1, y1, (102, 102, 102))
+    cv.line(x0, m_y(0.0), x1, m_y(0.0), (200, 200, 200))
+
+    for i, (_, pts) in enumerate(series):
+        color = _SERIES_RGB[i % len(_SERIES_RGB)]
+        cv.polyline([(m_x(ts), m_y(v)) for ts, v in pts], color)
+
+    if title:
+        cv.text(l, 12, _ascii_safe(title)[:40], (34, 34, 34))
+    leg_x = l + 4
+    leg_y = y0 + 8
+    for i, (label, _) in enumerate(series):
+        color = _SERIES_RGB[i % len(_SERIES_RGB)]
+        lx, ly = leg_x, leg_y + i * 14
+        if ly > y1:
+            break
+        cv.line(lx, ly, lx + 22, ly, color)
+        cv.text(lx + 26, ly - 5, _ascii_safe(label)[:12], (51, 51, 51))
+    return cv.save()
+
+
 def render_metrics_png(results: Sequence[dict], metric: str = "total_pnl",
                        title: str = "", width: int = 900,
                        height: int = 420) -> bytes:
@@ -679,8 +875,9 @@ def _write(path: str, data: str | bytes) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="Графики по бэктестам и A/B-свипам (SVG/PNG, без зависимостей)")
-    ap.add_argument("--kind", choices=("equity", "metrics", "hist"), required=True,
-                    help="equity — эквити и просадка; metrics — бар-диаграмма; "
+    ap.add_argument("--kind", choices=("equity", "equity-by-symbol", "metrics", "hist"), required=True,
+                    help="equity — эквити и просадка; equity-by-symbol — "
+                         "многосерийный график по символам; metrics — бар-диаграмма; "
                          "hist — гистограмма длительностей")
     ap.add_argument("--input", required=True,
                     help="JSON: сделки [{exit_ts, pnl}] или результаты ab_grid")
@@ -705,6 +902,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             _write(args.out, data_bytes)
         else:
             _write(args.out, render_equity_svg(data, title, args.width, args.height))
+    elif args.kind == "equity-by-symbol":
+        series = multi_equity_series(data)
+        if ext in (".png", ".PNG"):
+            data_bytes = render_equity_multi_png(series, title, args.width, args.height)
+            _write(args.out, data_bytes)
+        else:
+            _write(args.out, render_equity_multi_svg(series, title, args.width, args.height))
     elif args.kind == "hist":
         if ext in (".png", ".PNG"):
             data_bytes = render_hist_png(data, title, args.width, args.height,

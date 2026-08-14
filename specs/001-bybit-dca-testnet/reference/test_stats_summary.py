@@ -135,6 +135,21 @@ btc = s["по_символам"]["BTCUSDT"]
 ok("по символу: 2 цикла, PnL 3.84, WR 100%",
    btc["закрыто_циклов"] == 2 and btc["pnl_usdt"] == 3.84 and btc["win_rate_pct"] == 100.0,
    btc)
+
+print("\nequity_by_symbol: кумулятивный PnL по символам")
+eq = ss.equity_by_symbol(cycles)
+ok("два символа, отсортированы", [e["symbol"] for e in eq] == ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+   [e["symbol"] for e in eq])
+btc_eq = next(e for e in eq if e["symbol"] == "BTCUSDT")
+ok("BTC: 2 точки (C1@0.64, C4@+3.20)", [p[1] for p in btc_eq["points"]] == [0.64, 3.84],
+   btc_eq["points"])
+ok("BTC: времена закрытия отсортированы",
+   [p[0] for p in btc_eq["points"]] == sorted(p[0] for p in btc_eq["points"]))
+eth_eq = next(e for e in eq if e["symbol"] == "ETHUSDT")
+ok("ETH: одна точка −2.50", eth_eq["points"] == [[T0 + 10 * MIN, -2.50]], eth_eq)
+ok("в сводке with by_symbol есть по_символам_эквити",
+   "по_символам_эквити" in s
+   and len(s["по_символам_эквити"]) == 3, s.get("по_символам_эквити"))
 os.unlink(path)
 
 print("\nокно по датам (--days / --since / --until)")
@@ -172,6 +187,17 @@ print("\nCLI: рендер и JSON")
 lines = ss.render(s, by_symbol=True).splitlines()
 ok("в рендере есть строка win-rate", any("Win-rate" in l for l in lines), lines)
 ok("в рендере есть блок по символам", any("По символам" in l for l in lines), lines)
+
+import contextlib
+import io
+import subprocess
+
+cli_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "..", "..", "tools", "stats_summary.py")
+cli_path = os.path.normpath(cli_path)
+p = subprocess.run([sys.executable, cli_path, "--help"],
+                   capture_output=True, text=True, cwd=os.path.dirname(cli_path))
+ok("CLI --help есть", p.returncode == 0 and "--by-symbol" in p.stdout)
 
 print(f"\nИтог: {PASS} ok, {FAIL} FAIL")
 sys.exit(1 if FAIL else 0)

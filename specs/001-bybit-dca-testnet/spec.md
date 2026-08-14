@@ -310,6 +310,28 @@ python3 reference/report_charts.py --kind metrics --input ab_grid.json --metric 
 
 Покрытие: `reference/test_report_charts.py` — 36 проверок без сети.
 
+### Сводка и графики по символам (Phase 9, Next Scope)
+
+`tools/stats_summary.py --by-symbol` (T028) помимо агрегатов `по_символам`
+выдаёт в `--json` equity-ряды по каждому символу:
+
+| Поле | Содержимое |
+|------|------------|
+| `по_символам_эквити` | `[{symbol, points: [[close_ts, equity], ...]}]` — кумулятивный PnL по времени закрытия циклов |
+
+`reference/report_charts.py --kind equity-by-symbol` рисует многосерийный
+график (одна панель, полилиния на символ из палитры, легенда, пунктир нуля).
+Вход: выход stats_summary или список `{symbol, points}` / `{series: [...]}` /
+словарь `symbol → [[ts, equity], ...]`.
+
+```bash
+python3 tools/stats_summary.py --by-symbol --json > by_symbol.json
+python3 reference/report_charts.py --kind equity-by-symbol --input by_symbol.json --out multi.png
+```
+
+Покрытие: `reference/test_stats_summary.py` — 26 проверок,
+`test_report_charts.py` — 56 проверок, без сети.
+
 ### Экспорт сделок из бэктеста (Phase 9, Next Scope)
 
 `reference/backtest.py` (T023) выгружает закрытые циклы флагом `--out-cycles`:

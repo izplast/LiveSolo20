@@ -1006,3 +1006,33 @@ CLI `--hist-bins`); `test_report_charts.py` — 42 проверки, 0 fail
 
 Суммарно по reference-слою без сети: 853 ok, 0 fail.
 
+## T028 — Сводка и графики по символам
+
+Раньше `tools/stats_summary.py --by-symbol` давал только агрегаты по парам
+(счётчики, PnL, win-rate), а `reference/report_charts.py` умел рисовать эквити
+лишь одной серией. T028 закрывает оба пробела:
+
+- **`equity_by_symbol(cycles)`** (`tools/stats_summary.py`) — кумулятивный PnL
+  по каждому символу: `[{symbol, points: [[close_ts, equity], ...]}]`,
+  отсортировано по времени закрытия, `pnl=None` трактуется как 0 (как
+  `equity_points` в report_charts);
+- **JSON-выход** — в `--json --by-symbol` добавляется поле
+  `по_символам_эквити`, готовое для `report_charts.py --kind equity-by-symbol`;
+- **`multi_equity_series(data)`** (`reference/report_charts.py`) — нормализация
+  входа: список `{symbol, points}`, обёртки `{"по_символам_эквити": [...]}` /
+  `{"series": [...]}` / `{"results": [...]}` / `{"cycles": [...]}`, а также
+  словарь `symbol → [[ts, equity], ...]`; нечисловые точки отбрасываются;
+- **`render_equity_multi_svg` / `render_equity_multi_png`** — многосерийный
+  график: одна панель с общей шкалой, полилиния на каждый символ цветом из
+  палитры (8 цветов, циклично), пунктирная линия нуля, легенда сверху-справа,
+  подписи дат по краям;
+- **CLI** — новый `--kind equity-by-symbol`, `load_input` понимает ключи
+  `по_символам_эквити`/`series`.
+
+Покрытие: `reference/test_stats_summary.py` — 26 проверок (equity_by_symbol,
+наличие по_символам_эквити, CLI --help), `test_report_charts.py` — 56 проверок
+(multi_equity_series во всех формах, multi SVG/PNG с палитрой и легендой,
+`--kind equity-by-symbol` SVG/PNG).
+
+Суммарно по reference-слою без сети: 873 ok, 0 fail.
+

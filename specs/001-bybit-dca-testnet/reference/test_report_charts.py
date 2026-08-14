@@ -193,6 +193,45 @@ cv.rect(10, 10, 5, 5, (255, 0, 0))
 ok("заливка прямоугольника",
    cv.px[(12 * 20 + 12) * 3] == 255 and cv.px[(12 * 20 + 12) * 3 + 1] == 0)
 
+# ── многосерийный график по символам (T028) ─────────────────────────────────
+
+print("\nmulti_equity_series")
+series_in = [{"symbol": "BTCUSDT", "points": [[T0, 0.5], [T0 + HOUR, 1.5]]},
+             {"symbol": "ETHUSDT", "points": [[T0, -1.0], [T0 + HOUR, -0.2]]}]
+m = rc.multi_equity_series(series_in)
+ok("список {symbol, points} → (label, points)",
+   m == [("BTCUSDT", [(T0, 0.5), (T0 + HOUR, 1.5)]),
+         ("ETHUSDT", [(T0, -1.0), (T0 + HOUR, -0.2)])], m)
+m2 = rc.multi_equity_series({"по_символам_эквити": series_in})
+ok("обёртка по_символам_эквити", m2 == m, m2)
+m3 = rc.multi_equity_series({"BTCUSDT": [[T0, 0.5]], "ETHUSDT": [[T0, -1.0]]})
+ok("dict symbol → точки, отсортирован по символам",
+   [l for l, _ in m3] == ["BTCUSDT", "ETHUSDT"], m3)
+m4 = rc.multi_equity_series({"series": [{"label": "SOL", "points": [[1, 2.0], [3, 4.0]]}]})
+ok("обёртка series с label", m4 == [("SOL", [(1, 2.0), (3, 4.0)])], m4)
+ok("нечисловые точки отбрасываются",
+   rc.multi_equity_series([{"symbol": "A", "points": [[1, 2.0], ["x", 5], [3, "y"]]}])
+   == [("A", [(1, 2.0)])], "")
+
+print("\nrender_equity_multi_svg / render_equity_multi_png")
+m_svg = rc.render_equity_multi_svg(m, title="По символам", width=800, height=400)
+ok("SVG: две полилинии", m_svg.count("<polyline") == 2, m_svg.count("<polyline"))
+ok("SVG: легенда с символами",
+   "BTCUSDT" in m_svg and "ETHUSDT" in m_svg)
+ok("SVG: два цвета серий",
+   all(c in m_svg for c in ("#2563eb", "#16a34a")))
+ok("SVG: пусто → сообщение", "нет данных по символам" in rc.render_equity_multi_svg([]))
+
+p_multi = os.path.join(tempfile.gettempdir(), "rc_multi.png")
+with open(p_multi, "wb") as f:
+    f.write(rc.render_equity_multi_png(m, "BySymbol", 500, 300))
+wm, hm, rawm = parse_png(p_multi)
+ok("PNG: размер совпадает", (wm, hm) == (500, 300))
+ok("PNG: есть синие и зелёные пиксели линий",
+   any(rawm[i + 2] > 150 and rawm[i] < 120 for i in range(0, len(rawm), 3))
+   and any(rawm[i + 1] > 150 and rawm[i] < 120 for i in range(0, len(rawm), 3)))
+os.unlink(p_multi)
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 print("\nmain (CLI)")
@@ -259,6 +298,27 @@ ok("hist PNG: rc=0 и файл валиден", rcode == 0)
 parse_png(out_h2)
 os.unlink(out_h2)
 os.unlink(h_json)
+
+print("\nmain --kind equity-by-symbol")
+bs_json = write_json({"по_символам_эквити": [
+    {"symbol": "BTCUSDT", "points": [[T0, 0.5], [T0 + HOUR, 1.5]]},
+    {"symbol": "ETHUSDT", "points": [[T0, -1.0], [T0 + HOUR, -0.2]]},
+], "title": "CLI multi"})
+out_bs = os.path.join(tempfile.gettempdir(), "rc_cli_bs.svg")
+rcode = rc.main(["--kind", "equity-by-symbol", "--input", bs_json, "--out", out_bs])
+ok("equity-by-symbol SVG: rc=0 и файл создан",
+   rcode == 0 and os.path.exists(out_bs))
+svg_bs = open(out_bs, encoding="utf-8").read()
+ok("equity-by-symbol SVG: две серии и легенда",
+   svg_bs.count("<polyline") == 2 and "BTCUSDT" in svg_bs)
+os.unlink(out_bs)
+
+out_bs2 = os.path.join(tempfile.gettempdir(), "rc_cli_bs.png")
+rcode = rc.main(["--kind", "equity-by-symbol", "--input", bs_json, "--out", out_bs2])
+ok("equity-by-symbol PNG: rc=0 и файл валиден", rcode == 0)
+parse_png(out_bs2)
+os.unlink(out_bs2)
+os.unlink(bs_json)
 
 for p in (p, p2, p3, eq_json, m_json):
     try:
