@@ -417,3 +417,26 @@ python3 tools/run_tests.py --history-path logs/test_runs.jsonl --history-version
 
 Покрытие: `reference/test_backtest_metrics.py` — 28 проверок,
 `test_report_charts.py` — 42 проверки, без сети.
+
+### Сверка состояния с биржей (Phase 10, Live Integration)
+
+`reference/reconcile.py` (T029) — автономный слой сверки локального стейта
+бота с Bybit REST (запуск при старте и после сбоя), без сетевых вызовов:
+
+| Расхождение | Что означает | Предлагаемое действие |
+|-------------|--------------|------------------------|
+| позиция `missing_on_exchange` | локально есть, на бирже нет | `close_local_cycle` |
+| позиция `unknown_local` | есть на бирже, бот не знает | `adopt_position` |
+| позиция `qty/side/avg_price_mismatch` | параметры разошлись | `sync_position*` |
+| ордер `missing_on_exchange` | локально open, на бирже нет | `recreate_order` |
+| ордер `unknown_local` | на бирже, бот не знает | `cancel_exchange_order` |
+| ордер `not_open_exchange` | статус на бирже не New/PartiallyFilled | `mark_closed` |
+| ордер `qty/price/side/reduce_only_mismatch` | параметры разошлись | `sync_*` / `recreate_order` |
+
+Позиции сводятся по символу, ордера — по `order_link_id` (Bybit `orderLinkId`).
+Вход REST разбирается `parse_positions`/`parse_orders` (`/v5/position/list`,
+`/v5/order/realtime`; строковые числа → float, `price: "0"` → маркет).
+Результат — `ReconciliationReport` (`ok`, `all`, `actions()`) с `render()` и
+`to_dict()` для журнала. API — инъекция, тесты без сети.
+
+Покрытие: `reference/test_reconcile.py` — 24 проверки.

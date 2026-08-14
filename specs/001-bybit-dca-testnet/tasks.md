@@ -127,6 +127,16 @@
 
 ---
 
+## Phase 10: Live Integration & Robustness (живая интеграция и устойчивость)
+
+**Purpose**: живой прогон на Testnet без участия человека — состояние сверяется с биржей после сбоев, сеть сама восстанавливается, о событиях приходит уведомление в Telegram.
+
+- [x] T029 Сверка и синхронизация состояния (Reconciliation): проверка расхождений открытых позиций/ордеров локального стейта с Bybit REST API при старте/сбое: reference/reconcile.py — датаклсссы LocalPosition/LocalOrder/ExchangePosition/ExchangeOrder, parse_positions/parse_orders (REST /v5/position/list и /v5/order/realtime, строковые size/avgPrice/qty → float, нулевые размеры пропускаются, цена 0 → None), reconcile() (позиции по символу: missing_on_exchange/unknown_local/qty/side/avg_price; ордера по order_link_id: missing_on_exchange/unknown_local/qty/price/side/reduce_only/not_open_exchange; у каждого расхождения action — close_local_cycle/adopt_position/sync_*/recreate_order/cancel_exchange_order/mark_closed), ReconciliationReport (ok, all, actions), render()/to_dict() (для журнала); API — инъекция, сетевых вызовов нет; reference/test_reconcile.py — 24 проверки, 0 fail; суммарно 897 ok, 0 fail
+- [ ] T030 Обработка сетевых ошибок и автореконнект REST/WebSocket с экспоненциальной задержкой (Exponential Backoff & Circuit Breaker)
+- [ ] T031 Уведомления и алерты (Telegram Webhook): отсылки событий входа/выхода, фиксации TP/SL и критических ошибок API
+
+---
+
 ## Dependencies & Execution Order
 
 ### Phase Dependencies
@@ -138,6 +148,7 @@
 - **US3 (Phase 5)**: переиспользует WS-цикл из Phase 2
 - **US4 (Phase 6)**: зависит от форматов журнала (contracts/journal.md) — реализовано
 - **Polish (Phase 7)**: зависит от всех остальных
+- **Live (Phase 10)**: T029 зависит от US1/US2 (локальный стейт позиций/ордеров из reference/bot.py); T030 — общая инфраструктура соединений, переиспользует WS-цикл Phase 2; T031 зависит от журнала событий (contracts/journal.md) и точек входа/выхода
 
 ### Within Each User Story
 

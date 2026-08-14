@@ -1036,3 +1036,36 @@ CLI `--hist-bins`); `test_report_charts.py` — 42 проверки, 0 fail
 
 Суммарно по reference-слою без сети: 873 ok, 0 fail.
 
+## T029 — Сверка состояния с биржей (Reconciliation)
+
+Раньше после сбоя/перезапуска локальный стейт бота молча расходился с биржей:
+позиция могла закрыться, пока процесс лежал, или ордер исполниться, а монитор
+не успел это заметить. T029 добавляет автономный слой сверки
+`reference/reconcile.py`:
+
+- **датаклсссы**: `LocalPosition`/`LocalOrder` (локальный стейт DCA-цикла) и
+  `ExchangePosition`/`ExchangeOrder` (снимок биржи);
+- **`parse_positions(rows)` / `parse_orders(rows)`** — разбор ответов
+  `/v5/position/list` и `/v5/order/realtime`: строковые `size`/`avgPrice`/`qty`
+  → float, позиции нулевого размера пропускаются, `price: "0"` → `None`
+  (маркет-ордер);
+- **`reconcile(local_pos, local_orders, exch_pos, exch_orders)`** — чистое
+  сравнение: позиции по символу, ордера по `order_link_id`:
+  - позиции: `missing_on_exchange` (локально есть, на бирже нет →
+    `close_local_cycle`), `unknown_local` (есть на бирже → `adopt_position`),
+    `side_mismatch`/`qty_mismatch`/`avg_price_mismatch` (→ `sync_*`);
+  - ордера: `missing_on_exchange` (→ `recreate_order`),
+    `unknown_local` (→ `cancel_exchange_order`), `not_open_exchange`
+    (биржевой статус Filled/... при локальном open → `mark_closed`),
+    `qty/price/side/reduce_only_mismatch` (→ `sync_*`/`recreate_order`);
+- **`ReconciliationReport`** — `ok`, `all`, `actions()` (сводка действий);
+- **`render()` / `to_dict()`** — человекочитаемый отчёт и машиночитаемая
+  форма для журнала.
+
+Сетевых вызовов модуль не делает — API передаётся инъекцией, поэтому
+проверяется без сети. Покрытие: `reference/test_reconcile.py` — 24 проверки
+(парсинг REST, согласованный стейт, все виды расхождений позиций и ордеров,
+render/to_dict).
+
+Суммарно по reference-слою без сети: 897 ok, 0 fail.
+
