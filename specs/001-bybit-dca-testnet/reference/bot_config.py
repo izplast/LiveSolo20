@@ -55,6 +55,10 @@ def _load_sibling(name: str):
 backtest = _load_sibling("backtest")
 DcaParams = backtest.DcaParams
 
+resilience = _load_sibling("resilience")
+notifier = _load_sibling("notifier")
+TelegramParams = notifier.TelegramParams
+
 # Значения по умолчанию DcaParams для ключей, которых нет в конфиге бота.
 DEFAULTS = {
     "entry_usdt": 50.0,
@@ -231,6 +235,22 @@ def bot_params_from_config(bot: dict) -> BotParams:
     return p
 
 
+def telegram_params_from_config(telegram: dict) -> TelegramParams:
+    """Словарь секции telegram → валидный TelegramParams.
+
+    enabled=False (по умолчанию) не требует token/chat_id — секция может быть
+    пустой. При enabled=True отсутствие bot_token/chat_id — расхождение.
+    """
+    p = TelegramParams(
+        bot_token=str(telegram.get("bot_token", "")),
+        chat_id=str(telegram.get("chat_id", "")),
+        enabled=bool(telegram.get("enabled", False)),
+        parse_mode=str(telegram.get("parse_mode", "HTML")),
+    )
+    p.validate()
+    return p
+
+
 def load_screener_cfg(config_path: str):
     """Конфиг скринера из config.yml (секция screener) → Config.
 
@@ -271,10 +291,16 @@ def validate_config(config_path: str) -> list[dict]:
     dca = read_dca_section(config_path)
     bot = read_section(config_path, "bot")
     screener = read_section(config_path, "screener")
+    telegram = read_section(config_path, "telegram")
 
     add("секция dca разобрана", len(dca) > 0, f"{len(dca)} ключей")
     add("секция bot разобрана", len(bot) > 0, f"{len(bot)} ключей")
     add("секция screener разобрана", len(screener) > 0, f"{len(screener)} ключей")
+
+    if "enabled" not in telegram:
+        add("секция telegram разобрана", False, "нет ключа enabled")
+    else:
+        add("секция telegram разобрана", True, f"{len(telegram)} ключей")
 
     missing_dca = [k for k in REQUIRED_DCA_KEYS if k not in dca]
     add("dca: обязательные ключи заданы", not missing_dca,
@@ -310,6 +336,14 @@ def validate_config(config_path: str) -> list[dict]:
         add("screener → Config валиден", True, detail)
     except Exception as e:
         add("screener → Config валиден", False, str(e))
+
+    try:
+        tp_ = telegram_params_from_config(telegram)
+        detail = (f"enabled={tp_.enabled} mode={tp_.parse_mode} "
+                  f"chat={tp_.chat_id[:12] or '—'}…")
+        add("telegram → TelegramParams валиден", True, detail)
+    except Exception as e:
+        add("telegram → TelegramParams валиден", False, str(e))
 
     lev = dca.get("leverage")
     req = screener.get("required_leverage")

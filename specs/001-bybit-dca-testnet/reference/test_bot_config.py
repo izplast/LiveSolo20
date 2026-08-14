@@ -149,6 +149,21 @@ ok("max_cycles < 1 отвергается",
 ok("heartbeat_sec < 1 отвергается",
    raises(lambda: bc.bot_params_from_config({"heartbeat_sec": 0})))
 
+# ── TelegramParams: секция telegram (T031) ───────────────────────────────────
+
+print("\nTelegramParams: секция telegram из config.yml")
+_tg = bc.read_section(REPO_CONFIG, "telegram")
+ok("секция telegram разобрана", isinstance(_tg, dict) and "enabled" in _tg, _tg)
+tp_ = bc.telegram_params_from_config(_tg)
+ok("telegram → валидный TelegramParams", tp_.validate() is None)
+ok("в конфиге уведомления выключены", tp_.enabled is False, tp_)
+ok("parse_mode по умолчанию HTML", tp_.parse_mode == "HTML", tp_)
+td = bc.telegram_params_from_config({})
+ok("пустая telegram → disabled с дефолтами",
+   td.enabled is False and td.parse_mode == "HTML", td)
+ok("enabled без token → ValueError",
+   raises(lambda: bc.telegram_params_from_config({"enabled": True})))
+
 # ── validate_config: полная проверка на старте бота (T027) ──────────────────
 
 print("\nvalidate_config (config/config.yml)")
@@ -160,6 +175,8 @@ ok("проверен leverage dca == screener",
    any("leverage" in c["name"] for c in _checks))
 ok("проверена полнота dca-ключей",
    any("обязательные ключи" in c["name"] and "dca" in c["name"] for c in _checks))
+ok("проверена секция telegram в validate_config",
+   any("telegram" in c["name"] for c in _checks), [c["name"] for c in _checks])
 
 print("\nvalidate_config: отсутствующий файл → фолбэк дефолтов допустим")
 _no = bc.validate_config("/no/such/config.yml")

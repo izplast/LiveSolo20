@@ -1104,3 +1104,38 @@ rate-limit. T030 добавляет общий слой устойчивости
 
 Суммарно по reference-слою без сети: 930 ok, 0 fail.
 
+## T031 — Telegram-уведомления
+
+Раньше события бота (вход, выход, TP/SL, сбой API) можно было увидеть только
+в журнале — вручную. T031 добавляет `reference/notifier.py` — отправку
+уведомлений в Telegram через Bot API `sendMessage`, без внешних зависимостей:
+
+- **`TelegramParams`** — секция `telegram` конфига (`bot_token`, `chat_id`,
+  `enabled`, `parse_mode` HTML | MarkdownV2 | ""); `validate()`: при `enabled`
+  требует непустые token/chat_id и известный parse_mode;
+- **экранирование** — `escape_html` (через `html.escape`), `escape_markdown_v2`
+  (ручное экранирование `_*[]()~`>#+-=|{}.!`), `escape_auto` по parse_mode —
+  пользовательские данные (символы и т.п.) не ломают форматирование;
+- **форматирование событий** — `format_cycle_opened` (вход: символ, сторона,
+  цена, объём, цикл), `format_cycle_closed` (выход: причина, PnL, удержание),
+  `format_tp_hit` / `format_sl_hit` (фиксация TP / срабатывание SL),
+  `format_api_error`, `format_circuit_open`;
+- **`TelegramNotifier`** — `send_message()` (синхронный POST в `sendMessage`,
+  повторяет на сетевых сбоях и 5xx/429 через `ResilientCaller` из
+  `resilience.py` T030, счётчики `sent`/`failed`), `notify()` (неблокирующая
+  отправка через `ThreadPoolExecutor`, один воркер — Telegram не любит
+  параллельные sendMessage из одного чата), `shutdown()`. Ошибки сети
+  перехватываются и не роняют бота.
+
+Параметры добавлены в `bot_config.py` (`telegram_params_from_config`,
+проверка секции `telegram` в `validate_config`) и в `config/config.yml`
+(секция `telegram: enabled: false` — уведомления выключены по умолчанию).
+Сетевой вызов и паузы — инъекция, поэтому проверяется без сети.
+
+Покрытие: `reference/test_notifier.py` — 29 проверок (экранирование,
+форматирование всех событий, валидация параметров, ретраи сетевых сбоев,
+неустранимый сбой → False без падения, disabled не отправляет, неблокирующий
+notify), `test_bot_config.py` — 58 проверок (секция telegram + validate_config).
+
+Суммарно по reference-слою без сети: 966 ok, 0 fail.
+

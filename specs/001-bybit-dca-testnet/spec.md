@@ -460,3 +460,24 @@ HTTP-слой бросает `ResponseError(status, ...)`; `is_retryable_status`
 Покрытие: `reference/test_resilience.py` — 33 проверки (backoff, состояния
 предохранителя, ретраи/исчерпание, мгновенное отклонение при open,
 восстановление через half_open), все — с моками сбоев.
+
+### Telegram-уведомления (Phase 10, Live Integration)
+
+`reference/notifier.py` (T031) — уведомления в Telegram через Bot API
+`sendMessage`, без внешних зависимостей:
+
+| Элемент | Что даёт |
+|---------|----------|
+| `TelegramParams` | секция `telegram`: `bot_token`, `chat_id`, `enabled`, `parse_mode` (HTML/MarkdownV2/""); enabled требует непустые token/chat_id |
+| `escape_html` / `escape_markdown_v2` / `escape_auto` | экранирование пользовательских данных под parse_mode |
+| `format_cycle_opened/closed`, `format_tp_hit`, `format_sl_hit`, `format_api_error`, `format_circuit_open` | сообщения о входах/выходах, фиксации TP/SL, ошибках API, срабатывании предохранителя |
+| `TelegramNotifier.send_message` | синхронный POST, ретраи на сетевых сбоях/5xx/429 через `ResilientCaller` (T030), счётчики sent/failed |
+| `TelegramNotifier.notify` | неблокирующая отправка через `ThreadPoolExecutor` (один воркер) |
+
+Параметры подключены в `bot_config.py` (`telegram_params_from_config`,
+`validate_config` → проверка секции `telegram`) и `config/config.yml`
+(`telegram: enabled: false` по умолчанию). Ошибки сети не роняют бота.
+Сетевой вызов и паузы — инъекция, тесты без сети.
+
+Покрытие: `reference/test_notifier.py` — 29 проверок, `test_bot_config.py` —
+58 проверок.

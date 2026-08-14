@@ -78,6 +78,12 @@ bot:
   heartbeat_sec: 60
   journal_path: "logs/bot-events.jsonl"
 
+telegram:
+  enabled: false              # уведомления в Telegram о событиях бота (T031)
+  bot_token: ""               # токен бота @BotFather, например "123456:ABC-..."
+  chat_id: ""                 # ID чата/канала, куда слать сообщения
+  parse_mode: "HTML"          # HTML | MarkdownV2 | "" (без форматирования)
+
 server:
   host: "0.0.0.0"
   port: 8000
