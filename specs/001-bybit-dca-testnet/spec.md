@@ -347,3 +347,31 @@ python3 reference/report_charts.py --kind equity --input trades.json --out equit
 `--out-cycles` и CLI-флаг `--max-notional-usdt`.
 
 Покрытие: `reference/test_backtest_limits.py` — 24 проверки без сети.
+
+### История прогонов автораннера (Phase 9, Next Scope)
+
+`tools/run_tests.py` (T025) пишет итоги каждого прогона в
+`logs/test_runs.jsonl` (файл в .gitignore — не коммитится):
+
+| Поле записи | Содержимое |
+|-------------|------------|
+| `ts` | метка времени ISO-UTC |
+| `version` | короткий git-hash (`git rev-parse --short HEAD`), фолбэк `unknown` |
+| `rc` | код выхода прогона |
+| `sections` | ok/fail по каждой запущенной секции (unit/config/journal/journal-sim) |
+| `ok_total` / `fail_total` | итог по всем секциям |
+
+Команды:
+
+```bash
+python3 tools/run_tests.py                       # прогон + запись в историю
+python3 tools/run_tests.py --history-summary     # сводка истории
+python3 tools/run_tests.py --no-history          # прогон без записи
+python3 tools/run_tests.py --history-path logs/test_runs.jsonl --history-version v1
+```
+
+Чтение/агрегация — `read_history` (битые строки пропускает),
+`summarize_history` (прогоны, провалы, суммарно ok/fail, проходимость по
+секциям).
+
+Покрытие: `reference/test_run_tests_history.py` — 20 проверок без сети.

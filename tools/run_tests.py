@@ -15,9 +15,12 @@ tools/run_tests.py — единый автораннер проверок про
               сводка reference/report.py, вердикты SC-001..SC-005, отчёт об
               ошибках (битые строки) и простоях (слепые интервалы);
   --journal-sim  прогон синтетических сценариев журналов (reference/
-              journal_sim.py): stable/violations/downtime/short — сводка
-              report.py по детерминированной генерации (seed) и сверка
-              вердиктов SC с ожидаемыми для каждого сценария.
+               journal_sim.py): stable/violations/downtime/short — сводка
+               report.py по детерминированной генерации (seed) и сверка
+               вердиктов SC с ожидаемыми для каждого сценария.
+
+Каждый прогон дописывается в logs/test_runs.jsonl (история: дата, версия —
+git-hash, ok/fail по секциям); сводку истории показывает --history-summary.
 
 Запуск:
 
@@ -31,6 +34,7 @@ tools/run_tests.py — единый автораннер проверок про
     python3 tools/run_tests.py --config-path config/config.yml
     python3 tools/run_tests.py --journal logs/bot-events.jsonl logs/screener-events.jsonl
     python3 tools/run_tests.py --app-log logs/app.log
+    python3 tools/run_tests.py --history-summary
 
 Код выхода: 0 — все включённые секции прошли (или «нет данных»), 1 — есть
 провалы или ошибки исполнения.
@@ -260,6 +264,123 @@ def journal_sim_ok(res: dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# История прогонов: logs/test_runs.jsonl
+# ---------------------------------------------------------------------------
+
+def git_version() -> str:
+    """Короткий хэш HEAD (для записи в историю); 'unknown', если не git."""
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=5,
+                              cwd=_REPO_ROOT)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unknown"
+
+
+def section_record(results: dict[str, Any]) -> dict[str, Any]:
+    """Сводка по каждой запущенной секции для истории: {ok, fail, files}."""
+    out: dict[str, Any] = {}
+    if "unit" in results:
+        u = unit_summary(results["unit"])
+        out["unit"] = {"ok": u["всего_ok"], "fail": u["всего_fail"],
+                       "files": sum(p["files"] for p in u["по_фазам"].values())}
+    if "config" in results:
+        checks = results["config"]
+        out["config"] = {"ok": sum(c["ok"] for c in checks),
+                         "fail": sum(not c["ok"] for c in checks)}
+    if "journal" in results:
+        j = results["journal"]
+        out["journal"] = {"ok": 0 if j["error"] else sum(
+            v["вердикт"] != "НЕ выполнен" for v in j["verdicts"]),
+            "fail": 0 if not j["found"] else sum(
+                v["вердикт"] == "НЕ выполнен" for v in j["verdicts"])}
+        if not j["found"]:
+            out["journal"] = {"ok": 0, "fail": 0, "нет_данных": True}
+    if "journal_sim" in results:
+        sim = results["journal_sim"]
+        out["journal_sim"] = {"ok": sum(r.get("ok") for r in sim.values()),
+                              "fail": sum(not r.get("ok") for r in sim.values()),
+                              "files": len(sim)}
+    return out
+
+
+def build_history_record(results: dict[str, Any], rc: int,
+                         version: str | None = None) -> dict[str, Any]:
+    """Запись одного прогона для logs/test_runs.jsonl.
+
+    Поля: ts (ISO-UTC), version (git-hash по умолчанию), rc, sections
+    (ok/fail по каждой запущенной секции), ok_total/fail_total.
+    """
+    import datetime
+    sec = section_record(results)
+    total_ok = sum(s.get("ok", 0) for s in sec.values())
+    total_fail = sum(s.get("fail", 0) for s in sec.values())
+    return {
+        "ts": datetime.datetime.now(datetime.timezone.utc)
+              .strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "version": version or git_version(),
+        "rc": rc,
+        "sections": sec,
+        "ok_total": total_ok,
+        "fail_total": total_fail,
+    }
+
+
+def write_history(path: str, record: dict[str, Any]) -> None:
+    """Дописывает запись прогона в JSONL-историю (создаёт каталог/файл)."""
+    dirname = os.path.dirname(path)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def read_history(path: str) -> list[dict[str, Any]]:
+    """Читает историю прогонов; битые строки пропускает."""
+    records: list[dict[str, Any]] = []
+    if not os.path.exists(path):
+        return records
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def summarize_history(records: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Агрегация истории: счётчики, последний прогон, проходимость секций."""
+    if not records:
+        return {"прогонов": 0, "последний": None}
+    ok_total = sum(r.get("ok_total", 0) for r in records)
+    fail_total = sum(r.get("fail_total", 0) for r in records)
+    failed = [r for r in records if r.get("rc")]
+    sections: dict[str, dict[str, int]] = {}
+    for r in records:
+        for name, s in (r.get("sections") or {}).items():
+            sec = sections.setdefault(name, {"прогонов": 0, "ok": 0, "fail": 0})
+            sec["прогонов"] += 1
+            sec["ok"] += s.get("ok", 0)
+            sec["fail"] += s.get("fail", 0)
+    last = records[-1]
+    return {
+        "прогонов": len(records),
+        "последний": last,
+        "ok_total": ok_total,
+        "fail_total": fail_total,
+        "прогонов_с_провалом": len(failed),
+        "секции": sections,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Вывод
 # ---------------------------------------------------------------------------
 
@@ -341,6 +462,25 @@ def render_journal_sim(res: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_history(hist: dict[str, Any]) -> str:
+    lines = ["История прогонов автораннера (logs/test_runs.jsonl)"]
+    if hist["прогонов"] == 0:
+        lines.append("  история пуста — прогоны ещё не записывались")
+        return "\n".join(lines)
+    last = hist["последний"]
+    lines.append(f"  Прогонов: {hist['прогонов']} "
+                 f"(с провалами: {hist['прогонов_с_провалом']})")
+    lines.append(f"  Итого по всем прогонам: {hist['ok_total']} ok, "
+                 f"{hist['fail_total']} fail")
+    lines.append(f"  Последний: {last.get('ts')} v{last.get('version')} "
+                 f"rc={last.get('rc')} ({last.get('ok_total')} ok, "
+                 f"{last.get('fail_total')} fail)")
+    for name, s in sorted(hist["секции"].items()):
+        lines.append(f"  {name:<12} прогонов {s['прогонов']:>2}, "
+                     f"{s['ok']} ok, {s['fail']} fail")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -373,6 +513,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                          "(journal_sim.py) и сверить вердикты SC")
     ap.add_argument("--journal-sim-seed", type=int, default=0,
                     help="seed генерации сценариев (по умолчанию 0)")
+    ap.add_argument("--history-path", default=None,
+                    help=f"JSONL-история прогонов (по умолчанию "
+                         f"{os.path.join('logs', 'test_runs.jsonl')})")
+    ap.add_argument("--no-history", action="store_true",
+                    help="не дописывать итог прогона в историю")
+    ap.add_argument("--history-version", default=None,
+                    help="версия для записи в историю (по умолчанию git-hash)")
+    ap.add_argument("--history-summary", action="store_true",
+                    help="показать сводку истории прогонов и выйти")
     ap.add_argument("--ref-dir", default=DEFAULT_REF_DIR,
                     help=f"reference-каталог (по умолчанию {DEFAULT_REF_DIR})")
     ap.add_argument("--config-path", default=DEFAULT_CONFIG,
@@ -405,6 +554,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.journals = list(DEFAULT_JOURNALS)
     else:
         args.journals = list(args.journal_files)
+
+    # История прогонов.
+    if args.history_path is None:
+        args.history_path = os.path.join(_REPO_ROOT, "logs", "test_runs.jsonl")
+    if args.history_summary:
+        hist = summarize_history(read_history(args.history_path))
+        print(render_history(hist))
+        return 0
 
     results = run_sections(args)
 
@@ -446,6 +603,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         failed |= not journal_ok(results["journal"])
     if "journal_sim" in results:
         failed |= not journal_sim_ok(results["journal_sim"])
+
+    if not args.no_history:
+        record = build_history_record(results, 1 if failed else 0,
+                                      version=args.history_version)
+        try:
+            write_history(args.history_path, record)
+        except OSError as e:
+            sys.stderr.write(f"[run_tests] предупреждение: история не записана "
+                             f"({e})\n")
     return 1 if failed else 0
 
 

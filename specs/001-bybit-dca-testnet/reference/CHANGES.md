@@ -951,8 +951,29 @@ vs бот» (FR-017/FR-018). T024 закрывает его:
 
 Суммарно по reference-слою без сети: 799 ok, 0 fail.
 
+## История прогонов автораннера (2026-08-14)
 
+Раньше итоги `tools/run_tests.py` жили только в stdout — по одному прогону
+нельзя было понять, что ломается со временем. T025 добавляет историю:
 
+- **`logs/test_runs.jsonl`** — каждая запись: `ts` (ISO-UTC), `version`
+  (короткий git-hash через `git rev-parse --short HEAD`, фолбэк `unknown`),
+  `rc` (код выхода), `sections` (ok/fail по каждой запущенной секции:
+  unit/config/journal/journal-sim), `ok_total`/`fail_total`;
+- **`--history-summary`** — сводка истории: число прогонов, провалов, итог
+  ok/fail, последний прогон, проходимость по секциям;
+- **`--no-history`** — не дописывать текущий прогон в историю;
+- **`--history-path`** — другой файл истории (по умолчанию `logs/test_runs.jsonl`);
+- **`--history-version`** — зафиксировать версию в записи (по умолчанию git-hash).
 
+Утилиты (`tools/run_tests.py`): `git_version`, `build_history_record`,
+`section_record`, `write_history` (append, создаёт каталог), `read_history`
+(битые строки пропускает), `summarize_history`. `logs/` в .gitignore —
+история не коммитится.
 
+Покрытие: **`reference/test_run_tests_history.py`** — 20 проверок, 0 fail
+(git_version, build_history_record/section_record, write/read_history с
+битыми строками, summarize_history на синтетике; без сети).
+
+Суммарно по reference-слою без сети: 819 ok, 0 fail.
 
