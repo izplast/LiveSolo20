@@ -172,6 +172,28 @@ def format_circuit_open(symbol: str | None, error: str,
         parse_mode)
 
 
+def format_signal(symbol: str, side: str, price: float,
+                  signal_id: str, natr: float | None = None,
+                  detection_lag_ms: int | None = None,
+                  parse_mode: str = "HTML") -> str:
+    """Dry-run: скринер нашёл кандидата, но ордер не выставляется."""
+    e = lambda s: escape_auto(s, parse_mode)  # noqa: E731
+    lines = [f"Символ: {e(symbol)}  ({e(side)})",
+             f"Цена: {_fmt_price(price)}"]
+    if natr is not None:
+        lines.append(f"NATR: {natr:.2f}%")
+    if detection_lag_ms is not None:
+        lines.append(f"Задержка: {detection_lag_ms} мс")
+    lines.append(f"ID: {e(signal_id)}")
+    return _wrap("📈 DCA-сигнал (dry-run)", lines, parse_mode)
+
+
+def format_telegram_test(parse_mode: str = "HTML") -> str:
+    """Проверка соединения с ботом и каналом (--telegram-test)."""
+    return _wrap("🔔 Тест уведомлений",
+                 ["Скринер работает, канал открыт."], parse_mode)
+
+
 # ---------------------------------------------------------------------------
 # Параметры
 # ---------------------------------------------------------------------------

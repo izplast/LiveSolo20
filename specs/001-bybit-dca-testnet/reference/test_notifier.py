@@ -103,6 +103,17 @@ m = nt.format_circuit_open(None, "сбой")
 ok("предохранитель без символа → 'Все символы'", "Все символы" in m, m)
 m = nt.format_cycle_opened("A_B", "Buy", 1.0, 1.0, "C1", "MarkdownV2")
 ok("MarkdownV2: спецсимвол символа экранирован", "A\\_B" in m, m)
+m = nt.format_signal("TESTUSDT", "Buy", 65000.5, "TESTUSDT:1:12345",
+                     natr=1.2, detection_lag_ms=800)
+ok("сигнал (dry-run): символ, сторона, цена, NATR, задержка, ID",
+   "TESTUSDT" in m and "Buy" in m and "65000.5" in m
+   and "NATR: 1.20%" in m and "800 мс" in m and "TESTUSDT:1:12345" in m, m)
+ok("сигнал: dry-run метка", "dry-run" in m, m)
+m = nt.format_signal("BTCUSDT", "Sell", 30000.0, "B:1:2")
+ok("сигнал без NATR/задержки",
+   "BTCUSDT" in m and "NATR" not in m and "мс" not in m, m)
+m = nt.format_telegram_test()
+ok("тест уведомлений: текст", "Тест уведомлений" in m, m)
 
 # ── параметры ───────────────────────────────────────────────────────────────
 

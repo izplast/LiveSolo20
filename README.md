@@ -12,14 +12,14 @@ WebSocket-потоке. Скринер ищет монеты с волатиль
 
 ## Статус: ✅ Phase 10 closed — готов к боевому прогону
 
-Все 11 фаз бэклога закрыты, автономная test-база без сети — **966/966 passed, 0 fail**.
+Все 11 фаз бэклога закрыты, автономная test-база без сети — **980/980 passed, 0 fail**.
 
 | Фаза | Что закрыто |
 |------|-------------|
 | Phase 1–7 (MVP) | инфраструктура, WS-скринер, вход с плечом, докупки и TP, 72 ч, сводка прогона |
 | Phase 8 | A/B-инструменты, единый автораннер, графики по эквити/просадкам |
 | Phase 9 | синтетические журналы, экспорт сделок, лимиты бэктеста, история прогонов, расширенные метрики, валидатор конфига, сводка по символам |
-| Phase 10 (Live) | сверка состояния с биржей, backoff + circuit breaker, **Telegram-уведомления** |
+| Phase 10 (Live) | сверка состояния с биржей, backoff + circuit breaker, Telegram-уведомления, **paper-режим (dry-run)** |
 
 ## Запуск тестов
 
@@ -27,8 +27,36 @@ WebSocket-потоке. Скринер ищет монеты с волатиль
 python3 tools/run_tests.py            # все автономные тесты reference/ + анализ журналов
 ```
 
-Ожидаемый итог: `966 ok, 0 fail` (юнит-секция `reference/test_*.py`,
+Ожидаемый итог: `980 ok, 0 fail` (юнит-секция `reference/test_*.py`,
 22 файла — без сети, только stdlib).
+
+## Paper-прогон перед Testnet (dry-run)
+
+Без единого ордера: проверка WS-подключения, нагрузки скринера, логов и
+Telegram-уведомлений. Требует зависимостей (в Termux):
+
+```bash
+pip install websockets requests pyyaml
+```
+
+Сначала — тест канала Telegram (укажите в `config/config.yml` секцию `telegram`:
+`enabled: true`, `bot_token`, `chat_id`):
+
+```bash
+python3 specs/001-bybit-dca-testnet/reference/screener.py --telegram-test --config config/config.yml
+```
+
+Затем paper-прогон (реальный WS mainnet, сигналы → журнал `signal_dry_run` +
+Telegram, ордера не выставляются):
+
+```bash
+python3 specs/001-bybit-dca-testnet/reference/screener.py --dry-run --config config/config.yml
+```
+
+Смотреть за работой 30–60 минут: WS-поток (600 символов, 6 соединений),
+события `signal_dry_run` в `logs/screener-events.jsonl`, уведомления в Telegram.
+Ctrl+C — аккуратная остановка. Для непрерывной работы в Termux:
+`termux-wake-lock`.
 
 ## Структура
 
@@ -54,5 +82,7 @@ logs/                           # журналы и история прогон�
 1. Проверить секцию `telegram` в `config/config.yml` (T031): включить `enabled`,
    указать `bot_token`/`chat_id`, чтобы получать уведомления о входах/выходах,
    TP/SL и критических ошибках API.
-2. Прогнать `python3 tools/run_tests.py` — итог `966 ok, 0 fail`.
-3. Калибровать пороги волатильности/проскальзывания по результатам Testnet.
+2. Прогнать `python3 tools/run_tests.py` — итог `980 ok, 0 fail`.
+3. Сделать paper-прогон (см. выше, `--dry-run`) и посмотреть 30–60 мин за
+   поведением WS и уведомлениями.
+4. Калибровать пороги волатильности/проскальзывания по результатам Testnet.

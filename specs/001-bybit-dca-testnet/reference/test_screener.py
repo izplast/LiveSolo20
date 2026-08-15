@@ -195,8 +195,9 @@ print("\nотправка сигнала и состояние цвета")
 
 
 def fresh_screener(**over):
+    notifier = over.pop("notifier", None)
     c = cfg(journal_path=os.path.join(_tmp, "events.jsonl"), **over)
-    s = sc.Screener(c)
+    s = sc.Screener(c, notifier=notifier)
     st = sc.SymbolState(s._fast_cap, s._slow_cap)
     for row in up_fast:
         st.push("fast", row)
@@ -307,6 +308,45 @@ ok("шум insufficient_history не журналируется", "insufficient_
 ok("шум repeat_color не журналируется", "repeat_color" not in reasons)
 ok("каждая строка — валидный JSON с kind и ts",
    all("kind" in x and "ts" in x for x in lines))
+
+# ── 5. Paper-режим (dry-run) ─────────────────────────────────────────────────
+
+print("\ndry-run: сигналы без POST и ордеров")
+fake_requests.posted.clear()
+sd, std = fresh_screener(dry_run=True)
+fire(sd, std)
+ok("dry-run: POST на бота НЕ идёт", len(fake_requests.posted) == 0,
+   fake_requests.posted)
+ok("dry-run: цвет зафиксирован (как после успешной доставки)", std.last_color == "green")
+ok("dry-run: метка сигнала сдвинута", std.last_signal_ms != 0, std.last_signal_ms)
+sd.journal.close()
+dry_lines = [json.loads(x) for x in
+             open(os.path.join(_tmp, "events.jsonl"), encoding="utf-8")]
+dry_ev = [x for x in dry_lines if x["kind"] == "signal_dry_run"]
+ok("dry-run: событие signal_dry_run в журнале", len(dry_ev) == 1, dry_ev)
+ok("dry-run: в событии статус dry_run и конверт",
+   dry_ev and dry_ev[0].get("status") == "dry_run"
+   and dry_ev[0].get("signal", {}).get("symbol") == "TESTUSDT", dry_ev)
+
+class _FakeNotifier:
+    def __init__(self):
+        self.sent = []
+    def notify(self, text):
+        self.sent.append(text)
+
+fake_nt = _FakeNotifier()
+sn, stn = fresh_screener(dry_run=True, notifier=fake_nt)
+sn.journal.close()
+fire(sn, stn)
+ok("dry-run: уведомление ушло в notifier", len(fake_nt.sent) == 1, fake_nt.sent)
+ok("dry-run: в уведомлении символ и сторона",
+   fake_nt.sent and "TESTUSDT" in fake_nt.sent[0] and "Buy" in fake_nt.sent[0],
+   fake_nt.sent)
+
+ok("dry_run по умолчанию False", cfg().dry_run is False)
+ok("не-булевый dry_run отвергается",
+   raises(lambda: sc.validate_config(cfg(dry_run="yes"))))
+ok("bool dry_run валиден", not raises(lambda: sc.validate_config(cfg(dry_run=True))))
 
 print(f"\nитог: {PASS} ok, {FAIL} fail")
 sys.exit(1 if FAIL else 0)

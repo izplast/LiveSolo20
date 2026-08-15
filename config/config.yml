@@ -118,6 +118,10 @@ screener:
                               # 1м не выше порога (красный требует 80..100;
                               # 90 — свежий дамп шортится; 100 — выключено)
   journal_path: "logs/screener-events.jsonl"
+  # Paper-режим: сигналы НЕ уходят на bot_api_url, а пишутся в журнал
+  # (signal_dry_run) и, при настроенном telegram ниже, уходят в Telegram.
+  # Команда: python3 reference/screener.py --dry-run (или --telegram-test).
+  dry_run: false
   # «Чистый крипто-пул»: в скринер попадают только USDT-перпетуалы, которые
   # есть в топе CoinGecko по капитализации (0 — фильтр выключен). Отсекает
   # токенизированные акции/ETF (bStocks: TSLA, NVDA, SOXL, XAU...), индексные

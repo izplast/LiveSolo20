@@ -46,6 +46,7 @@ import json
 import os
 import random
 import signal as os_signal
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -130,6 +131,10 @@ class Config:
     post_retries: int = 3
     seed_concurrency: int = 6
     journal_path: str = "logs/screener-events.jsonl"
+    # Paper-режим: сигналы НЕ отправляются на bot_api_url, а пишутся в журнал
+    # (signal_dry_run) и, при включённой секции telegram в config.yml, уходят
+    # уведомлением в Telegram. Ордера никуда не выставляются.
+    dry_run: bool = False
 
 
 def load_config(path: str = "config/config.yml") -> Config:
@@ -187,6 +192,9 @@ def validate_config(cfg: Config) -> None:
         problems.append("ws_stale_sec должен превышать ws_ping_sec")
     if cfg.reject_log not in ("all", "candidates", "none"):
         problems.append("reject_log: all | candidates | none")
+
+    if not isinstance(cfg.dry_run, bool):
+        problems.append("dry_run: bool")
     if not _is_minute_tf(cfg.tf_fast) or not _is_minute_tf(cfg.tf_slow):
         problems.append("tf_fast/tf_slow — целые минуты в виде строки ('1', '15'); "
                         "нецелые или нецифровые значения ('D', 'W') не поддерживаются")
@@ -509,7 +517,7 @@ def check_clock_skew(cfg: Config) -> int:
 # ---------------------------------------------------------------------------
 
 class Screener:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, notifier=None):
         self.cfg = cfg
         self.journal = Journal(cfg.journal_path)
         self.states: dict[str, SymbolState] = {}
@@ -519,6 +527,23 @@ class Screener:
         self._stop = asyncio.Event()
         self._fast_cap = max(cfg.natr_period + 2, cfg.uhlo_length * 2 + 2)
         self._slow_cap = cfg.uhlo_length * 2 + 2
+        # Инъекция уведомлений: None — не слать. В dry-run и при запуске с
+        # Telegram-настройками сюда подставляется TelegramNotifier (notifier.py).
+        self.notifier = notifier
+
+    def _notify_signal(self, payload: dict) -> None:
+        """Отправка уведомления о сигнале (только в dry-run, без ордеров)."""
+        if self.notifier is None:
+            return
+        d = payload.get("diagnostics", {})
+        try:
+            self.notifier.notify(
+                "📈 DCA-сигнал (dry-run): "
+                f"{payload.get('symbol')} {payload.get('side')} "
+                f"@{payload.get('price')} "
+                f"NATR {d.get('natr')}% lag {d.get('detection_lag_ms')} мс")
+        except Exception:  # noqa: BLE001 — уведомления не роняют скринер
+            logger.warning("не удалось отправить уведомление о сигнале", exc_info=True)
 
     def now_ms(self) -> int:
         return int(time.time() * 1000) + self.skew_ms
@@ -821,6 +846,19 @@ class Screener:
             },
         }
 
+        if self.cfg.dry_run:
+            # Paper-режим: без POST и без ордеров. Состояние продвигается
+            # как при успешной доставке — иначе dry-run задыхался бы на
+            # повторных сигналах того же цвета.
+            st.last_color = d.color
+            st.last_signal_ms = ts
+            self.journal.write("signal_dry_run", status="dry_run", signal=payload)
+            logger.info("dry-run сигнал %s %s natr=%.2f lag=%d мс",
+                        symbol, payload["side"], d.natr or 0.0,
+                        payload["diagnostics"]["detection_lag_ms"])
+            self._notify_signal(payload)
+            return
+
         ok, info = await asyncio.to_thread(self._post_signal, payload)
         if ok:
             # Состояние продвигается ТОЛЬКО после успешной доставки: иначе
@@ -866,14 +904,49 @@ class Screener:
 # Точка входа
 # ---------------------------------------------------------------------------
 
-async def amain() -> int:
-    cfg = load_config()
+async def amain(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="DCA-скринер Bybit (WS mainnet, сигналы → бот/журнал/Telegram)",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", default="config/config.yml",
+                    help="путь к config.yml (по умолчанию config/config.yml)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="paper-режим: сигналы в журнал (signal_dry_run) + Telegram "
+                         "вместо POST на bot_api_url; ордера не выставляются")
+    ap.add_argument("--telegram-test", action="store_true",
+                    help="отправить тестовое сообщение в Telegram из секции "
+                         "telegram config.yml и выйти")
+    args = ap.parse_args(argv)
+
+    cfg = load_config(args.config)
     logger.info("скринер запущен: NATR %.2f..%.2f (период %d), UHLO %d, ТФ %s/%s, топ-%d по обороту, "
                 "пропуск первых %d по объёму",
                 cfg.natr_min, cfg.natr_max, cfg.natr_period, cfg.uhlo_length,
                 cfg.tf_fast, cfg.tf_slow, cfg.top_n_turnover, cfg.skip_top_volume)
 
-    screener = Screener(cfg)
+    notifier = _build_notifier_from_config(args.config)
+    if args.telegram_test:
+        if notifier is None:
+            logger.error("telegram-секция не настроена (enabled=false или пустой токен) — "
+                         "тест невозможен")
+            return 1
+        ok_ = notifier.send_message(notifier_formats("telegram_test"))
+        notifier.shutdown(wait=True)
+        logger.info("telegram-тест: %s", "отправлено" if ok_ else "не доставлено")
+        return 0 if ok_ else 1
+
+    if args.dry_run:
+        cfg.dry_run = True
+        if notifier is not None:
+            logger.info("dry-run: сигналы → журнал + Telegram (без ордеров)")
+        else:
+            logger.info("dry-run: сигналы → журнал (Telegram не настроен)")
+    elif notifier is not None:
+        notifier.shutdown(wait=False)
+
+    screener = Screener(cfg, notifier=notifier)
     loop = asyncio.get_running_loop()
     for sig in (os_signal.SIGINT, os_signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
@@ -887,6 +960,104 @@ async def amain() -> int:
         return 1
     finally:
         screener.journal.close()
+        if notifier is not None:
+            notifier.shutdown(wait=False)
+
+
+def _read_flat_section(path: str, section: str) -> dict:
+    """Плоская секция из YAML-подобного файла без pyyaml (как bot_config.read_section).
+
+    Для telegram-настроек: ключи bot_token/chat_id/parse_mode — строки,
+    enabled — bool. Списки не нужны.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return {}
+    out: dict = {}
+    in_section = False
+    for raw in lines:
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if len(line) - len(line.lstrip(" ")) == 0 and stripped.endswith(":"):
+            in_section = stripped == f"{section}:"
+            continue
+        if not in_section:
+            continue
+        if "#" in line:
+            line = line.split("#", 1)[0].rstrip()
+        if ":" in line:
+            key, _, value = line.partition(":")
+            out[key.strip()] = _parse_scalar(value)
+    return out
+
+
+def _parse_scalar(value: str):
+    v = value.strip()
+    if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0]:
+        v = v[1:-1]
+    if v == "":
+        return ""
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    return v
+
+
+def _build_notifier_from_config(config_path: str):
+    """TelegramNotifier из секции telegram config.yml; None — не настроен."""
+    try:
+        import importlib.util as _iu
+
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        spec = _iu.spec_from_file_location("notifier_for_screener",
+                                           os.path.join(_dir, "notifier.py"))
+        assert spec and spec.loader
+        nt = _iu.module_from_spec(spec)
+        sys.modules["notifier_for_screener"] = nt
+        spec.loader.exec_module(nt)
+    except Exception:  # noqa: BLE001
+        logger.warning("notifier.py недоступен — уведомления выключены", exc_info=True)
+        return None
+
+    try:
+        import yaml  # локальный импорт: без конфига не нужен
+
+        with open(config_path) as f:
+            raw = (yaml.safe_load(f) or {}).get("telegram", {}) or {}
+    except Exception:  # noqa: BLE001
+        raw = _read_flat_section(config_path, "telegram")
+
+    try:
+        params = nt.telegram_params_from_config(raw)
+        if not params.enabled:
+            logger.info("telegram-уведомления выключены (enabled=false)")
+            return None
+        return nt.TelegramNotifier(params)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("telegram-настройки некорректны: %s", e)
+        return None
+
+
+def notifier_formats(what: str, **kw) -> str:
+    """Лёгкий мост к форматтерам notifier для CLI без жёсткого импорта."""
+    try:
+        import importlib.util as _iu
+
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        spec = _iu.spec_from_file_location("notifier_formats_mod",
+                                           os.path.join(_dir, "notifier.py"))
+        assert spec and spec.loader
+        nt = _iu.module_from_spec(spec)
+        sys.modules["notifier_formats_mod"] = nt
+        spec.loader.exec_module(nt)
+        return nt.format_telegram_test() if what == "telegram_test" else str(what)
+    except Exception:  # noqa: BLE001
+        return "🔔 Тест уведомлений: скринер работает"
 
 
 def main() -> None:
