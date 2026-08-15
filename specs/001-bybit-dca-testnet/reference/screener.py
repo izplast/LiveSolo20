@@ -119,6 +119,21 @@ class Config:
     # 'candidates' — всё, кроме шума (нехватка истории, NATR ниже минимума,
     # неизменный цвет); 'all' — включая шум; 'none' — только сигналы.
     reject_log: str = "candidates"
+    # Анти-памп (LONG): сигнал гасится, если объём закрытой свечи выше
+    # pump_volume_mult × среднего за предыдущие 20 И верхняя тень длиннее
+    # pump_wick_ratio × размаха бара. 0 — защита выключена.
+    pump_volume_mult: float = 0.0
+    pump_wick_ratio: float = 0.5
+    # Шорт только пока рынок не перепродан: UHLO highs 1м не выше порога.
+    # Красный цвет требует highs 80..100; 90 — свежий дамп шортится;
+    # 100 — выключено.
+    short_highs_max: float = 100.0
+    # «Чистый крипто-пул»: только символы, чья базовая монета есть в топе
+    # CoinGecko по капитализации (0 — фильтр выключен).
+    cg_max_rank: int = 0
+    # Суточный оборот Bybit (turnover24h, USDT) не ниже этого значения
+    # (0 — фильтр выключен).
+    min_turnover_usdt: float = 0.0
     ws_topics_per_conn: int = 200
     ws_subscribe_batch: int = 10   # Bybit не принимает больше 10 args за раз
     ws_ping_sec: int = 15          # Bybit закрывает соединение без ping в 20 с
@@ -206,6 +221,16 @@ def validate_config(cfg: Config) -> None:
         problems.append("skip_top_volume >= 0")
     if cfg.ws_topics_per_conn < 2:
         problems.append("ws_topics_per_conn >= 2 (по 2 топика на символ)")
+    if not cfg.pump_volume_mult >= 0:
+        problems.append("pump_volume_mult >= 0")
+    if not 0 <= cfg.pump_wick_ratio <= 1:
+        problems.append("pump_wick_ratio в пределах 0..1")
+    if not 80 <= cfg.short_highs_max <= 100:
+        problems.append("short_highs_max в пределах 80..100 (100 — выключено)")
+    if cfg.cg_max_rank < 0:
+        problems.append("cg_max_rank >= 0")
+    if cfg.min_turnover_usdt < 0:
+        problems.append("min_turnover_usdt >= 0")
     if problems:
         raise ValueError("некорректный screener-конфиг:\n- " + "\n- ".join(problems))
 
@@ -352,12 +377,72 @@ def evaluate(fast: Sequence, slow: Sequence, cfg: Config) -> Decision:
         return Decision(False, "uhlo_no_color", natr=natr,
                         uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow)
 
+    if color == "green" and pump_blocked(fast, cfg):
+        return Decision(False, "pump_volume_spike", color=color, natr=natr,
+                        uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow,
+                        details={"volume_mult": cfg.pump_volume_mult,
+                                 "wick_ratio": cfg.pump_wick_ratio})
+    if color == "red" and short_blocked(uhlo_fast, cfg):
+        return Decision(False, "short_oversold", color=color, natr=natr,
+                        uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow,
+                        details={"highs_1m": uhlo_fast.get("highs"),
+                                 "short_highs_max": cfg.short_highs_max})
+
     return Decision(True, "", color=color, natr=natr,
                     uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow)
 
 
 def color_to_side(color: str) -> str:
     return "Buy" if color == "green" else "Sell"
+
+
+# ---------------------------------------------------------------------------
+# Фильтры сигнала (чистые функции — проверяются юнит-тестами без сети)
+# ---------------------------------------------------------------------------
+
+def _volume(row: list) -> float | None:
+    """Объём свечи (индекс 5), если он есть в строке."""
+    return float(row[5]) if len(row) > 5 else None
+
+
+def pump_blocked(fast: Sequence, cfg: Config) -> bool:
+    """Анти-памп (LONG): объёмный спайк + длинная верхняя тень.
+
+    Сигнал гасится, если объём последней закрытой свечи выше
+    pump_volume_mult × среднего за предыдущие 20 свечей И верхняя тень
+    занимает больше pump_wick_ratio × размаха бара. 0 — выключено.
+    """
+    if cfg.pump_volume_mult <= 0:
+        return False
+    if len(fast) < 2:
+        return False
+    last_vol = _volume(fast[-1])
+    if last_vol is None:
+        return False
+    prev = fast[-21:-1]
+    prev_vols = [_volume(r) for r in prev]
+    prev_vols = [v for v in prev_vols if v is not None]
+    if len(prev_vols) < 2:
+        return False
+    avg = sum(prev_vols) / len(prev_vols)
+    if last_vol <= cfg.pump_volume_mult * avg:
+        return False
+    o, h, l, c = (float(fast[-1][1]), float(fast[-1][2]),
+                  float(fast[-1][3]), float(fast[-1][4]))
+    rng = h - l
+    if rng <= 0:
+        return False
+    wick = (h - max(o, c)) / rng
+    return wick > cfg.pump_wick_ratio
+
+
+def short_blocked(uhlo_fast: dict | None, cfg: Config) -> bool:
+    """Шорт только пока рынок не перепродан: UHLO highs 1м не выше порога."""
+    if cfg.short_highs_max >= 100:
+        return False
+    if not uhlo_fast:
+        return False
+    return uhlo_fast.get("highs", 0) > cfg.short_highs_max
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +554,51 @@ def fetch_turnover(base: str) -> dict[str, float]:
     return {t["symbol"]: float(t.get("turnover24h") or 0) for t in res.get("list", [])}
 
 
+COINGECKO_API = "https://api.coingecko.com/api/v3"
+
+
+def _cg_get(path: str, params: dict[str, Any], retries: int = 3) -> list:
+    """GET CoinGecko: в отличие от Bybit возвращает чистый JSON-массив."""
+    last_err: Exception | None = None
+    for attempt in range(retries + 1):
+        if attempt:
+            time.sleep(min(8.0, 0.5 * 2 ** attempt) * (0.7 + 0.6 * random.random()))
+        try:
+            r = requests.get(f"{COINGECKO_API}{path}", params=params, timeout=15)
+            r.raise_for_status()
+            body = r.json()
+            if not isinstance(body, list):
+                raise RuntimeError(f"CoinGecko {path}: неожиданный ответ {type(body)}")
+            return body
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"CoinGecko GET {path} не удался после {retries + 1} попыток: {last_err}")
+
+
+def fetch_cg_top(max_rank: int) -> set[str]:
+    """Символы базовых монет в топе CoinGecko по капитализации.
+
+    Фильтр «чистого крипто-пула»: отсекает токенизированные акции/ETF,
+    индексные и леверидж-токены (bStocks: TSLA, NVDA...), которых нет на
+    CoinGecko. Возвращает ВЕРХНИЙ регистр символов (BTC, ETH, ...).
+    """
+    out: set[str] = set()
+    page = 1
+    per_page = 250
+    while len(out) < max_rank:
+        rows = _cg_get("/coins/markets",
+                       {"vs_currency": "usd", "order": "market_cap_desc",
+                        "per_page": per_page, "page": page}, retries=2)
+        if not rows:
+            break
+        for coin in rows:
+            out.add(str(coin.get("symbol") or "").upper())
+        page += 1
+        if len(rows) < per_page:
+            break
+    return out
+
+
 def fetch_klines(base: str, symbol: str, interval: str, limit: int) -> list[list]:
     """Закрытые свечи, от старых к новым.
 
@@ -480,7 +610,8 @@ def fetch_klines(base: str, symbol: str, interval: str, limit: int) -> list[list
                       "limit": min(1000, limit + 1)})
     interval_ms = int(interval) * 60_000
     now_ms = int(time.time() * 1000)
-    rows = [[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])] for r in res.get("list", [])]
+    rows = [[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]),
+             float(r[5]) if len(r) > 5 else 0.0] for r in res.get("list", [])]
     closed = [r for r in rows if r[0] + interval_ms <= now_ms]
     closed.sort(key=lambda r: r[0])
     return closed[-limit:]
@@ -559,11 +690,16 @@ class Screener:
 
     async def build_universe(self) -> list[str]:
         """Топ по обороту, торгуемые и на mainnet, и на Testnet."""
-        mainnet, testnet, turnover = await asyncio.gather(
+        tasks = [
             asyncio.to_thread(fetch_instruments, MAINNET_REST),
             asyncio.to_thread(fetch_instruments, TESTNET_REST),
             asyncio.to_thread(fetch_turnover, MAINNET_REST),
-        )
+        ]
+        if self.cfg.cg_max_rank > 0:
+            tasks.append(asyncio.to_thread(fetch_cg_top, self.cfg.cg_max_rank))
+        results = await asyncio.gather(*tasks)
+        mainnet, testnet, turnover = results[:3]
+        cg_top = results[3] if len(results) > 3 else set()
         self.instruments = mainnet
 
         ranked = sorted(turnover.items(), key=lambda kv: kv[1], reverse=True)
@@ -576,10 +712,14 @@ class Screener:
                 continue
             reason = None
             base = symbol[:-4] if symbol.endswith("USDT") else symbol
-            if symbol in self.cfg.blacklist:
+            if turn < self.cfg.min_turnover_usdt:
+                reason = "below_min_turnover"
+            elif symbol in self.cfg.blacklist:
                 reason = "symbol_blacklisted"
             elif base in self.cfg.base_coin_blacklist:
                 reason = "base_coin_blacklisted"
+            elif self.cfg.cg_max_rank > 0 and base.upper() not in cg_top:
+                reason = "not_in_cg_top"
             elif info["status"] != "Trading":
                 reason = "not_trading"
             elif symbol not in testnet:
@@ -769,7 +909,7 @@ class Screener:
                 if item.get("confirm") is not True:
                     continue  # только закрытые свечи
                 row = [int(item["start"]), float(item["open"]), float(item["high"]),
-                       float(item["low"]), float(item["close"])]
+                       float(item["low"]), float(item["close"]), float(item.get("volume") or 0)]
                 if not row[3] > 0:
                     continue
                 is_new = st.push(tf, row)

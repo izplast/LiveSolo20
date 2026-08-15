@@ -1104,6 +1104,31 @@ rate-limit. T030 добавляет общий слой устойчивости
 
 Суммарно по reference-слою без сети: 930 ok, 0 fail.
 
+## T033 — Ключи фильтрации прод-скринера в reference (анти-памп, пул, оборот)
+
+Раньше reference-скринер игнорировал 5 ключей из config.yml (предупреждение
+«незнакомые ключи»): `pump_volume_mult`, `pump_wick_ratio`, `short_highs_max`,
+`cg_max_rank`, `min_turnover_usdt`. T033 добавляет их поддержку:
+
+- **Анти-памп (LONG)**: `pump_blocked(fast, cfg)` — сигнал гасится, если объём
+  последней закрытой свечи выше `pump_volume_mult` × среднего за предыдущие 20
+  И верхняя тень длиннее `pump_wick_ratio` × размаха бара. Причина
+  `pump_volume_spike`. Свечи теперь несут объём (индекс 5) и из WS
+  (`item["volume"]`), и из REST (`r[5]`).
+- **Перепроданность (SHORT)**: `short_blocked(uhlo_fast, cfg)` — красный сигнал
+  только пока UHLO highs 1м не выше `short_highs_max` (100 — выключено).
+  Причина `short_oversold`.
+- **Чистый крипто-пул**: `fetch_cg_top(max_rank)` (CoinGecko /coins/markets,
+  отдельный `_cg_get` для JSON-массива вместо Bybit-конверта) + отсечение
+  `not_in_cg_top` в build_universe.
+- **Ликвидность**: `min_turnover_usdt` — отсечение `below_min_turnover` по
+  turnover24h.
+- Валидация новых ключей (пороги, неотрицательность).
+
+Покрытие: `test_screener.py` — 73 проверки (+15: pump-фильтр с/без верхней
+тени, выключение 0, short_highs_max, валидация). Суммарно по reference-слою
+без сети: 995 ok, 0 fail.
+
 ## T032 — Paper-режим (dry-run) скринера для проверки перед Testnet
 
 Раньше скринер всегда слал сигналы POST-ом на `bot_api_url` (в live-контуре —

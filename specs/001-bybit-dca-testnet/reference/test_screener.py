@@ -155,6 +155,73 @@ ok("нет истории → insufficient_history",
 ok("1м вверх, 15м вниз → uhlo_no_color",
    sc.evaluate(up_fast, bars(60, drift=-0.15, rng=1.2, step_ms=15 * 60_000), C).reason == "uhlo_no_color")
 
+# ── 1b. Фильтры сигнала: анти-памп и перепроданность (T033) ──────────────────
+
+print("\nфильтры: анти-памп (pump_volume_mult / pump_wick_ratio)")
+def raises(fn) -> bool:
+    try:
+        fn()
+        return False
+    except Exception:
+        return True
+
+
+def with_vol(rows, vol=None):
+    """Свечи с объёмом в индексе 5; vol — скаляр или функция i→объём."""
+    out = []
+    for i, r in enumerate(rows):
+        v = vol(i) if callable(vol) else (vol if vol is not None else 100.0)
+        out.append(list(r) + [v])
+    return out
+
+
+def set_upper_wick(row, frac=0.9):
+    """Длинная верхняя тень: high поднимается, close остаётся у лоу."""
+    r = list(row)
+    o, h, l, c = r[1], r[2], r[3], r[4]
+    span = max(h - l, 1e-9)
+    r[2] = c + frac * span   # high = close + frac*размах → тень (high-close)/span = frac
+    return r
+
+
+fast_v = with_vol(up_fast)
+slow_v = with_vol(up_slow, vol=lambda i: 100.0)
+ok("с объёмом сигнал green остаётся",
+   sc.evaluate(fast_v, slow_v, cfg()).passed, sc.evaluate(fast_v, slow_v, cfg()))
+spiked = list(fast_v)
+spiked[-1] = list(spiked[-1])
+spiked[-1][5] = 1_000_000.0          # объём × 10000 от среднего
+spiked[-1] = set_upper_wick(spiked[-1])
+d = sc.evaluate(spiked, slow_v, cfg(pump_volume_mult=3.0, pump_wick_ratio=0.5))
+ok("объёмный спайк + длинная верхняя тень → pump_volume_spike",
+   d.reason == "pump_volume_spike", d)
+d0 = sc.evaluate(spiked, slow_v, cfg(pump_volume_mult=0.0))
+ok("pump_volume_mult=0 → защита выключена", d0.passed, d0)
+spiked_no_wick = list(fast_v)
+spiked_no_wick[-1] = list(spiked_no_wick[-1])
+spiked_no_wick[-1][5] = 1_000_000.0  # объёмный спайк БЕЗ длинной тени
+ok("спайк объёма без верхней тени → не pump",
+   sc.evaluate(spiked_no_wick, slow_v, cfg(pump_volume_mult=3.0,
+                                           pump_wick_ratio=0.6)).passed)
+
+print("\nфильтры: перепроданность (short_highs_max)")
+ok("short_highs_max=100 → выключено",
+   sc.short_blocked({"highs": 95.0}, cfg(short_highs_max=100.0)) is False)
+ok("highs выше порога → шорт заблокирован",
+   sc.short_blocked({"highs": 95.0}, cfg(short_highs_max=90.0)) is True)
+ok("highs ниже/на пороге → шорт разрешён",
+   sc.short_blocked({"highs": 85.0}, cfg(short_highs_max=90.0)) is False)
+ok("short_blocked без uhlo → False", sc.short_blocked(None, cfg(short_highs_max=90.0)) is False)
+
+print("\nконфиг: новые ключи фильтрации")
+ok("неотрицательный pump_volume_mult валиден", not raises(lambda: sc.validate_config(cfg(pump_volume_mult=3.0))))
+ok("отрицательный pump_volume_mult отвергается", raises(lambda: sc.validate_config(cfg(pump_volume_mult=-1))))
+ok("pump_wick_ratio > 1 отвергается", raises(lambda: sc.validate_config(cfg(pump_wick_ratio=1.5))))
+ok("short_highs_max < 80 отвергается", raises(lambda: sc.validate_config(cfg(short_highs_max=70.0))))
+ok("short_highs_max=100 (выкл) валиден", not raises(lambda: sc.validate_config(cfg(short_highs_max=100.0))))
+ok("отрицательный min_turnover_usdt отвергается", raises(lambda: sc.validate_config(cfg(min_turnover_usdt=-5))))
+ok("отрицательный cg_max_rank отвергается", raises(lambda: sc.validate_config(cfg(cg_max_rank=-1))))
+
 print("\ncompute_uhlo: скользящее окно эквивалентно полной истории")
 long_hist = bars(500, drift=0.1, rng=1.0)
 ok("UHLO(20) по 500 барам == по последним 60",
