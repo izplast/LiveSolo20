@@ -131,6 +131,9 @@ class Config:
     tf_slow: str = "15"
     cooldown_sec: int = 300
     required_leverage: float = 3.0
+    # Требовать ли наличия символа на Testnet. При False вселенная строится
+    # только по mainnet (для диагностики/проверки скринера вне тестнет-контура).
+    require_testnet: bool = True
     # 'candidates' — всё, кроме шума (нехватка истории, NATR ниже минимума,
     # неизменный цвет); 'all' — включая шум; 'none' — только сигналы.
     reject_log: str = "candidates"
@@ -231,6 +234,8 @@ def validate_config(cfg: Config) -> None:
 
     if not isinstance(cfg.dry_run, bool):
         problems.append("dry_run: bool")
+    if not isinstance(cfg.require_testnet, bool):
+        problems.append("require_testnet: bool")
     if not _is_minute_tf(cfg.tf_fast) or not _is_minute_tf(cfg.tf_slow):
         problems.append("tf_fast/tf_slow — целые минуты в виде строки ('1', '15'); "
                         "нецелые или нецифровые значения ('D', 'W') не поддерживаются")
@@ -805,17 +810,25 @@ class Screener:
     # ── подготовка ─────────────────────────────────────────────────────────
 
     async def build_universe(self) -> list[str]:
-        """Топ по обороту, торгуемые и на mainnet, и на Testnet."""
+        """Топ по обороту; торгуемость на Testnet проверяется только при require_testnet."""
         tasks = [
             asyncio.to_thread(fetch_instruments, MAINNET_REST),
-            asyncio.to_thread(fetch_instruments, TESTNET_REST),
             asyncio.to_thread(fetch_turnover, MAINNET_REST),
         ]
+        if self.cfg.require_testnet:
+            tasks.insert(1, asyncio.to_thread(fetch_instruments, TESTNET_REST))
         if self.cfg.cg_max_rank > 0:
             tasks.append(asyncio.to_thread(fetch_cg_top, self.cfg.cg_max_rank))
         results = await asyncio.gather(*tasks)
-        mainnet, testnet, turnover = results[:3]
-        cg_top = results[3] if len(results) > 3 else set()
+        mainnet = results[0]
+        if self.cfg.require_testnet:
+            testnet = results[1]
+            turnover = results[2]
+            cg_top = results[3] if len(results) > 3 else set()
+        else:
+            testnet = {}
+            turnover = results[1]
+            cg_top = results[2] if len(results) > 2 else set()
         self.instruments = mainnet
 
         ranked = sorted(turnover.items(), key=lambda kv: kv[1], reverse=True)
@@ -838,14 +851,15 @@ class Screener:
                 reason = "not_in_cg_top"
             elif info["status"] != "Trading":
                 reason = "not_trading"
-            elif symbol not in testnet:
-                # Самая коварная из отсечённых причин: символ есть на mainnet,
-                # сигнал по нему выглядит нормальным, а ордер на Testnet
-                # обречён — и это попало бы в статистику как ошибка исполнения.
-                reason = "not_on_testnet"
-            elif testnet[symbol]["status"] != "Trading":
-                reason = "not_trading_on_testnet"
-            elif info["max_leverage"] < self.cfg.required_leverage:
+            elif self.cfg.require_testnet:
+                if symbol not in testnet:
+                    # Самая коварная из отсечённых причин: символ есть на mainnet,
+                    # сигнал по нему выглядит нормальным, а ордер на Testnet
+                    # обречён — и это попало бы в статистику как ошибка исполнения.
+                    reason = "not_on_testnet"
+                elif testnet[symbol]["status"] != "Trading":
+                    reason = "not_trading_on_testnet"
+            if reason is None and info["max_leverage"] < self.cfg.required_leverage:
                 reason = "max_leverage_below_required"
             if reason:
                 self.journal.write("universe_reject", symbol=symbol, reason=reason,

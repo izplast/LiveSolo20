@@ -478,5 +478,43 @@ ok("не-булевый dry_run отвергается",
    raises(lambda: sc.validate_config(cfg(dry_run="yes"))))
 ok("bool dry_run валиден", not raises(lambda: sc.validate_config(cfg(dry_run=True))))
 
+# ── 6. Вселенная: require_testnet ─────────────────────────────────────────────
+
+print("\nвселенная: require_testnet (testnet-ограничение снимается)")
+
+_mainnet_inst = {"BTCUSDT": {"status": "Trading", "max_leverage": 10.0},
+                 "DOGEUSDT": {"status": "Trading", "max_leverage": 10.0},
+                 "MEMEUSDT": {"status": "Trading", "max_leverage": 10.0}}
+_testnet_inst = {"BTCUSDT": {"status": "Trading", "max_leverage": 10.0}}
+_turnover = {"BTCUSDT": 5_000_000.0, "DOGEUSDT": 4_000_000.0,
+             "MEMEUSDT": 3_000_000.0}
+
+_real_fetch_inst = sc.fetch_instruments
+_real_fetch_turn = sc.fetch_turnover
+sc.fetch_instruments = lambda base: (_mainnet_inst if "testnet" not in base else _testnet_inst)
+sc.fetch_turnover = lambda base: dict(_turnover)
+
+
+async def _universe(require_testnet):
+    s = sc.Screener(cfg(require_testnet=require_testnet, skip_top_volume=0,
+                        min_turnover_usdt=2_000_000.0, top_n_turnover=600))
+    return await s.build_universe()
+
+
+uni_req = asyncio.run(_universe(True))
+uni_any = asyncio.run(_universe(False))
+ok("require_testnet=True: символ без Testnet отсеян (not_on_testnet)",
+   uni_req == ["BTCUSDT"], uni_req)
+ok("require_testnet=False: символ без Testnet допущен",
+   uni_any == ["BTCUSDT", "DOGEUSDT", "MEMEUSDT"], uni_any)
+ok("require_testnet по умолчанию True", cfg().require_testnet is True)
+ok("не-булевый require_testnet отвергается",
+   raises(lambda: sc.validate_config(cfg(require_testnet="no"))))
+ok("bool require_testnet валиден",
+   not raises(lambda: sc.validate_config(cfg(require_testnet=False))))
+
+sc.fetch_instruments = _real_fetch_inst
+sc.fetch_turnover = _real_fetch_turn
+
 print(f"\nитог: {PASS} ok, {FAIL} fail")
 sys.exit(1 if FAIL else 0)
