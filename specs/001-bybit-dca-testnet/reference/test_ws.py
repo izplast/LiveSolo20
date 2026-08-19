@@ -87,10 +87,12 @@ def ok(name: str, cond: bool, extra: object = "") -> None:
         print(f"  FAIL   {name}   {extra}")
 
 
-def bars(n: int, step_ms: int = 60_000, drift: float = 0.15, rng: float = 1.2) -> list[list]:
+def bars(n: int, step_ms: int = 60_000, drift: float = 0.15, rng: float = 1.2,
+         amp: float = 0.5, freq: float = 5.0) -> list[list]:
+    import math
     out = []
     for i in range(n):
-        base = 100.0 * (1 + drift * i / 100)
+        base = 100.0 * (1 + drift * i / 100 + amp * math.sin(2 * math.pi * i / freq) / 100)
         out.append([i * step_ms, base, base * (1 + rng / 100), base, base * (1 + rng / 200)])
     return out
 
@@ -160,8 +162,10 @@ ok("confirm != true не добавляет свечу", len(st.fast) == before)
 # закрытая свеча fast → состояние растёт и решение запускается
 s, st = state_with_history()
 fake_requests.posted.clear()
-trigger = {"start": 60 * 60_000, "open": 109.0, "high": 111.0, "low": 108.0,
-           "close": 109.6, "confirm": True}
+# свеча-продолжение роста (не вертикальный пробой): вертикальный пробой даёт
+# UHLO 1м в «углу» (highs 100 / lows 0) и режется фильтром uhlo_corner
+trigger = {"start": 60 * 60_000, "open": 106.5, "high": 107.2, "low": 105.5,
+           "close": 107.0, "confirm": True}
 
 
 async def pump_once():

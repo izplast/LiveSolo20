@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import shutil
 import sys
@@ -166,7 +167,7 @@ with open(csv_path, "w", newline="", encoding="utf-8") as f:
     w = _csv.writer(f)
     w.writerow(["ts", "open", "high", "low", "close", "volume"])
     for i in range(2000):
-        base = 100.0 + 0.15 * i
+        base = 100.0 + 0.15 * i + 0.5 * math.sin(2 * math.pi * i / 5)
         w.writerow([ts0 + i * 60_000, round(base, 4), round(base + 1.2, 4),
                     round(base - 1.2, 4), round(base, 4), 1000.0])
 

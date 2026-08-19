@@ -157,7 +157,7 @@ with open(csv_path, "w", newline="", encoding="utf-8") as f:
     w = csv.writer(f)
     w.writerow(["ts", "open", "high", "low", "close", "volume"])
     for i in range(2000):
-        base = 100.0 + 0.15 * i
+        base = 100.0 + 0.15 * i + 0.5 * math.sin(2 * math.pi * i / 5)
         w.writerow([ts0 + i * 60_000, round(base, 4), round(base + 1.2, 4),
                     round(base - 1.2, 4), round(base, 4), 1000.0])
 bt.fetch_instrument = lambda symbol: {"symbol": "BTCUSDT", "qty_step": 0.001,

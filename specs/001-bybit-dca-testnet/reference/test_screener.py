@@ -105,11 +105,17 @@ def ok(name: str, cond: bool, extra: object = "") -> None:
 
 
 def bars(n: int, start: float = 100.0, drift: float = 0.0, rng: float = 1.0,
-         step_ms: int = 60_000) -> list[list]:
-    """Свечи [start, open, high, low, close]; drift — % на бар, rng — размах в %."""
+         step_ms: int = 60_000, amp: float = 0.5, freq: float = 5.0) -> list[list]:
+    """Свечи [start, open, high, low, close]; drift — % на бар, rng — размах в %.
+
+    Волнистая база (amp % с периодом freq баров) вместо идеально прямой:
+    на прямой UHLO 1м стоит в «углу» (0 и 100 одновременно) и сигнал
+    режется фильтром uhlo_corner. amp=0 → идеально прямая фикстура.
+    """
+    import math
     out = []
     for i in range(n):
-        base = start * (1 + drift * i / 100)
+        base = start * (1 + drift * i / 100 + amp * math.sin(2 * math.pi * i / freq) / 100)
         out.append([i * step_ms, base, base * (1 + rng / 100), base, base * (1 + rng / 200)])
     return out
 
@@ -155,6 +161,45 @@ ok("нет истории → insufficient_history",
 ok("1м вверх, 15м вниз → uhlo_no_color",
    sc.evaluate(up_fast, bars(60, drift=-0.15, rng=1.2, step_ms=15 * 60_000), C).reason == "uhlo_no_color")
 
+print("\nфильтр: 1м UHLO не должен одновременно показывать 0 и 100 (uhlo_corner)")
+def straight(n: int, drift: float = 0.15, step_ms: int = 60_000):
+    return bars(n, drift=drift, rng=1.2, step_ms=step_ms, amp=0.0)
+
+ok("прямая монотонная мачта вверх → UHLO 1м ровно (highs 100, lows 0)",
+   sc.compute_uhlo(straight(60), 20) == {"highs": 100.0, "lows": 0.0},
+   sc.compute_uhlo(straight(60), 20))
+ok("прямая мачта вниз → UHLO 1м ровно (highs 0, lows 100)",
+   sc.compute_uhlo(straight(60, drift=-0.15), 20) == {"highs": 0.0, "lows": 100.0},
+   sc.compute_uhlo(straight(60, drift=-0.15), 20))
+ok("мачта вверх → сигнал green режется (uhlo_corner)",
+   sc.evaluate(straight(60), straight(60, step_ms=15 * 60_000), C).reason == "uhlo_corner")
+ok("мачта вниз → сигнал red режется (uhlo_corner)",
+   sc.evaluate(straight(60, drift=-0.15), straight(60, drift=-0.15, step_ms=15 * 60_000), C).reason == "uhlo_corner")
+ok("uhlo_corner несёт цвет и значения 1м",
+   (lambda d: d.color == "green" and d.uhlo_fast.get("highs") == 100.0
+    and d.uhlo_fast.get("lows") == 0.0)(sc.evaluate(straight(60), straight(60, step_ms=15 * 60_000), C)))
+ok("с откатом каждые 10 баров угол снят → сигнал проходит",
+   sc.evaluate(up_fast, up_slow, C).passed, sc.evaluate(up_fast, up_slow, C))
+ok("fast_uhlo_corner без данных → False", sc.fast_uhlo_corner(None) is False)
+ok("fast_uhlo_corner: не-угол (60/40) → False", sc.fast_uhlo_corner({"highs": 60.0, "lows": 40.0}) is False)
+ok("fast_uhlo_corner: угол вверх (100/0) → True", sc.fast_uhlo_corner({"highs": 100.0, "lows": 0.0}) is True)
+ok("fast_uhlo_corner: угол вниз (0/100) → True", sc.fast_uhlo_corner({"highs": 0.0, "lows": 100.0}) is True)
+
+print("\nclassify_color: жёсткий триггер (1м и 15м одинаково: highs 80..100, lows 0..20)")
+ok("green: оба ТФ у хаёв (highs 85+, lows 10) → green",
+   sc.classify_color({"highs": 85.0, "lows": 10.0}, {"highs": 85.0, "lows": 10.0}) == "green")
+ok("green: 15м ниже 80 (highs 72) → none — смягчения больше нет",
+   sc.classify_color({"highs": 85.0, "lows": 10.0}, {"highs": 72.0, "lows": 28.0}) == "none")
+ok("green: 15м на границе 80/20 → green",
+   sc.classify_color({"highs": 85.0, "lows": 10.0}, {"highs": 80.0, "lows": 20.0}) == "green")
+ok("red: оба ТФ у лоу (lows 85+, highs 10) → red",
+   sc.classify_color({"lows": 85.0, "highs": 10.0}, {"lows": 85.0, "highs": 10.0}) == "red")
+ok("red: 15м выше 20 (lows 28) → none — смягчения больше нет",
+   sc.classify_color({"lows": 85.0, "highs": 10.0}, {"lows": 72.0, "highs": 28.0}) == "none")
+ok("red: противоречие ТФ (1м у хаёв, 15м у лоу) → none",
+   sc.classify_color({"highs": 85.0, "lows": 10.0}, {"lows": 85.0, "highs": 10.0}) == "none")
+ok("нет данных → none", sc.classify_color(None, {"highs": 85.0, "lows": 10.0}) == "none")
+
 # ── 1b. Фильтры сигнала: анти-памп и перепроданность (T033) ──────────────────
 
 print("\nфильтры: анти-памп (pump_volume_mult / pump_wick_ratio)")
@@ -191,6 +236,9 @@ ok("с объёмом сигнал green остаётся",
 spiked = list(fast_v)
 spiked[-1] = list(spiked[-1])
 spiked[-1][5] = 1_000_000.0          # объём × 10000 от среднего
+# лоу уходит под окно: иначе размашистый спайк-бар даёт UHLO 1м в «углу»
+# (highs 100 / lows 0) и режется uhlo_corner раньше, чем анти-памп фильтр
+spiked[-1][3] = spiked[-1][4] * 0.98
 spiked[-1] = set_upper_wick(spiked[-1])
 d = sc.evaluate(spiked, slow_v, cfg(pump_volume_mult=3.0, pump_wick_ratio=0.5))
 ok("объёмный спайк + длинная верхняя тень → pump_volume_spike",
@@ -200,18 +248,26 @@ ok("pump_volume_mult=0 → защита выключена", d0.passed, d0)
 spiked_no_wick = list(fast_v)
 spiked_no_wick[-1] = list(spiked_no_wick[-1])
 spiked_no_wick[-1][5] = 1_000_000.0  # объёмный спайк БЕЗ длинной тени
+spiked_no_wick[-1][3] = spiked_no_wick[-1][4] * 0.98  # и без углового UHLO (highs 100 / lows 0)
 ok("спайк объёма без верхней тени → не pump",
    sc.evaluate(spiked_no_wick, slow_v, cfg(pump_volume_mult=3.0,
                                            pump_wick_ratio=0.6)).passed)
 
-print("\nфильтры: перепроданность (short_highs_max)")
+print("\nфильтры: экстремумы (short_highs_max / long_lows_min)")
 ok("short_highs_max=100 → выключено",
    sc.short_blocked({"highs": 95.0}, cfg(short_highs_max=100.0)) is False)
-ok("highs выше порога → шорт заблокирован",
+ok("SHORT на пике (highs выше порога) → заблокирован",
    sc.short_blocked({"highs": 95.0}, cfg(short_highs_max=90.0)) is True)
-ok("highs ниже/на пороге → шорт разрешён",
+ok("SHORT не на пике (highs на/ниже порога) → разрешён",
    sc.short_blocked({"highs": 85.0}, cfg(short_highs_max=90.0)) is False)
 ok("short_blocked без uhlo → False", sc.short_blocked(None, cfg(short_highs_max=90.0)) is False)
+ok("long_lows_min=100 → выключено",
+   sc.long_blocked({"lows": 95.0}, cfg(long_lows_min=100.0)) is False)
+ok("LONG у дна (lows выше порога) → заблокирован",
+   sc.long_blocked({"lows": 95.0}, cfg(long_lows_min=90.0)) is True)
+ok("LONG не у дна (lows на/ниже порога) → разрешён",
+   sc.long_blocked({"lows": 85.0}, cfg(long_lows_min=90.0)) is False)
+ok("long_blocked без uhlo → False", sc.long_blocked(None, cfg(long_lows_min=90.0)) is False)
 
 print("\nконфиг: новые ключи фильтрации")
 ok("неотрицательный pump_volume_mult валиден", not raises(lambda: sc.validate_config(cfg(pump_volume_mult=3.0))))
@@ -219,11 +275,13 @@ ok("отрицательный pump_volume_mult отвергается", raises(
 ok("pump_wick_ratio > 1 отвергается", raises(lambda: sc.validate_config(cfg(pump_wick_ratio=1.5))))
 ok("short_highs_max < 80 отвергается", raises(lambda: sc.validate_config(cfg(short_highs_max=70.0))))
 ok("short_highs_max=100 (выкл) валиден", not raises(lambda: sc.validate_config(cfg(short_highs_max=100.0))))
+ok("long_lows_min < 80 отвергается", raises(lambda: sc.validate_config(cfg(long_lows_min=70.0))))
+ok("long_lows_min=100 (выкл) валиден", not raises(lambda: sc.validate_config(cfg(long_lows_min=100.0))))
 ok("отрицательный min_turnover_usdt отвергается", raises(lambda: sc.validate_config(cfg(min_turnover_usdt=-5))))
 ok("отрицательный cg_max_rank отвергается", raises(lambda: sc.validate_config(cfg(cg_max_rank=-1))))
 
 print("\ncompute_uhlo: скользящее окно эквивалентно полной истории")
-long_hist = bars(500, drift=0.1, rng=1.0)
+long_hist = bars(500, drift=0.1, rng=1.0, amp=0.0)  # монотонно: окно UHLO самодостаточно
 ok("UHLO(20) по 500 барам == по последним 60",
    sc.compute_uhlo(long_hist, 20) == sc.compute_uhlo(long_hist[-60:], 20),
    (sc.compute_uhlo(long_hist, 20), sc.compute_uhlo(long_hist[-60:], 20)))
@@ -365,7 +423,7 @@ s5, st5 = fresh_screener(reject_log="candidates")
 s5._log_reject("XUSDT", "natr_above_max", 1, {"natr": 9.9})
 s5._log_reject("XUSDT", "insufficient_history", 1, {})
 s5._log_reject("XUSDT", "repeat_color", 1, {})
-s5._log_reject("XUSDT", "uhlo_no_color", 1, {})
+s5._log_reject("XUSDT", "uhlo_no_color", 1, {"natr": 1.4, "uhlo_fast": {"highs": 5.0, "lows": 65.0}})
 s5.journal.close()
 lines = [json.loads(x) for x in open(os.path.join(_tmp, "events.jsonl"), encoding="utf-8")]
 reasons = [x["reason"] for x in lines if x["kind"] == "reject"]
@@ -375,6 +433,11 @@ ok("шум insufficient_history не журналируется", "insufficient_
 ok("шум repeat_color не журналируется", "repeat_color" not in reasons)
 ok("каждая строка — валидный JSON с kind и ts",
    all("kind" in x and "ts" in x for x in lines))
+u_rej = next(x for x in reversed(lines)
+             if x.get("kind") == "reject" and x["reason"] == "uhlo_no_color")
+ok("в деталях режекта есть natr и uhlo-значения",
+   u_rej["details"].get("natr") == 1.4
+   and u_rej["details"].get("uhlo_fast") == {"highs": 5.0, "lows": 65.0})
 
 # ── 5. Paper-режим (dry-run) ─────────────────────────────────────────────────
 

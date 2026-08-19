@@ -68,12 +68,18 @@ def raises(fn) -> bool:
 INST = {"symbol": "BTCUSDT", "qty_step": 0.001, "min_qty": 0.001, "tick_size": 0.01}
 
 
-def bars(n: int, start: float = 100.0, drift: float = 0.0, rng: float = 1.0,
-         ts0: int = 0, step_ms: int = 60_000) -> list[list]:
-    """Свечи [ts, open, high, low, close, volume]; drift — % на бар, rng — размах в %."""
+def bars(n: int, start: float = 100.0, drift: float = 0.15, rng: float = 1.0,
+         ts0: int = 0, step_ms: int = 60_000, amp: float = 0.5, freq: float = 5.0) -> list[list]:
+    """Свечи [ts, open, high, low, close, volume]; drift — % на бар, rng — размах в %.
+
+    Волнистая база (amp % с периодом freq баров) вместо идеально прямой:
+    на прямой UHLO 1м стоит в «углу» (0 и 100 одновременно) и сигнал
+    режется фильтром uhlo_corner.
+    """
+    import math
     out = []
     for i in range(n):
-        base = start * (1 + drift * i / 100)
+        base = start * (1 + drift * i / 100 + amp * math.sin(2 * math.pi * i / freq) / 100)
         out.append([ts0 + i * step_ms, base, base * (1 + rng / 100),
                     base, base * (1 + rng / 200), 1.0])
     return out

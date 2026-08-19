@@ -78,6 +78,15 @@ bot:
   heartbeat_sec: 60
   journal_path: "logs/bot-events.jsonl"
 
+bybit:
+  # Ключи API Testnet (https://testnet.bybit.com → API → Create New Key,
+  # разрешения: Spot/Contract trade — Read-Write). Можно задать переменными
+  # окружения BYBIT_API_KEY / BYBIT_API_SECRET — они имеют приоритет.
+  testnet: true               # true — api-testnet.bybit.com (demo-контур)
+  api_key: ""                 # placeholder; заполнить перед --live
+  api_secret: ""              # placeholder; заполнить перед --live
+  recv_window_ms: 5000
+
 telegram:
   enabled: false              # уведомления в Telegram о событиях бота (T031)
   bot_token: ""               # токен бота @BotFather, например "123456:ABC-..."
@@ -114,9 +123,16 @@ screener:
                               # выше этого множителя × среднего за 20 свечей И
                               # длинная верхняя тень (0 — защита выключена)
   pump_wick_ratio: 0.5        # порог верхней тени: доля размаха бара
-  short_highs_max: 90.0       # шорт только пока рынок не перепродан: UHLO highs
-                              # 1м не выше порога (красный требует 80..100;
-                              # 90 — свежий дамп шортится; 100 — выключено)
+  short_highs_max: 90.0       # SHORT не входим, пока 1м «зажат на пике» без
+                              # импульса вниз: UHLO highs 1м выше порога (цена
+                              # прижата к максимумам окна). Красный требует
+                              # highs 1м <= 20, поэтому срабатывает только на
+                              # границах расширенных полос (100 — выключено)
+  long_lows_min: 90.0         # LONG не входим, пока 1м «зажат у дна» (ловля
+                              # падающего ножа): UHLO lows 1м выше порога (цена
+                              # прижата к минимумам окна). Зелёный требует
+                              # lows 1м <= 20, поэтому срабатывает только на
+                              # границах расширенных полос (100 — выключено)
   journal_path: "logs/screener-events.jsonl"
   # Paper-режим: сигналы НЕ уходят на bot_api_url, а пишутся в журнал
   # (signal_dry_run) и, при настроенном telegram ниже, уходят в Telegram.

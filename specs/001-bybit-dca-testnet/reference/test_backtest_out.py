@@ -54,11 +54,12 @@ charts = _load("report_charts")
 INST = {"symbol": "BTCUSDT", "qty_step": 0.001, "min_qty": 0.001, "tick_size": 0.01}
 
 
-def bars(n: int, start: float = 100.0, drift: float = 0.0, rng: float = 1.0,
-         ts0: int = 0, step_ms: int = 60_000) -> list[list]:
+def bars(n: int, start: float = 100.0, drift: float = 0.15, rng: float = 1.0,
+         ts0: int = 0, step_ms: int = 60_000, amp: float = 0.5, freq: float = 5.0) -> list[list]:
+    import math
     out = []
     for i in range(n):
-        base = start * (1 + drift * i / 100)
+        base = start * (1 + drift * i / 100 + amp * math.sin(2 * math.pi * i / freq) / 100)
         out.append([ts0 + i * step_ms, base, base * (1 + rng / 100),
                     base, base * (1 + rng / 200), 1.0])
     return out

@@ -3,9 +3,24 @@ core/screener.py — скринер для DCA-бота на Bybit USDT Perpetua
 
 Замена присланной версии. Что сохранено из неё без изменений:
   * compute_natr  — NATR-14 по Уайлдеру, дословно;
-  * compute_uhlo  — Unreached Highs/Lows Oscillator (LuxAlgo), дословно;
-  * classify_color — бычий/медвежий по совпадению UHLO на 1м и 15м, дословно;
   * отдельный процесс, отправляющий сигнал на локальный FastAPI бота (POST /signal).
+
+Режим сигналов — трендовый/скальперский, вход по импульсу на пробой:
+  * compute_uhlo возвращает БЛИЗОСТЬ цены к экстремумам окна: highs — близость
+    к ХАЮ (100 = цена на самом пике), lows — близость к ЛОЮ (100 = цена на
+    самом дне). Имена полей говорят сами за себя.
+  * classify_color переработан: green (LONG) — цена поджалась к хаям и
+    пробивает их (highs 80..100, lows 0..20) НА ОБОИХ ТФ (1м и 15м);
+    red (SHORT) — цена поджалась к лоям и пробивает их (lows 80..100,
+    highs 0..20) на обоих ТФ. Условия жёсткие и одинаковые для обоих
+    таймфреймов, без смягчения на 15м.
+  * фильтры экстремумов перевёрнуты под тренд: LONG не входим, пока 1м
+    «зажат у дна» (ловля падающего ножа), SHORT не входим, пока 1м «зажат
+    на пике» без импульса вниз (пороги long_lows_min / short_highs_max).
+  * требование пользователя «на ТФ 1м индикаторы не должны одновременно
+    показывать 0 и 100»: сигнал режется, когда UHLO 1м в «углу» — вертикальный
+    рывок без единого отката в окне (highs=100 и lows=0, либо наоборот),
+    причина uhlo_corner.
 Индикаторы работают на строках вида [ts, open, high, low, close, ...] — индексы
 k[2]/k[3]/k[4] одинаковы у Binance и у Bybit v5, поэтому код не переписывался.
 
@@ -124,10 +139,16 @@ class Config:
     # pump_wick_ratio × размаха бара. 0 — защита выключена.
     pump_volume_mult: float = 0.0
     pump_wick_ratio: float = 0.5
-    # Шорт только пока рынок не перепродан: UHLO highs 1м не выше порога.
-    # Красный цвет требует highs 80..100; 90 — свежий дамп шортится;
-    # 100 — выключено.
+    # SHORT не входим, пока 1м «зажат на самом пике» без импульса вниз:
+    # UHLO highs 1м выше порога (цена прижата к максимумам окна). Красный
+    # цвет в трендовом режиме требует highs 1м <= 20, поэтому срабатывает
+    # только на границах расширенных полос. 100 — выключено.
     short_highs_max: float = 100.0
+    # LONG не входим, пока 1м «зажат у самого дна» (ловля падающего ножа):
+    # UHLO lows 1м выше порога (цена прижата к минимумам окна).
+    # Зелёный цвет в трендовом режиме требует lows 1м <= 20, поэтому
+    # срабатывает только на границах расширенных полос. 100 — выключено.
+    long_lows_min: float = 100.0
     # «Чистый крипто-пул»: только символы, чья базовая монета есть в топе
     # CoinGecko по капитализации (0 — фильтр выключен).
     cg_max_rank: int = 0
@@ -227,6 +248,8 @@ def validate_config(cfg: Config) -> None:
         problems.append("pump_wick_ratio в пределах 0..1")
     if not 80 <= cfg.short_highs_max <= 100:
         problems.append("short_highs_max в пределах 80..100 (100 — выключено)")
+    if not 80 <= cfg.long_lows_min <= 100:
+        problems.append("long_lows_min в пределах 80..100 (100 — выключено)")
     if cfg.cg_max_rank < 0:
         problems.append("cg_max_rank >= 0")
     if cfg.min_turnover_usdt < 0:
@@ -270,14 +293,23 @@ def compute_natr(klines, period=14):
 
 
 def compute_uhlo(klines, length=20):
-    """Unreached Highs/Lows Oscillator [LuxAlgo] -- прямой порт Pine-логики.
+    """UHLO — «близость цены к экстремумам окна» (поля говорят сами за себя):
 
-    На каждом баре:
-      1) убираем из массива highs те h, что текущий high пробил (high > h)
-      2) убираем из lows те l, что текущий low пробил (low < l)
-      3) обрезаем до длины length
-      4) значения = 100 * size / length
-      5) добавляем текущий high/low в начало массивов
+      * highs  — близость к ХАЮ окна: 100 = цена на самом пике
+        (все максимумы окна под/на текущем уровне), 0 = цена у дна;
+      * lows   — близость к ЛОЮ окна: 100 = цена на самом дне
+        (все минимумы окна над/на текущем уровне), 0 = цена у хая.
+
+    Алгоритмически это обратная сторона Unreached Highs/Lows [LuxAlgo]: там
+    хранятся экстремумы, ДО которых цена не дошла, и результат — их доля.
+    Близость = 100 − доля недостигнутых экстремумов (сколько максимумов цена
+    уже перекрыла / минимумов уже пробила). Цикл идентичен Pine-порту:
+
+      1) убираем из массива unreached_highs те h, что текущий high пробил
+         (high > h) — значит цена достигла этого максимума;
+      2) убираем из unreached_lows те l, что текущий low пробил (low < l) —
+      3) обрезаем до длины length и добавляем текущий high/low в начало;
+      4) близость = 100 − 100 * размер массива недостигнутых / length.
 
     Каждый бар вставляет ровно один элемент и обрезает массив до length,
     поэтому результат зависит только от последних length+1 баров. Отсюда и
@@ -286,48 +318,92 @@ def compute_uhlo(klines, length=20):
     if len(klines) < 2:
         return None
 
-    highs, lows = [], []
+    unreached_highs, unreached_lows = [], []
     u_highs = u_lows = 0.0
 
     for k in klines:
         h = float(k[2])
         l = float(k[3])
 
-        highs = [x for x in highs if h <= x]
-        lows = [x for x in lows if l >= x]
+        unreached_highs = [x for x in unreached_highs if h <= x]
+        unreached_lows = [x for x in unreached_lows if l >= x]
 
-        if len(highs) > length:
-            highs.pop()
-        if len(lows) > length:
-            lows.pop()
+        if len(unreached_highs) > length:
+            unreached_highs.pop()
+        if len(unreached_lows) > length:
+            unreached_lows.pop()
 
-        u_highs = 100 * len(highs) / length
-        u_lows = 100 * len(lows) / length
+        u_highs = 100 * len(unreached_highs) / length
+        u_lows = 100 * len(unreached_lows) / length
 
-        highs.insert(0, h)
-        lows.insert(0, l)
+        unreached_highs.insert(0, h)
+        unreached_lows.insert(0, l)
 
-    return {"highs": u_highs, "lows": u_lows}
+    return {"highs": 100 - u_highs, "lows": 100 - u_lows}
+
+
+# Пороги трендового/скальперского триггера (см. classify_color). Условия
+# ЖЁСТКИЕ и одинаковые для обоих таймфреймов: 15м — не подтверждение с
+# мягкими порогами, а равноправная часть триггера.
+FAST_MIN = 80.0   # поле близости к экстремуму входа (для LONG — highs, для SHORT — lows)
+FAST_MAX = 20.0   # противоположное поле (для LONG — lows, для SHORT — highs)
+SLOW_MIN = 80.0   # 15м: те же пороги, что и на 1м
+SLOW_MAX = 20.0   # 15м: те же пороги, что и на 1м
 
 
 def classify_color(a, b):
-    """green = бычий сигнал (Unreached Lows высокие, Highs низкие на обоих ТФ)
-    red = медвежий (наоборот)."""
+    """Трендовый/скальперский триггер: вход по импульсу на пробой.
+
+    Поля UHLO — БЛИЗОСТЬ цены к экстремумам окна (см. compute_uhlo):
+      * highs ВЫСОКИЙ (>= 80) — цена поджалась к ХАЮ окна (на самом пике);
+      * highs НИЗКИЙ  (<= 20) — цена далеко от хая окна (внизу/у дна);
+      * lows  ВЫСОКИЙ (>= 80) — цена поджалась к ЛОЮ окна (на самом дне);
+      * lows  НИЗКИЙ  (<= 20) — цена далеко от лоя окна (вверху/у хая).
+
+    green (LONG) — ЦЕНА ПОДЖАЛАСЬ К ХАЯМ и пробивает их: highs >= 80,
+    lows <= 20 — на обоих ТФ (1м и 15м);
+    red (SHORT) — ЦЕНА ПОДЖАЛАСЬ К ЛОЯМ и пробивает их: lows >= 80,
+    highs <= 20 — на обоих ТФ.
+
+    Условия жёсткие и одинаковые для обоих таймфреймов: 15м — равноправная
+    часть триггера, без смягчения.
+    """
     if not a or not b:
         return "none"
     green = (
-        80 <= a["lows"] <= 100 and 80 <= b["lows"] <= 100
-        and 0 <= a["highs"] <= 20 and 0 <= b["highs"] <= 20
+        a["highs"] >= FAST_MIN and a["lows"] <= FAST_MAX
+        and b["highs"] >= SLOW_MIN and b["lows"] <= SLOW_MAX
     )
     red = (
-        80 <= a["highs"] <= 100 and 80 <= b["highs"] <= 100
-        and 0 <= a["lows"] <= 20 and 0 <= b["lows"] <= 20
+        a["lows"] >= FAST_MIN and a["highs"] <= FAST_MAX
+        and b["lows"] >= SLOW_MIN and b["highs"] <= SLOW_MAX
     )
     if green:
         return "green"
     if red:
         return "red"
     return "none"
+
+
+def fast_uhlo_corner(uhlo_fast: dict | None) -> bool:
+    """«Угол» UHLO на 1м: highs и lows одновременно на 0 и 100.
+
+    Состояние (highs=100, lows=0) — вертикальный рывок вверх: цена на пике,
+    все 20 баров окна обновляли хаи, ни один не сделал нового лоу. Зеркальное
+    состояние (highs=0, lows=100) — вертикальный обвал. Это не «пробой»
+    (противоположное поле при этом ненулевое), а вертикальная мачта без
+    единого отката: вход в неё — покупка/продажа вершины движения. Такие
+    сигналы режем безусловно.
+
+    UHLO считается по целым барам (0/20 и 20/20), поэтому углы дают ровно
+    0.0/100.0; допуск BOUNDARY_EPS — страховка от арифметики double.
+    """
+    if not uhlo_fast:
+        return False
+    highs = uhlo_fast.get("highs", 0.0)
+    lows = uhlo_fast.get("lows", 0.0)
+    return (highs <= BOUNDARY_EPS and lows >= 100 - BOUNDARY_EPS) or (
+        lows <= BOUNDARY_EPS and highs >= 100 - BOUNDARY_EPS)
 
 
 # ---------------------------------------------------------------------------
@@ -377,11 +453,28 @@ def evaluate(fast: Sequence, slow: Sequence, cfg: Config) -> Decision:
         return Decision(False, "uhlo_no_color", natr=natr,
                         uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow)
 
+    # ТФ 1м: индикаторы не должны одновременно показывать 0 и 100 —
+    # вертикальный рывок без единого отката в окне (см. fast_uhlo_corner).
+    if fast_uhlo_corner(uhlo_fast):
+        return Decision(False, "uhlo_corner", color=color, natr=natr,
+                        uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow,
+                        details={"highs_1m": uhlo_fast.get("highs"),
+                                 "lows_1m": uhlo_fast.get("lows")})
+
     if color == "green" and pump_blocked(fast, cfg):
         return Decision(False, "pump_volume_spike", color=color, natr=natr,
                         uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow,
                         details={"volume_mult": cfg.pump_volume_mult,
                                  "wick_ratio": cfg.pump_wick_ratio})
+    # LONG не входим, пока 1м зажат у дна (ловля падающего ножа). Имена
+    # причины/порога — из формулировки задачи; по сути это защита от входа
+    # против тренда на экстремуме.
+    if color == "green" and long_blocked(uhlo_fast, cfg):
+        return Decision(False, "long_overbought", color=color, natr=natr,
+                        uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow,
+                        details={"lows_1m": uhlo_fast.get("lows"),
+                                 "long_lows_min": cfg.long_lows_min})
+    # SHORT не входим, пока 1м зажат на пике без импульса вниз.
     if color == "red" and short_blocked(uhlo_fast, cfg):
         return Decision(False, "short_oversold", color=color, natr=natr,
                         uhlo_fast=uhlo_fast, uhlo_slow=uhlo_slow,
@@ -436,8 +529,31 @@ def pump_blocked(fast: Sequence, cfg: Config) -> bool:
     return wick > cfg.pump_wick_ratio
 
 
+def long_blocked(uhlo_fast: dict | None, cfg: Config) -> bool:
+    """Анти-нож (LONG): не входим, пока 1м зажат у самого дна.
+
+    Трендовый LONG — это импульс вверх от верха окна. Если быстрый ТФ всё
+    ещё «у самого дна» (UHLO lows 1м выше long_lows_min — цена прижата к
+    минимумам окна), лонг — ловля падающего ножа. С узкими полосами
+    зелёного (lows 1м <= 20) срабатывает только на границах расширенных
+    полос; 100 — выключено.
+    """
+    if cfg.long_lows_min >= 100:
+        return False
+    if not uhlo_fast:
+        return False
+    return uhlo_fast.get("lows", 0) > cfg.long_lows_min
+
+
 def short_blocked(uhlo_fast: dict | None, cfg: Config) -> bool:
-    """Шорт только пока рынок не перепродан: UHLO highs 1м не выше порога."""
+    """Анти-пик (SHORT): не входим, пока 1м зажат на самом пике.
+
+    Трендовый SHORT — это импульс вниз от дна окна. Если быстрый ТФ «на
+    пике» (UHLO highs 1м выше short_highs_max — цена прижата к максимумам
+    окна), шорт — вход в вершину без подтверждённого пробоя вниз. С узкими
+    полосами красного (highs 1м <= 20) срабатывает только на границах
+    расширенных полос; 100 — выключено.
+    """
     if cfg.short_highs_max >= 100:
         return False
     if not uhlo_fast:
@@ -945,7 +1061,14 @@ class Screener:
         d = evaluate(fast, slow, self.cfg)
 
         if not d.passed:
-            self._log_reject(symbol, d.reason, ts, d.details)
+            diag = dict(d.details)
+            if d.natr is not None:
+                diag["natr"] = round(d.natr, 3)
+            if d.uhlo_fast is not None:
+                diag["uhlo_fast"] = {k: round(v, 1) for k, v in d.uhlo_fast.items()}
+            if d.uhlo_slow is not None:
+                diag["uhlo_slow"] = {k: round(v, 1) for k, v in d.uhlo_slow.items()}
+            self._log_reject(symbol, d.reason, ts, diag)
             if d.reason in ("uhlo_no_color", "uhlo_slow_missing"):
                 # Сброс цвета — то, чего не хватало в исходной версии: без него
                 # монета, побывавшая в none, больше никогда не выдаёт сигнал.
