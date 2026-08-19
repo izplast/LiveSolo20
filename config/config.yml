@@ -114,7 +114,7 @@ screener:
   natr_period: 14
   natr_min: 0.95              # 0.95-5.0%: порог входной волатильности (снижен с 1.5)
   natr_max: 5.0               # +3.19 PnL, WR 89.3%, max drawdown −2.8 (30д, базовые параметры)
-  uhlo_length: 20
+  uhlo_length: 15
   tf_fast: "1"
   tf_slow: "15"
   cooldown_sec: 300           # пауза между сигналами по одному символу

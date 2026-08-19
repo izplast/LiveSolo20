@@ -6,7 +6,8 @@ requests/websockets — они подменяются заглушками до 
     python3 specs/001-bybit-dca-testnet/reference/test_screener.py
 
 Заглушка requests позволяет проверить главное в поведении отправки: что
-состояние цвета НЕ продвигается при неудачном POST и что монета, побывавшая
+канал доставки боту — журнал (signal_sent пишется всегда, HTTP-POST — лишь
+уведомление поверх журнала и не влияет на состояние) и что монета, побывавшая
 в состоянии none, снова способна выдать сигнал. Обе регрессии — на реальные
 дефекты предыдущей версии скринера.
 """
@@ -237,8 +238,9 @@ spiked = list(fast_v)
 spiked[-1] = list(spiked[-1])
 spiked[-1][5] = 1_000_000.0          # объём × 10000 от среднего
 # лоу уходит под окно: иначе размашистый спайк-бар даёт UHLO 1м в «углу»
-# (highs 100 / lows 0) и режется uhlo_corner раньше, чем анти-памп фильтр
-spiked[-1][3] = spiked[-1][4] * 0.98
+# (highs 100 / lows 0) и режется uhlo_corner раньше, чем анти-памп фильтр.
+# 0.99 — при uhlo_length=15: lows 1м 6.7 (не угол, но и не выше порога 20).
+spiked[-1][3] = spiked[-1][4] * 0.99
 spiked[-1] = set_upper_wick(spiked[-1])
 d = sc.evaluate(spiked, slow_v, cfg(pump_volume_mult=3.0, pump_wick_ratio=0.5))
 ok("объёмный спайк + длинная верхняя тень → pump_volume_spike",
@@ -248,7 +250,7 @@ ok("pump_volume_mult=0 → защита выключена", d0.passed, d0)
 spiked_no_wick = list(fast_v)
 spiked_no_wick[-1] = list(spiked_no_wick[-1])
 spiked_no_wick[-1][5] = 1_000_000.0  # объёмный спайк БЕЗ длинной тени
-spiked_no_wick[-1][3] = spiked_no_wick[-1][4] * 0.98  # и без углового UHLO (highs 100 / lows 0)
+spiked_no_wick[-1][3] = spiked_no_wick[-1][4] * 0.99  # и без углового UHLO (highs 100 / lows 0)
 ok("спайк объёма без верхней тени → не pump",
    sc.evaluate(spiked_no_wick, slow_v, cfg(pump_volume_mult=3.0,
                                            pump_wick_ratio=0.6)).passed)
@@ -282,9 +284,9 @@ ok("отрицательный cg_max_rank отвергается", raises(lambd
 
 print("\ncompute_uhlo: скользящее окно эквивалентно полной истории")
 long_hist = bars(500, drift=0.1, rng=1.0, amp=0.0)  # монотонно: окно UHLO самодостаточно
-ok("UHLO(20) по 500 барам == по последним 60",
-   sc.compute_uhlo(long_hist, 20) == sc.compute_uhlo(long_hist[-60:], 20),
-   (sc.compute_uhlo(long_hist, 20), sc.compute_uhlo(long_hist[-60:], 20)))
+ok("UHLO(15) по 500 барам == по последним 60",
+   sc.compute_uhlo(long_hist, 15) == sc.compute_uhlo(long_hist[-60:], 15),
+   (sc.compute_uhlo(long_hist, 15), sc.compute_uhlo(long_hist[-60:], 15)))
 
 print("\nSymbolState: дедупликация свечей")
 st = sc.SymbolState(60, 60)
@@ -339,6 +341,15 @@ def fire(s, st, color_bars=None):
     return asyncio.run(s._on_fast_close("TESTUSDT", st, trigger))
 
 
+def _journal_lines():
+    """Строки журнала скринера (общий файл _tmp/events.jsonl)."""
+    try:
+        with open(os.path.join(_tmp, "events.jsonl"), encoding="utf-8") as f:
+            return [json.loads(x) for x in f if x.strip()]
+    except FileNotFoundError:
+        return []
+
+
 fake_requests.posted.clear()
 fake_requests.post_status = 200
 fake_requests.post_raises = False
@@ -380,28 +391,30 @@ fire(s, st)
 ok("green → none → green: сигнал ЕСТЬ (был баг: монета стреляла один раз)",
    len(fake_requests.posted) == 1, fake_requests.posted)
 
-# регрессия: неудачная доставка не должна продвигать состояние
-print("\nрегрессия: неудачная доставка")
+# регрессия: журнал — канал доставки, HTTP-POST — уведомление поверх журнала
+print("\nрегрессия: отказ HTTP-уведомления не теряет сигнал")
 s2, st2 = fresh_screener()
 fake_requests.posted.clear()
 fake_requests.post_raises = True
 fire(s2, st2)
-ok("при отказе доставки попытки повторяются", len(fake_requests.posted) == s2.cfg.post_retries + 1,
-   len(fake_requests.posted))
-ok("цвет НЕ зафиксирован при неудаче", st2.last_color == "none")
-ok("метка последнего сигнала не сдвинута", st2.last_signal_ms == 0)
+ok("при отказе POST сигнал всё равно в журнале (signal_sent)",
+   any(x["kind"] == "signal_sent" for x in _journal_lines()), _journal_lines())
+ok("цвет зафиксирован (журнал — доставка)", st2.last_color == "green", st2.last_color)
+ok("метка последнего сигнала сдвинута", st2.last_signal_ms != 0, st2.last_signal_ms)
+ok("записей signal_failed нет", not any(x["kind"] == "signal_failed" for x in _journal_lines()),
+   _journal_lines())
 
 fake_requests.post_raises = False
 fake_requests.posted.clear()
 fire(s2, st2)
-ok("на следующей свече сигнал уходит повторно", len(fake_requests.posted) == 1)
-ok("после успеха цвет зафиксирован", st2.last_color == "green")
+ok("повтор того же цвета не отправляется (цвет уже зафиксирован)",
+   len(fake_requests.posted) == 0, fake_requests.posted)
 
 fake_requests.posted.clear()
 fake_requests.post_status = 422
 s3, st3 = fresh_screener()
 fire(s3, st3)
-ok("не-2xx считается неудачей", st3.last_color == "none")
+ok("не-2xx тоже не теряет сигнал: цвет зафиксирован", st3.last_color == "green", st3.last_color)
 fake_requests.post_status = 200
 
 # пауза между сигналами

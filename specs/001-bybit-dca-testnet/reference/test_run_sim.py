@@ -123,14 +123,14 @@ _tmp = tempfile.mkdtemp(prefix="run-sim-test-")
 _cfg_path = os.path.join(_tmp, "config.yml")
 with open(_cfg_path, "w", encoding="utf-8") as f:
     f.write("dca:\n  entry_usdt: 20\n"
-            "screener:\n  natr_min: 1.5\n  natr_max: 5.0\n  uhlo_length: 20\n"
+            "screener:\n  natr_min: 1.5\n  natr_max: 5.0\n  uhlo_length: 15\n"
             "  tf_fast: \"1\"\n  tf_slow: \"15\"\n")
 _c = rs.load_screener_cfg(_cfg_path)
 ok("natr-границы из конфига", _c.natr_min == 1.5 and _c.natr_max == 5.0,
    (_c.natr_min, _c.natr_max))
 ok("tf из конфига остаются строками", _c.tf_fast == "1" and _c.tf_slow == "15",
    (_c.tf_fast, _c.tf_slow))
-ok("uhlo_length из конфига", _c.uhlo_length == 20, _c.uhlo_length)
+ok("uhlo_length из конфига", _c.uhlo_length == 15, _c.uhlo_length)
 ok("незнакомые ключи конфига не ломают разбор",
    sc.validate_config(_c) is None and isinstance(_c.top_n_turnover, int))
 ok("отсутствующий файл → значения по умолчанию",

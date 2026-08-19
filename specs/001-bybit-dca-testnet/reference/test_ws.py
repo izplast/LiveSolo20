@@ -134,7 +134,7 @@ print("\nприём сообщений (_on_message)")
 def state_with_history():
     s = fresh()
     st = sc.SymbolState(s._fast_cap, s._slow_cap)
-    for row in bars(41):
+    for row in bars(30):
         st.push("fast", row)
     for row in bars(60, step_ms=15 * 60_000):
         st.push("slow", row)

@@ -677,7 +677,9 @@ class DcaBot:
 
         pt = self._testnet_price(symbol)
         self.journal.write("signal_received", signal_id=sig_id, symbol=symbol,
-                           price_mainnet=sig.get("price"), price_testnet=pt,
+                           price_mainnet=sig.get("price"),
+                           price_venue=sig.get("price_venue") or "bybit_mainnet",
+                           price_testnet=pt,
                            ts_signal=int(sig.get("ts") or recv_ts))
         logger.info("сигнал %s %s %s (testnet=%.6g)",
                     symbol, side, sig_id, pt or 0.0)
@@ -934,8 +936,9 @@ class DcaBot:
             self.journal.write("order_filled", signal_id=c["signal_id"],
                                cycle_id=c["cycle_id"], symbol=c["symbol"],
                                role="entry", mode="entry",
-                               expected_price=c["signal_price"],
+                               expected_price=c["price_testnet"],
                                avg_fill_price=round(price, 8),
+                               price_venue="bybit_testnet",
                                ts_signal=c["signal_ts"], ts_confirmed=now)
             self.journal.cycle_opened(c["cycle_id"], c["symbol"],
                                       open_ts=c["open_ts"])
@@ -954,6 +957,7 @@ class DcaBot:
                                role="dca", mode="entry",
                                expected_price=_f(order.get("price")),
                                avg_fill_price=round(price, 8),
+                               price_venue="bybit_testnet",
                                ts_signal=c["signal_ts"], ts_confirmed=now)
             logger.info("докупка #%d %s @%.6g, avg=%.6g", c["docups"],
                         c["symbol"], price, c["avg_entry"])
@@ -979,6 +983,7 @@ class DcaBot:
                            role="close", mode="close",
                            expected_price=c["tp_price"],
                            avg_fill_price=round(price, 8),
+                           price_venue="bybit_testnet",
                            ts_signal=c["signal_ts"], ts_confirmed=now)
         self.journal.cycle_closed(c["cycle_id"], c["symbol"],
                                   exit_reason=reason, pnl=round(c["pnl"], 4),

@@ -102,7 +102,7 @@ screener:
   natr_period: 14
   natr_min: 0.9
   natr_max: 2.5
-  uhlo_length: 20
+  uhlo_length: 15
   cooldown_sec: 300
   required_leverage: 3
   reject_log: candidates
@@ -330,7 +330,7 @@ unrealised ≈ −5 USDT), но такие позиции нужно исклю�
   `reason: pump_bar`, сигнал подавляется (журналируется, как и `natr_above_max`);
 - SHORT защита не касается: на красном памп-баре с длинной тенью цена уже
   откатила вниз, и шорт в неё входить можно;
-- окно скринера хранит `uhlo_length*2+4` свечей (при `uhlo_length=20` — 44),
+- окно скринера хранит `uhlo_length*2+4` свечей (при `uhlo_length=15` — 34),
   среза `fast[-21:]` для среднего объёма достаточно;
 - параметры в секции `screener`: `pump_volume_mult: 3.0`, `pump_wick_ratio: 0.5`
   (0 — проверка выключена; `pump_bar` выходит сразу при `mult <= 0`).

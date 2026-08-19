@@ -126,7 +126,7 @@ class Config:
     # Явный blacklist символов по полному имени (INXUSDT, ...). Расширяемый:
     # каждый символ исключается из вселенной при подборе.
     blacklist: list[str] = field(default_factory=list)
-    uhlo_length: int = 20
+    uhlo_length: int = 15
     tf_fast: str = "1"
     tf_slow: str = "15"
     cooldown_sec: int = 300
@@ -297,7 +297,7 @@ def compute_natr(klines, period=14):
     return (atr / last_close) * 100
 
 
-def compute_uhlo(klines, length=20):
+def compute_uhlo(klines, length=15):
     """UHLO — «близость цены к экстремумам окна» (поля говорят сами за себя):
 
       * highs  — близость к ХАЮ окна: 100 = цена на самом пике
@@ -400,7 +400,7 @@ def fast_uhlo_corner(uhlo_fast: dict | None) -> bool:
     единого отката: вход в неё — покупка/продажа вершины движения. Такие
     сигналы режем безусловно.
 
-    UHLO считается по целым барам (0/20 и 20/20), поэтому углы дают ровно
+    UHLO считается по целым барам (0/15 и 15/15), поэтому углы дают ровно
     0.0/100.0; допуск BOUNDARY_EPS — страховка от арифметики double.
     """
     if not uhlo_fast:
@@ -1136,19 +1136,20 @@ class Screener:
             self._notify_signal(payload)
             return
 
+        # Доставка боту — запись в журнал: executor.py читает
+        # logs/screener-events.jsonl напрямую и сам исполняет ордера.
+        # HTTP-POST к bot_api_url — уведомление поверх журнала; его отказ
+        # не теряет сигнал, поэтому состояние продвигается безусловно.
+        st.last_color = d.color
+        st.last_signal_ms = ts
+        self.journal.write("signal_sent", status="sent", signal=payload)
+        logger.info("сигнал %s %s natr=%.2f lag=%d мс",
+                    symbol, payload["side"], d.natr or 0.0,
+                    payload["diagnostics"]["detection_lag_ms"])
         ok, info = await asyncio.to_thread(self._post_signal, payload)
-        if ok:
-            # Состояние продвигается ТОЛЬКО после успешной доставки: иначе
-            # потерянный POST терял сигнал до следующей смены цвета.
-            st.last_color = d.color
-            st.last_signal_ms = ts
-            self.journal.write("signal_sent", status="sent", signal=payload)
-            logger.info("сигнал %s %s natr=%.2f lag=%d мс",
-                        symbol, payload["side"], d.natr or 0.0,
-                        payload["diagnostics"]["detection_lag_ms"])
-        else:
-            self.journal.write("signal_failed", status="delivery_failed", error=info, signal=payload)
-            logger.error("сигнал %s не доставлен: %s", symbol, info)
+        if not ok:
+            logger.warning("HTTP-уведомление бота не доставлено "
+                           "(сигнал уже в журнале): %s", info)
 
     def _post_signal(self, payload: dict) -> tuple[bool, str]:
         url = f"{self.cfg.bot_api_url}/signal"
