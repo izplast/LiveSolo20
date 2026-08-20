@@ -91,6 +91,9 @@ except ImportError:  # автономный запуск вне дерева п�
         return datetime.now(_kyiv_tz()).strftime("%Y-%m-%d %H:%M:%S")
 
     class KyivFormatter(logging.Formatter):
+        def __init__(self):
+            super().__init__(fmt="%(asctime)s %(levelname)s %(message)s")
+
         def formatTime(self, record, datefmt=None):  # noqa: N802
             dt = datetime.fromtimestamp(record.created, _kyiv_tz())
             return dt.strftime("%Y-%m-%d %H:%M:%S")
