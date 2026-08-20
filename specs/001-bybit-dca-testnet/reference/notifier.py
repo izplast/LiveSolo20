@@ -33,11 +33,24 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from resilience import CircuitBreaker, ExponentialBackoff, ResilientCaller, ResponseError
 
 TELEGRAM_API = "https://api.telegram.org"
+
+KYIV_TZ = "Europe/Kyiv"
+
+
+def kyiv_now() -> str:
+    """Текущее дата и время в киевском часовом поясе, формат ГГГГ-ММ-ДД ЧЧ:ММ:СС."""
+    try:
+        tz = ZoneInfo(KYIV_TZ)
+    except Exception:  # noqa: BLE001 — нет tzdata → UTC+3 (летнее киевское)
+        tz = timezone(timedelta(hours=3))
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 # parse_mode: HTML — экранирование через html.escape; MarkdownV2 — ручное.
 _PARSE_MODES = ("HTML", "MarkdownV2", "")
@@ -95,11 +108,12 @@ def _fmt_duration(ms: int | None) -> str:
 # ---------------------------------------------------------------------------
 
 def _wrap(title: str, body_lines: list[str], parse_mode: str = "HTML") -> str:
+    stamp = f"🕐 {kyiv_now()}"
     if parse_mode == "MarkdownV2":
         b = "\n".join(body_lines)
-        return f"*{title}*\n{b}"
+        return f"*{stamp}*\n*{title}*\n{b}"
     b = "\n".join(body_lines)
-    return f"<b>{title}</b>\n{b}"
+    return f"<b>{stamp}</b>\n<b>{title}</b>\n{b}"
 
 
 def format_cycle_opened(symbol: str, side: str, price: float, qty: float,
@@ -175,6 +189,10 @@ def format_circuit_open(symbol: str | None, error: str,
 def format_signal(symbol: str, side: str, price: float,
                   signal_id: str, natr: float | None = None,
                   detection_lag_ms: int | None = None,
+                  uhlo_1m: dict | None = None,
+                  uhlo_15m: dict | None = None,
+                  color: str | None = None,
+                  candle_start: int | None = None,
                   parse_mode: str = "HTML") -> str:
     """Dry-run: скринер нашёл кандидата, но ордер не выставляется."""
     e = lambda s: escape_auto(s, parse_mode)  # noqa: E731
@@ -182,6 +200,16 @@ def format_signal(symbol: str, side: str, price: float,
              f"Цена: {_fmt_price(price)}"]
     if natr is not None:
         lines.append(f"NATR: {natr:.2f}%")
+    if uhlo_1m:
+        lines.append(f"UHLO 1м: highs {_fmt_price(uhlo_1m.get('highs'))}, "
+                     f"lows {_fmt_price(uhlo_1m.get('lows'))}")
+    if uhlo_15m:
+        lines.append(f"UHLO 15м: highs {_fmt_price(uhlo_15m.get('highs'))}, "
+                     f"lows {_fmt_price(uhlo_15m.get('lows'))}")
+    if color:
+        lines.append(f"Цвет: {e(color)}")
+    if candle_start is not None:
+        lines.append(f"Свеча (UTC ms): {candle_start}")
     if detection_lag_ms is not None:
         lines.append(f"Задержка: {detection_lag_ms} мс")
     lines.append(f"ID: {e(signal_id)}")

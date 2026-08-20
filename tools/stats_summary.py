@@ -176,7 +176,14 @@ def summarize(cycles: Sequence[dict[str, Any]],
     wins = sum(1 for p in pnls if p > 0)
     durations = [c["duration_ms"] for c in cycles if c["duration_ms"] is not None]
 
+    open_tss = [c["open_ts"] for c in cycles if c["open_ts"] is not None]
+    close_tss = [c["close_ts"] for c in cycles if c["close_ts"] is not None]
+
     out: dict[str, Any] = {
+        "период_торговли": {
+            "начало": min(open_tss) if open_tss else None,
+            "конец": max(close_tss) if close_tss else None,
+        },
         "закрыто_циклов": closed,
         "по_причине": {r: reasons.get(r, 0) for r in
                        ("take_profit", "hard_sl", "trailing", "time_exit", "manual", "unknown")},
@@ -225,9 +232,27 @@ def fmt_iso(ms: int | None) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def render_trades(cycles: Sequence[dict[str, Any]]) -> str:
+    """Построчный список сделок: начало, конец, длительность, причина выхода, PnL."""
+    lines = ["Сделки (начало → конец):"]
+    for c in sorted(cycles, key=lambda x: (x["open_ts"] or 0, x["close_ts"] or 0)):
+        pnl = c["pnl"]
+        lines.append(
+            f"  {fmt_iso(c['open_ts'])} → {fmt_iso(c['close_ts'])}   "
+            f"{fmt_duration(c['duration_ms']):>10}   "
+            f"{c.get('symbol', '?'):<12} {c.get('exit_reason', '?'):<12} "
+            f"{pnl:+.4f} USDT" if pnl is not None else
+            f"  {fmt_iso(c['open_ts'])} → {fmt_iso(c['close_ts'])}   "
+            f"{fmt_duration(c['duration_ms']):>10}   "
+            f"{c.get('symbol', '?'):<12} {c.get('exit_reason', '?'):<12} PnL —")
+    return "\n".join(lines)
+
+
 def render(s: dict[str, Any], by_symbol: bool) -> str:
     lines = ["Сводка по закрытым DCA-циклам"]
     hold = s["удержание_мс"]
+    per = s["период_торговли"]
+    lines.append(f"  Торговля бота:     {fmt_iso(per['начало'])} → {fmt_iso(per['конец'])}")
     lines.append(f"  Закрыто циклов:   {s['закрыто_циклов']}")
     lines.append(f"    по TP:          {s['по_причине']['take_profit']}")
     lines.append(f"    по SL:          {s['по_причине']['hard_sl']}")
@@ -311,6 +336,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(s, ensure_ascii=False, indent=2, default=str))
     else:
         print(render(s, args.by_symbol))
+        if cycles:
+            print()
+            print(render_trades(cycles))
         if since_ms is not None or until_ms is not None:
             period = []
             if since_ms is not None:

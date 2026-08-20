@@ -78,6 +78,22 @@ try:
     from infra.logging_setup import setup_logging
 except ImportError:  # автономный запуск вне дерева проекта
     import logging
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    def _kyiv_tz():
+        try:
+            return ZoneInfo("Europe/Kyiv")
+        except Exception:  # noqa: BLE001 — нет tzdata → UTC+3 (летнее киевское)
+            return timezone(timedelta(hours=3))
+
+    def _kyiv_now():
+        return datetime.now(_kyiv_tz()).strftime("%Y-%m-%d %H:%M:%S")
+
+    class KyivFormatter(logging.Formatter):
+        def formatTime(self, record, datefmt=None):  # noqa: N802
+            dt = datetime.fromtimestamp(record.created, _kyiv_tz())
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
 
     def setup_logging(path: str):  # type: ignore[misc]
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -86,6 +102,8 @@ except ImportError:  # автономный запуск вне дерева п�
             format="%(asctime)s %(levelname)s %(message)s",
             handlers=[logging.FileHandler(path), logging.StreamHandler()],
         )
+        for h in logging.getLogger().handlers:
+            h.setFormatter(KyivFormatter())
         return logging.getLogger("screener")
 
 
@@ -101,6 +119,21 @@ TESTNET_REST = "https://api-testnet.bybit.com"
 # Диапазон NATR объявлен включительным, но арифметика double на ровной границе
 # даёт 0.8999999999999879 — без допуска кандидат ровно на границе отсекался бы.
 BOUNDARY_EPS = 1e-9
+
+# Длительность тестового прогона: 72 часа непрерывной работы связки (README).
+TEST_DURATION_HOURS = 72
+
+
+def _fmt_kyiv_ms(ts_ms: int) -> str:
+    """Метка времени (мс с эпохи) → «ГГГГ-ММ-ДД ЧЧ:ММ:СС» по киевскому времени."""
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    try:
+        tz = ZoneInfo("Europe/Kyiv")
+    except Exception:  # noqa: BLE001 — нет tzdata → UTC+3 (летнее киевское)
+        tz = timezone(timedelta(hours=3))
+    return datetime.fromtimestamp(ts_ms / 1000, tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ---------------------------------------------------------------------------
@@ -790,10 +823,19 @@ class Screener:
         d = payload.get("diagnostics", {})
         try:
             self.notifier.notify(
-                "📈 DCA-сигнал (dry-run): "
-                f"{payload.get('symbol')} {payload.get('side')} "
-                f"@{payload.get('price')} "
-                f"NATR {d.get('natr')}% lag {d.get('detection_lag_ms')} мс")
+                notifier_formats(
+                    "signal",
+                    symbol=payload.get("symbol"),
+                    side=payload.get("side"),
+                    price=payload.get("price"),
+                    signal_id=payload.get("signal_id"),
+                    natr=d.get("natr"),
+                    detection_lag_ms=d.get("detection_lag_ms"),
+                    uhlo_1m=d.get("uhlo_1m"),
+                    uhlo_15m=d.get("uhlo_15m"),
+                    color=d.get("color"),
+                    candle_start=d.get("candle_start"),
+                ))
         except Exception:  # noqa: BLE001 — уведомления не роняют скринер
             logger.warning("не удалось отправить уведомление о сигнале", exc_info=True)
 
@@ -1230,6 +1272,11 @@ async def amain(argv: list[str] | None = None) -> int:
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, screener.stop)
 
+    start_ts = time.time()
+    logger.info("тест начат: %s (Киев)", _fmt_kyiv_ms(int(start_ts * 1000)))
+    logger.info("тест план: окончание %s (72 ч от старта)",
+                _fmt_kyiv_ms(int(start_ts * 1000) + TEST_DURATION_HOURS * 3_600_000))
+
     try:
         await screener.run()
         return 0
@@ -1237,6 +1284,9 @@ async def amain(argv: list[str] | None = None) -> int:
         logger.exception("скринер остановлен из-за ошибки")
         return 1
     finally:
+        stop_ts = time.time()
+        logger.info("тест завершён: %s (Киев), длительность %.0f мин",
+                    _fmt_kyiv_ms(int(stop_ts * 1000)), (stop_ts - start_ts) / 60)
         screener.journal.close()
         if notifier is not None:
             notifier.shutdown(wait=False)
@@ -1333,7 +1383,16 @@ def notifier_formats(what: str, **kw) -> str:
         nt = _iu.module_from_spec(spec)
         sys.modules["notifier_formats_mod"] = nt
         spec.loader.exec_module(nt)
-        return nt.format_telegram_test() if what == "telegram_test" else str(what)
+        if what == "telegram_test":
+            return nt.format_telegram_test()
+        if what == "signal":
+            return nt.format_signal(
+                symbol=kw.get("symbol"), side=kw.get("side"),
+                price=kw.get("price"), signal_id=kw.get("signal_id"),
+                natr=kw.get("natr"), detection_lag_ms=kw.get("detection_lag_ms"),
+                uhlo_1m=kw.get("uhlo_1m"), uhlo_15m=kw.get("uhlo_15m"),
+                color=kw.get("color"), candle_start=kw.get("candle_start"))
+        return str(what)
     except Exception:  # noqa: BLE001
         return "🔔 Тест уведомлений: скринер работает"
 
