@@ -164,6 +164,53 @@ def equity_by_symbol(cycles: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+ANOMALY_PNL_THRESHOLD = -100.0
+ANOMALY_SYMBOLS = {"OPGUSDT"}
+
+
+def is_anomalous(
+    cycle: dict[str, Any],
+    *,
+    pnl_threshold: float | None = ANOMALY_PNL_THRESHOLD,
+    symbols: set[str] | None = None,
+) -> bool:
+    """Проверка на аномальный цикл.
+
+    Аномалией считается:
+    * pnl < pnl_threshold (по умолчанию -100 USDT) — как OPGUSDT -628;
+    * symbol в списке аномальных (по умолчанию {"OPGUSDT"}).
+    """
+    sym = str(cycle.get("symbol") or "")
+    if symbols is not None:
+        if sym in symbols:
+            return True
+    else:
+        if sym in ANOMALY_SYMBOLS:
+            return True
+    if pnl_threshold is not None:
+        pnl = cycle.get("pnl")
+        if isinstance(pnl, (int, float)) and float(pnl) < pnl_threshold:
+            return True
+    return False
+
+
+def filter_anomalies(
+    cycles: Sequence[dict[str, Any]],
+    *,
+    pnl_threshold: float | None,
+    symbols: set[str] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Делит циклы на (чистые, аномальные) по критериям is_anomalous."""
+    clean: list[dict[str, Any]] = []
+    anomalous: list[dict[str, Any]] = []
+    for c in cycles:
+        if is_anomalous(c, pnl_threshold=pnl_threshold, symbols=symbols):
+            anomalous.append(c)
+        else:
+            clean.append(c)
+    return clean, anomalous
+
+
 def summarize(cycles: Sequence[dict[str, Any]],
               by_symbol: bool = False) -> dict[str, Any]:
     """Считает сводку по закрытым циклам. pnl=None (неизвестен) из
@@ -265,6 +312,10 @@ def render(s: dict[str, Any], by_symbol: bool) -> str:
     lines.append(f"  Удержание (ср.):  {fmt_duration(hold['среднее'])}   "
                  f"(медиана {fmt_duration(hold['медиана'])}, "
                  f"min {fmt_duration(hold['min'])}, max {fmt_duration(hold['max'])})")
+    if s.get("исключено_аномалий"):
+        excl = s["исключено_аномалий"]
+        lines.append(f"  Исключено аномалий: {excl['count']}  "
+                     f"(PnL {excl['pnl']:+.2f}, фильтр: {excl['filter']})")
     if by_symbol:
         lines.append("\nПо символам:")
         for sym, g in s["по_символам"].items():
@@ -317,6 +368,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                          "(в --json — также equity-ряды для report_charts)")
     ap.add_argument("--json", action="store_true",
                     help="вывести машиночитаемый JSON")
+    # Фильтрация аномалий (OPGUSDT -628): по символу и по размеру убытка
+    ap.add_argument("--exclude-anomalies", action="store_true",
+                    help="исключить аномальные циклы: symbol==OPGUSDT или pnl < -100 "
+                         "(включает --exclude-symbol OPGUSDT и --exclude-pnl-below -100)")
+    ap.add_argument("--exclude-symbol", action="append", dest="exclude_symbols",
+                    default=None,
+                    help="исключить циклы по символу (можно указывать несколько раз: "
+                         "--exclude-symbol OPGUSDT --exclude-symbol XYZUSDT)")
+    ap.add_argument("--exclude-pnl-below", type=float, default=None,
+                    dest="exclude_pnl_below",
+                    help="исключить циклы с pnl < порога (например --exclude-pnl-below -100)")
+    ap.add_argument("--include-anomalies", action="store_true",
+                    help="включить аномальные циклы обратно (отменяет --exclude-anomalies)")
     args = ap.parse_args(argv)
 
     since_ms, until_ms = parse_windows(args)
@@ -331,7 +395,43 @@ def main(argv: Sequence[str] | None = None) -> int:
             return True
         cycles = [c for c in cycles if in_window(c)]
 
-    s = summarize(cycles, by_symbol=args.by_symbol)
+    # --- фильтрация аномалий ---
+    exclude_symbols: set[str] | None = None
+    exclude_pnl: float | None = None
+    active_filter_desc: str | None = None
+    if args.exclude_anomalies and not args.include_anomalies:
+        exclude_symbols = set(ANOMALY_SYMBOLS)
+        exclude_pnl = ANOMALY_PNL_THRESHOLD
+        active_filter_desc = f"symbol in {sorted(ANOMALY_SYMBOLS)} или pnl < {ANOMALY_PNL_THRESHOLD}"
+    if args.exclude_symbols:
+        exclude_symbols = (exclude_symbols or set()) | set(args.exclude_symbols)
+        active_filter_desc = f"symbol in {sorted(exclude_symbols)}" + (
+            f" или pnl < {exclude_pnl}" if exclude_pnl is not None else "")
+    if args.exclude_pnl_below is not None:
+        exclude_pnl = args.exclude_pnl_below
+        if active_filter_desc:
+            active_filter_desc = f"{active_filter_desc} / pnl < {exclude_pnl}"
+        else:
+            active_filter_desc = f"pnl < {exclude_pnl}"
+    # Явные фильтры имеют приоритет над дефолтом
+    if exclude_symbols is not None or exclude_pnl is not None:
+        clean, anomalous = filter_anomalies(
+            cycles, pnl_threshold=exclude_pnl, symbols=exclude_symbols)
+        s = summarize(clean, by_symbol=args.by_symbol)
+        # Добавляем метаданные об исключённых для render/json
+        excl_pnl_sum = sum(c["pnl"] for c in anomalous if isinstance(c.get("pnl"), (int, float)))
+        s["исключено_аномалий"] = {
+            "count": len(anomalous),
+            "pnl": round(excl_pnl_sum, 4),
+            "filter": active_filter_desc or "",
+            "symbols": sorted(exclude_symbols) if exclude_symbols else [],
+            "pnl_threshold": exclude_pnl,
+        }
+        if args.json:
+            s["_anomalous_cycles"] = anomalous
+        cycles = clean
+    else:
+        s = summarize(cycles, by_symbol=args.by_symbol)
     if args.json:
         print(json.dumps(s, ensure_ascii=False, indent=2, default=str))
     else:
@@ -346,6 +446,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if until_ms is not None:
                 period.append(f"до {fmt_iso(until_ms)}")
             print(f"\n(окно: {' '.join(period)})")
+        if s.get("исключено_аномалий") and s["исключено_аномалий"]["count"]:
+            print(f"\n(исключено аномалий: {s['исключено_аномалий']['count']} "
+                  f"PnL {s['исключено_аномалий']['pnl']:+.2f} — {active_filter_desc})")
     return 0
 
 

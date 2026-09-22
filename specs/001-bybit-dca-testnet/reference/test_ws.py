@@ -173,12 +173,28 @@ async def pump_once():
     await asyncio.sleep(0.05)  # дождаться фоновой задачи решения
 
 
+# второй бар серии: подтверждение 2 баров — сигнал уходит только когда
+# одно и то же цветовое состояние держится 2 закрытых бара подряд
+trigger2 = {"start": 61 * 60_000, "open": 107.0, "high": 107.8, "low": 106.6,
+            "close": 107.5, "confirm": True}
+
+
+async def pump_twice():
+    s._on_message(json.dumps({"topic": "kline.1.TESTUSDT", "data": [trigger]}))
+    await asyncio.sleep(0.05)
+    s._on_message(json.dumps({"topic": "kline.1.TESTUSDT", "data": [trigger2]}))
+    await asyncio.sleep(0.05)
+
+
 asyncio.run(pump_once())
 ok("закрытая свеча fast добавляется в окно", len(st.fast) == before + 1)
 ok("повторный снапшот той же свечи не дублируется",
    (lambda: (s._on_message(json.dumps({"topic": "kline.1.TESTUSDT", "data": [trigger]})),
              len(st.fast) == before + 1)[1])())
-ok("сигнал по закрытой свече уходит в бота", len(fake_requests.posted) == 1,
+ok("первый бар серии сигнал не отправляет (нет подтверждения)",
+   len(fake_requests.posted) == 0, fake_requests.posted)
+asyncio.run(pump_twice())                       # повтор снапшота + второй бар
+ok("сигнал по двум закрытым свечам уходит в бота", len(fake_requests.posted) == 1,
    fake_requests.posted)
 
 # ── сторож тишины (_pump) ─────────────────────────────────────────────────────

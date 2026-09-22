@@ -85,6 +85,9 @@ class BotParams:
     heartbeat_sec: int = 60        # периодичность журнала/файла инбокса
     autostart: bool = True         # принимать сигналы сразу после старта
     journal_path: str = "logs/bot-events.jsonl"
+    # Частота вычитывания журнала сигналов, с. Малое значение режет задержку
+    # сигнал→вход (SC-003): такт монитора добавлял к ней в среднем полтакта.
+    signal_poll_sec: float = 0.5
 
     def validate(self) -> None:
         problems = []
@@ -100,6 +103,9 @@ class BotParams:
             problems.append("heartbeat_sec >= 1")
         if not self.journal_path:
             problems.append("journal_path не пуст")
+        if not 0.05 <= self.signal_poll_sec <= self.monitor_interval_sec:
+            problems.append("signal_poll_sec в пределах "
+                            "0.05..monitor_interval_sec")
         if problems:
             raise ValueError("некорректная секция bot:\n- " + "\n- ".join(problems))
 
@@ -113,6 +119,7 @@ BOT_DEFAULTS = {
     "heartbeat_sec": 60,
     "autostart": True,
     "journal_path": "logs/bot-events.jsonl",
+    "signal_poll_sec": 0.5,
 }
 
 # Обязательные ключи при существующем файле: их отсутствие — расхождение
@@ -230,6 +237,8 @@ def bot_params_from_config(bot: dict) -> BotParams:
         heartbeat_sec=int(bot.get("heartbeat_sec", BOT_DEFAULTS["heartbeat_sec"])),
         autostart=bool(bot.get("autostart", BOT_DEFAULTS["autostart"])),
         journal_path=str(bot.get("journal_path", BOT_DEFAULTS["journal_path"])),
+        signal_poll_sec=float(bot.get(
+            "signal_poll_sec", BOT_DEFAULTS["signal_poll_sec"])),
     )
     p.validate()
     return p

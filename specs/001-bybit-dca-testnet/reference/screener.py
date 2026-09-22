@@ -197,7 +197,16 @@ class Config:
     ws_topics_per_conn: int = 200
     ws_subscribe_batch: int = 10   # Bybit не принимает больше 10 args за раз
     ws_ping_sec: int = 15          # Bybit закрывает соединение без ping в 20 с
+    # Нет ответа pong после отправленного ping дольше этого — соединение
+    # считается мёртвым, шард переподключается, не дожидаясь сторожа тишины.
+    ws_pong_timeout_sec: float = 10.0
     ws_stale_sec: int = 45
+    # Обрыв WS дольше этого — включается REST-догонялка: закрытые свечи
+    # читаются из /v5/market/kline, чтобы сигналы не терялись на время
+    # разрыва (0 — догонялка выключена).
+    rest_fallback_after_sec: int = 30
+    # Период опроса REST в режиме догонялки: свечи 1м закрываются раз в минуту.
+    rest_fallback_interval_sec: int = 60
     # Обрыв длиннее этого — в окне свечей появляется дыра, и NATR с UHLO
     # начинают считаться по разрывной истории. Тогда окно перечитывается
     # заново из REST вместо доклейки к старому.
@@ -265,6 +274,14 @@ def validate_config(cfg: Config) -> None:
         problems.append("ws_ping_sec < 20: Bybit закрывает соединение без ping")
     if cfg.ws_stale_sec <= cfg.ws_ping_sec:
         problems.append("ws_stale_sec должен превышать ws_ping_sec")
+    if not cfg.ws_pong_timeout_sec > 0:
+        problems.append("ws_pong_timeout_sec > 0")
+    if cfg.ws_pong_timeout_sec >= cfg.ws_stale_sec:
+        problems.append("ws_pong_timeout_sec должен быть меньше ws_stale_sec")
+    if cfg.rest_fallback_after_sec < 0:
+        problems.append("rest_fallback_after_sec >= 0 (0 — догонялка выключена)")
+    if cfg.rest_fallback_after_sec > 0 and cfg.rest_fallback_interval_sec < 5:
+        problems.append("rest_fallback_interval_sec >= 5")
     if cfg.reject_log not in ("all", "candidates", "none"):
         problems.append("reject_log: all | candidates | none")
 
@@ -454,7 +471,8 @@ def fast_uhlo_corner(uhlo_fast: dict | None) -> bool:
 # Причины, которые в режиме 'candidates' в журнал не пишутся: это фон, а не
 # события. 300 символов × 1440 минут — за 72 часа это миллионы строк на
 # телефоне, поэтому отбор причин здесь не косметика.
-NOISE_REASONS = {"insufficient_history", "natr_below_min", "repeat_color"}
+NOISE_REASONS = {"insufficient_history", "natr_below_min", "repeat_color",
+                 "no_confirm"}
 
 
 @dataclass
@@ -614,6 +632,11 @@ class SymbolState:
         self.slow: deque[list] = deque(maxlen=slow_cap)
         self.last_color = "none"
         self.last_signal_ms = 0
+        # Цвет ПРЕДЫДУЩЕГО закрытого бара, если тот полностью прошёл evaluate()
+        # (иначе "none"). Механизм подтверждения: сигнал уходит только когда
+        # одно и то же цветовое состояние держится 2 бара подряд — одиночный
+        # бар в углу чаще оказывается ложным проколом (см. BTWUSDT 21.08).
+        self.prev_color = "none"
 
     def push(self, tf: str, row: list) -> bool:
         """Добавляет закрытую свечу. False, если свеча не новая.
@@ -818,6 +841,16 @@ class Screener:
         # Инъекция уведомлений: None — не слать. В dry-run и при запуске с
         # Telegram-настройками сюда подставляется TelegramNotifier (notifier.py).
         self.notifier = notifier
+        # Очередь решений «закрытая свеча → evaluate»: приём из WS больше не
+        # плодит по задаче на бар. Раньше 600 символов закрывали минутные
+        # свечи в одну и ту же секунду, и пачка параллельных задач с
+        # CPU-работой внутри блокировала цикл событий — отсюда хвосты p95
+        # задержки сигнал→исполнение. Теперь решения обрабатывает один
+        # воркер в порядке FIFO (порядок по символу сохранён), а recv-цикл
+        # остаётся отзывчивым к ping/pong и сторожу тишины.
+        self._decisions: asyncio.Queue = asyncio.Queue(maxsize=4096)
+        self._decision_worker: asyncio.Task | None = None
+        self._dropped_decisions = 0
 
     def _notify_signal(self, payload: dict) -> None:
         """Отправка уведомления о сигнале (только в dry-run, без ордеров)."""
@@ -976,7 +1009,11 @@ class Screener:
 
         shards = self._shards()
         logger.info("подписка: %d символов в %d соединениях", len(self.symbols), len(shards))
-        await asyncio.gather(*(self._shard_loop(i, group) for i, group in enumerate(shards)))
+        try:
+            await asyncio.gather(*(self._shard_loop(i, group)
+                                   for i, group in enumerate(shards)))
+        finally:
+            await self._stop_decision_worker()
 
     async def _shard_loop(self, index: int, group: list[str]) -> None:
         attempt = 0
@@ -985,46 +1022,123 @@ class Screener:
         # соединение писало бы ещё один stream_up без парного stream_down, и
         # стартовая пауза попадала бы в сумму «слепого» времени дважды.
         down_since: int | None = None
-        while not self._stop.is_set():
+        fallback: asyncio.Task | None = None
+
+        try:
+            while not self._stop.is_set():
+                try:
+                    async with ws_connect(MAINNET_WS, ping_interval=None,
+                                          open_timeout=20, close_timeout=5,
+                                          max_queue=2048) as ws:
+                        attempt = 0
+                        # Подписка раньше перечитывания истории: иначе свечи,
+                        # закрывшиеся во время чтения REST, будут потеряны.
+                        await self._subscribe(ws, group)
+                        if down_since is not None:
+                            outage_ms = self.now_ms() - down_since
+                            if outage_ms > self.cfg.reseed_after_sec * 1000:
+                                logger.info("shard#%d: обрыв %.0f с — перечитываю историю",
+                                            index, outage_ms / 1000)
+                                await self.seed_history(group)
+                            # stream_up пишется только после оформления подписки и
+                            # (при необходимости) перечитывания истории: «слепой»
+                            # интервал закрывается, когда данные реально пошли,
+                            # а не в момент открытия TCP-соединения. Если на этом
+                            # участке будет ошибка, down_since не сброшен — и интервал
+                            # останется одним непрерывным, без лишней пары down/up.
+                            self.journal.write("stream_up", shard=index, symbols=group,
+                                               duration_ms=outage_ms, cause="reconnect")
+                            down_since = None
+                        # Соединение восстановилось — REST-догонялка больше не нужна.
+                        if fallback is not None:
+                            fallback.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await fallback
+                            fallback = None
+                        await self._pump(ws, index)
+                except Exception as e:
+                    if self._stop.is_set():
+                        return
+                    if down_since is None:
+                        down_since = self.now_ms()
+                        # Интервал недоступности потока: сигналы, которые могли бы
+                        # возникнуть внутри него, не считаются пропущенными.
+                        self.journal.write("stream_down", shard=index, symbols=group,
+                                           cause="disconnect", error=str(e))
+                        # REST-догонялка включается, если обрыв затянется дольше
+                        # rest_fallback_after_sec (см. _rest_fallback).
+                        if self.cfg.rest_fallback_after_sec > 0 and fallback is None:
+                            fallback = asyncio.create_task(
+                                self._rest_fallback(group, down_since))
+                    attempt += 1
+                    delay = min(60.0, 1.0 * 2 ** (attempt - 1)) * (0.7 + 0.6 * random.random())
+                    logger.warning("shard#%d: обрыв (%s), переподключение через %.1f с (попытка %d)",
+                                   index, e, delay, attempt)
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self._stop.wait(), timeout=delay)
+        finally:
+            if fallback is not None:
+                fallback.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await fallback
+
+    async def _rest_fallback(self, group: list[str], down_since: int) -> None:
+        """REST-догонялка на время обрыва WS.
+
+        Включается через rest_fallback_after_sec после разрыва: закрытые свечи
+        читаются из /v5/market/kline и прогоняются через ту же очередь решений,
+        что и потоковые, — сигналы не теряются, пока соединение лежит. Отключается
+        отменой задачи при восстановлении WS (rest_fallback_off в журнале).
+        """
+        threshold_ms = self.cfg.rest_fallback_after_sec * 1000
+        delay_s = (down_since + threshold_ms - self.now_ms()) / 1000
+        if delay_s > 0:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=delay_s)
+            if self._stop.is_set():
+                return
+        self.journal.write("rest_fallback_on", symbols=len(group),
+                           downtime_ms=self.now_ms() - down_since)
+        logger.warning("WS недоступен дольше %d с — включаю REST-догонялку (%d символов)",
+                       self.cfg.rest_fallback_after_sec, len(group))
+        sem = asyncio.Semaphore(max(1, self.cfg.seed_concurrency))
+
+        async def one(symbol: str) -> int:
+            """Дочитать свечи символа из REST; вернуть число ошибок (0/1)."""
             try:
-                async with ws_connect(MAINNET_WS, ping_interval=None,
-                                      open_timeout=20, close_timeout=5,
-                                      max_queue=2048) as ws:
-                    attempt = 0
-                    # Подписка раньше перечитывания истории: иначе свечи,
-                    # закрывшиеся во время чтения REST, будут потеряны.
-                    await self._subscribe(ws, group)
-                    if down_since is not None:
-                        outage_ms = self.now_ms() - down_since
-                        if outage_ms > self.cfg.reseed_after_sec * 1000:
-                            logger.info("shard#%d: обрыв %.0f с — перечитываю историю",
-                                        index, outage_ms / 1000)
-                            await self.seed_history(group)
-                        # stream_up пишется только после оформления подписки и
-                        # (при необходимости) перечитывания истории: «слепой»
-                        # интервал закрывается, когда данные реально пошли,
-                        # а не в момент открытия TCP-соединения. Если на этом
-                        # участке будет ошибка, down_since не сброшен — и интервал
-                        # останется одним непрерывным, без лишней пары down/up.
-                        self.journal.write("stream_up", shard=index, symbols=group,
-                                           duration_ms=outage_ms, cause="reconnect")
-                        down_since = None
-                    await self._pump(ws, index)
+                async with sem:
+                    fast = await asyncio.to_thread(fetch_klines, MAINNET_REST,
+                                                   symbol, self.cfg.tf_fast,
+                                                   self._fast_cap)
+                    slow = await asyncio.to_thread(fetch_klines, MAINNET_REST,
+                                                   symbol, self.cfg.tf_slow,
+                                                   self._slow_cap)
             except Exception as e:
-                if self._stop.is_set():
-                    return
-                if down_since is None:
-                    down_since = self.now_ms()
-                    # Интервал недоступности потока: сигналы, которые могли бы
-                    # возникнуть внутри него, не считаются пропущенными.
-                    self.journal.write("stream_down", shard=index, symbols=group,
-                                       cause="disconnect", error=str(e))
-                attempt += 1
-                delay = min(60.0, 1.0 * 2 ** (attempt - 1)) * (0.7 + 0.6 * random.random())
-                logger.warning("shard#%d: обрыв (%s), переподключение через %.1f с (попытка %d)",
-                               index, e, delay, attempt)
+                logger.warning("REST-догонялка %s: %s", symbol, e)
+                return 1
+            st = self.state(symbol)
+            new_fast = [row for row in fast if st.push("fast", row)]
+            for row in slow:
+                st.push("slow", row)
+            for row in new_fast:
+                self._enqueue_decision(symbol, st, row)
+            return 0
+
+        try:
+            while not self._stop.is_set():
+                started = self.now_ms()
+                results = await asyncio.gather(*(one(s) for s in group))
+                failures = sum(results)
+                if failures:
+                    self.journal.write("rest_fallback_error", symbols=len(group),
+                                       failures=failures)
+                pause = max(1.0, self.cfg.rest_fallback_interval_sec -
+                            (self.now_ms() - started) / 1000)
                 with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                    await asyncio.wait_for(self._stop.wait(), timeout=pause)
+        finally:
+            self.journal.write("rest_fallback_off", symbols=len(group),
+                               duration_ms=self.now_ms() - down_since)
 
     async def _subscribe(self, ws, group: Iterable[str]) -> None:
         topics = []
@@ -1036,28 +1150,63 @@ class Screener:
             await ws.send(json.dumps({"op": "subscribe", "args": topics[i:i + batch]}))
 
     async def _pump(self, ws, index: int) -> None:
-        """Приём сообщений с ping и сторожем тишины.
+        """Приём сообщений с ping/pong и сторожем тишины.
 
-        Сторож нужен именно на Android: после сна устройства соединение часто
-        остаётся «открытым», но данные по нему не идут. Без него скринер молча
+        Ping уходит каждые ws_ping_sec (< 20 с — требование Bybit). Если после
+        отправленного ping в течение ws_pong_timeout_sec не пришло ни одного
+        pong, соединение считается мёртвым: поднимается RuntimeError, и шард
+        переподключается, не дожидаясь сторожа тишины. Сторож тишины нужен
+        именно на Android: после сна устройства соединение часто остаётся
+        «открытым», но данные по нему не идут. Без них скринер молча
         ослепнет, а прогон будет выглядеть успешным.
         """
+        last_pong = time.monotonic()
+
         async def pinger() -> None:
+            nonlocal last_pong
             while True:
                 await asyncio.sleep(self.cfg.ws_ping_sec)
                 await ws.send(json.dumps({"op": "ping"}))
+                sent_at = time.monotonic()
+                await asyncio.sleep(self.cfg.ws_pong_timeout_sec)
+                if last_pong < sent_at:
+                    raise RuntimeError(
+                        f"нет pong {self.cfg.ws_pong_timeout_sec} с — "
+                        "соединение мёртвое")
 
-        ping_task = asyncio.create_task(pinger())
+        recv_task: asyncio.Task = asyncio.create_task(ws.recv())
+        ping_task: asyncio.Task = asyncio.create_task(pinger())
         try:
             while not self._stop.is_set():
-                raw = await asyncio.wait_for(ws.recv(), timeout=self.cfg.ws_stale_sec)
-                self._on_message(raw)
-        except asyncio.TimeoutError:
-            raise RuntimeError(f"нет сообщений {self.cfg.ws_stale_sec} с — соединение мёртвое")
+                done, _ = await asyncio.wait(
+                    {recv_task, ping_task}, timeout=self.cfg.ws_stale_sec,
+                    return_when=asyncio.FIRST_COMPLETED)
+                if ping_task in done:
+                    # Pinger завершается только исключением («нет pong») —
+                    # result() пробрасывает его, и шард переподключается.
+                    ping_task.result()
+                if recv_task in done:
+                    raw = recv_task.result()
+                    recv_task = asyncio.create_task(ws.recv())
+                    if self._is_pong(raw):
+                        last_pong = time.monotonic()
+                        continue
+                    self._on_message(raw)
+                if not done:
+                    raise RuntimeError(
+                        f"нет сообщений {self.cfg.ws_stale_sec} с — соединение мёртвое")
         finally:
-            ping_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await ping_task
+            for t in (recv_task, ping_task):
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+
+    @staticmethod
+    def _is_pong(raw: str | bytes) -> bool:
+        """Дешёвая проверка pong-фрейма до json.loads: это служебные сообщения."""
+        if isinstance(raw, bytes):
+            return b'"pong"' in raw
+        return isinstance(raw, str) and '"pong"' in raw
 
     def _on_message(self, raw: str | bytes) -> None:
         try:
@@ -1098,18 +1247,52 @@ class Screener:
             # Решение принимается только на закрытии свечи МЛАДШЕГО ТФ:
             # старший лишь подтверждает направление.
             if is_new and tf == "fast":
-                task = asyncio.create_task(self._on_fast_close(symbol, st, row))
-                # Без этого исключение в задаче уходит в «Task exception was
-                # never retrieved» и за 72 часа теряется вместе с причиной.
-                task.add_done_callback(self._task_done)
+                self._enqueue_decision(symbol, st, row)
 
-    def _task_done(self, task: asyncio.Task) -> None:
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.error("ошибка обработки закрытой свечи", exc_info=exc)
-            self.journal.write("error", where="on_fast_close", error=str(exc))
+    def _enqueue_decision(self, symbol: str, st: SymbolState, row: list) -> None:
+        """Поставить решение в очередь без блокировки recv-цикла (put_nowait).
+
+        Воркер запускается лениво при первой свече. Переполнение очереди
+        (симптом деградации, а не штатный режим) фиксируется в журнале:
+        свеча пропускается осознанно, вместо лавинообразного роста памяти.
+        """
+        if self._decision_worker is None or self._decision_worker.done():
+            self._decision_worker = asyncio.get_running_loop().create_task(
+                self._decision_worker_loop())
+        try:
+            self._decisions.put_nowait((symbol, st, row))
+        except asyncio.QueueFull:
+            self._dropped_decisions += 1
+            logger.error("очередь решений переполнена: отброшено %d",
+                         self._dropped_decisions)
+            self.journal.write("decision_dropped", symbol=symbol,
+                               dropped_total=self._dropped_decisions)
+
+    async def _decision_worker_loop(self) -> None:
+        """Единственный обработчик очереди решений: FIFO без гонок.
+
+        Раньше на каждую закрытую свечу плодилась задача evaluate, и пачка
+        минутных закрытий (600 символов в одну секунду) блокировала цикл
+        событий; сериализация в одном воркере убирает эти всплески задержки.
+        """
+        while True:
+            symbol, st, row = await self._decisions.get()
+            try:
+                await self._on_fast_close(symbol, st, row)
+            except Exception as e:  # noqa: BLE001 — ошибка одного бара не убивает воркер
+                logger.error("ошибка обработки закрытой свечи %s", symbol, exc_info=e)
+                self.journal.write("error", where="on_fast_close",
+                                   symbol=symbol, error=str(e))
+            finally:
+                self._decisions.task_done()
+
+    async def _stop_decision_worker(self) -> None:
+        w = self._decision_worker
+        if w is not None:
+            w.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await w
+            self._decision_worker = None
 
     # ── решение и отправка ─────────────────────────────────────────────────
 
@@ -1118,6 +1301,13 @@ class Screener:
         fast = list(st.fast)
         slow = list(st.slow)
         d = evaluate(fast, slow, self.cfg)
+
+        # Подтверждение 2 баров: цвет предыдущего закрытого бара засчитывается
+        # только если тот полностью прошёл evaluate(); любой не-проход обнуляет
+        # серию. Обновление состояния — ДО ранних выходов, чтобы серия чётко
+        # отражала последний бар.
+        prev_color = st.prev_color
+        st.prev_color = d.color if d.passed else "none"
 
         if not d.passed:
             diag = dict(d.details)
@@ -1136,6 +1326,12 @@ class Screener:
 
         if d.color == st.last_color:
             self._log_reject(symbol, "repeat_color", ts, {"color": d.color})
+            return
+
+        if prev_color != d.color:
+            # Первый бар серии: состояние есть, но подтверждения ещё нет.
+            self._log_reject(symbol, "no_confirm", ts,
+                             {"color": d.color, "prev_color": prev_color})
             return
 
         if ts - st.last_signal_ms < self.cfg.cooldown_sec * 1000:
@@ -1162,6 +1358,15 @@ class Screener:
                 "natr": round(d.natr, 4) if d.natr is not None else None,
                 "uhlo_1m": d.uhlo_fast,
                 "uhlo_15m": d.uhlo_slow,
+                # Сырые значения LuxAlgo-UHLO (без инверсии): прямая сверка
+                # с индикатором «Unreached Highs/Lows [LuxAlgo]» на TV,
+                # где красная линия = Unreached Highs, зелёная = Unreached Lows.
+                "uhlo_raw": {
+                    "1m": {"unreached_highs": round(100 - d.uhlo_fast["highs"], 1),
+                           "unreached_lows": round(100 - d.uhlo_fast["lows"], 1)},
+                    "15m": {"unreached_highs": round(100 - d.uhlo_slow["highs"], 1),
+                            "unreached_lows": round(100 - d.uhlo_slow["lows"], 1)},
+                },
                 "color": d.color,
                 "candle_start": trigger[0],
                 "detection_lag_ms": ts - (trigger[0] + interval_ms),

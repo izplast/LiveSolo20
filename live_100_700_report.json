@@ -1,0 +1,53 @@
+{
+  "generated": "2026-09-22T07:55:23.669574+00:00",
+  "rank_range": "100-2500",
+  "duration_sec": 36000,
+  "interval_sec": 60,
+  "pool_size": 600,
+  "total_signals": 14,
+  "top": [
+    {
+      "symbol": "COOKIEUSDT",
+      "rank": 1338,
+      "count": 5,
+      "avg_vol_ratio": 8.766,
+      "avg_atr": 1.338
+    },
+    {
+      "symbol": "WETUSDT",
+      "rank": 1058,
+      "count": 2,
+      "avg_vol_ratio": 3.557,
+      "avg_atr": 1.116
+    },
+    {
+      "symbol": "BTWUSDT",
+      "rank": 9999,
+      "count": 2,
+      "avg_vol_ratio": 5.229,
+      "avg_atr": 1.101
+    },
+    {
+      "symbol": "CARVUSDT",
+      "rank": 762,
+      "count": 2,
+      "avg_vol_ratio": 2.711,
+      "avg_atr": 1.173
+    },
+    {
+      "symbol": "INUSDT",
+      "rank": 1181,
+      "count": 2,
+      "avg_vol_ratio": 2.992,
+      "avg_atr": 1.038
+    },
+    {
+      "symbol": "CASHCATUSDT",
+      "rank": 208,
+      "count": 1,
+      "avg_vol_ratio": 3.942,
+      "avg_atr": 0.935
+    }
+  ],
+  "csv": "live_100_700_signals.csv"
+}

@@ -1,0 +1,25 @@
+{
+  "generated": "2026-08-26T19:57:59.091165+00:00",
+  "rank_range": "50-600",
+  "duration_sec": 36000,
+  "interval_sec": 60,
+  "pool_size": 255,
+  "total_signals": 3,
+  "top": [
+    {
+      "symbol": "AKEUSDT",
+      "rank": 175,
+      "count": 2,
+      "avg_vol_ratio": 2.776,
+      "avg_atr": 4.447
+    },
+    {
+      "symbol": "HNTUSDT",
+      "rank": 550,
+      "count": 1,
+      "avg_vol_ratio": 3.23,
+      "avg_atr": 1.08
+    }
+  ],
+  "csv": "live_50_600_signals.csv"
+}

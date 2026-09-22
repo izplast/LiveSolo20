@@ -341,6 +341,13 @@ def fire(s, st, color_bars=None):
     return asyncio.run(s._on_fast_close("TESTUSDT", st, trigger))
 
 
+def fire2(s, st):
+    """Два закрытия подряд: первый бар становится в серию (no_confirm),
+    второй подтверждает и отправляет сигнал."""
+    fire(s, st)
+    return fire(s, st)
+
+
 def _journal_lines():
     """Строки журнала скринера (общий файл _tmp/events.jsonl)."""
     try:
@@ -354,8 +361,8 @@ fake_requests.posted.clear()
 fake_requests.post_status = 200
 fake_requests.post_raises = False
 s, st = fresh_screener()
-fire(s, st)
-ok("сигнал отправлен", len(fake_requests.posted) == 1, fake_requests.posted)
+fire2(s, st)
+ok("сигнал отправлен (после подтверждения 2 баров)", len(fake_requests.posted) == 1, fake_requests.posted)
 
 payload = fake_requests.posted[0]["payload"]
 ok("в конверте есть цена", isinstance(payload.get("price"), float))
@@ -365,7 +372,25 @@ ok("указан контур цены", payload.get("price_venue") == "bybit_ma
 ok("параметров DCA в конверте нет (владелец — бот)", "params" not in payload)
 ok("есть диагностика для калибровки",
    {"natr", "uhlo_1m", "uhlo_15m", "detection_lag_ms"} <= set(payload.get("diagnostics", {})))
+raw = payload["diagnostics"].get("uhlo_raw")
+ok("в диагностике есть сырые UHLO (семантика TV LuxAlgo)",
+   isinstance(raw, dict) and set(raw) == {"1m", "15m"}
+   and set(raw["1m"]) == {"unreached_highs", "unreached_lows"}
+   and set(raw["15m"]) == {"unreached_highs", "unreached_lows"}, raw)
 ok("цвет зафиксирован после успешной отправки", st.last_color == "green")
+
+# подтверждение сигнала: одиночный бар в состоянии не отправляет сигнал
+print("\nподтверждение сигнала (2 бара подряд)")
+s6, st6 = fresh_screener(reject_log="all")
+fake_requests.posted.clear()
+fire(s6, st6)                                   # первый бар серии
+ok("первый бар серии сигнал НЕ отправляет", len(fake_requests.posted) == 0,
+   fake_requests.posted)
+ok("первый бар серии: reject no_confirm в журнале",
+   any(x.get("reason") == "no_confirm" for x in _journal_lines()))
+fire(s6, st6)                                   # второй бар подтверждает
+ok("второй подряд бар с тем же цветом отправляет сигнал",
+   len(fake_requests.posted) == 1, fake_requests.posted)
 
 fake_requests.posted.clear()
 fire(s, st)
@@ -387,7 +412,7 @@ for row in up_fast:
     st.push("fast", row)
 st.last_signal_ms = 0                          # пауза уже прошла
 fake_requests.posted.clear()
-fire(s, st)
+fire2(s, st)
 ok("green → none → green: сигнал ЕСТЬ (был баг: монета стреляла один раз)",
    len(fake_requests.posted) == 1, fake_requests.posted)
 
@@ -396,7 +421,7 @@ print("\nрегрессия: отказ HTTP-уведомления не тер�
 s2, st2 = fresh_screener()
 fake_requests.posted.clear()
 fake_requests.post_raises = True
-fire(s2, st2)
+fire2(s2, st2)
 ok("при отказе POST сигнал всё равно в журнале (signal_sent)",
    any(x["kind"] == "signal_sent" for x in _journal_lines()), _journal_lines())
 ok("цвет зафиксирован (журнал — доставка)", st2.last_color == "green", st2.last_color)
@@ -413,7 +438,7 @@ ok("повтор того же цвета не отправляется (цве�
 fake_requests.posted.clear()
 fake_requests.post_status = 422
 s3, st3 = fresh_screener()
-fire(s3, st3)
+fire2(s3, st3)
 ok("не-2xx тоже не теряет сигнал: цвет зафиксирован", st3.last_color == "green", st3.last_color)
 fake_requests.post_status = 200
 
@@ -421,7 +446,7 @@ fake_requests.post_status = 200
 print("\nпауза между сигналами")
 s4, st4 = fresh_screener(cooldown_sec=3600)
 fake_requests.posted.clear()
-fire(s4, st4)
+fire2(s4, st4)
 ok("первый сигнал проходит", len(fake_requests.posted) == 1)
 st4.last_color = "red"                          # цвет сменился, но пауза не истекла
 fake_requests.posted.clear()
@@ -457,7 +482,7 @@ ok("в деталях режекта есть natr и uhlo-значения",
 print("\ndry-run: сигналы без POST и ордеров")
 fake_requests.posted.clear()
 sd, std = fresh_screener(dry_run=True)
-fire(sd, std)
+fire2(sd, std)
 ok("dry-run: POST на бота НЕ идёт", len(fake_requests.posted) == 0,
    fake_requests.posted)
 ok("dry-run: цвет зафиксирован (как после успешной доставки)", std.last_color == "green")
@@ -480,7 +505,7 @@ class _FakeNotifier:
 fake_nt = _FakeNotifier()
 sn, stn = fresh_screener(dry_run=True, notifier=fake_nt)
 sn.journal.close()
-fire(sn, stn)
+fire2(sn, stn)
 ok("dry-run: уведомление ушло в notifier", len(fake_nt.sent) == 1, fake_nt.sent)
 ok("dry-run: в уведомлении символ и сторона",
    fake_nt.sent and "TESTUSDT" in fake_nt.sent[0] and "Buy" in fake_nt.sent[0],

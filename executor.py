@@ -21,12 +21,12 @@ executor.py — исполнительный модуль DCA-бота на Bybi
 
 Сетевой слой — собственный тонкий клиент Bybit v5 (REST, только stdlib +
 requests), без ccxt. В live-режиме ордера идут на Testnet (demo-контур);
-в paper-режиме исполнение симулируется по тестовому тикеру, ордера на биржу
-не уходят.
+в paper-режиме исполнение симулируется по публичным котировкам Mainnet
+(реальное движение рынка), ордера на биржу не уходят.
 
 Два режима:
   * paper (по умолчанию) — проверка конвейера «журнал → решение → журнал»,
-    ордера не выставляются; нужен только публичный API Testnet;
+    ордера не выставляются; нужен только публичный API;
   * --live — реальные ордера на Bybit Testnet (нужны API-ключи).
 
 Запуск:
@@ -91,19 +91,57 @@ requests), без ccxt. В live-режиме ордера идут на Testnet 
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
 import logging
 import os
+import random
 import re
 import sys
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any
 
 import requests
+
+# Sprint 3: tenacity для ретраев Bybit API (нормальное логирование через before_sleep)
+try:
+    import tenacity  # type: ignore
+    from tenacity import (  # type: ignore
+        before_sleep_log,
+        retry,
+        retry_if_exception,
+        stop_after_attempt,
+        wait_exponential_jitter,
+    )
+
+    HAS_TENACITY = True
+except ImportError:  # pragma: no cover
+    HAS_TENACITY = False
+    tenacity = None  # type: ignore
+
+    def retry(*a, **kw):  # type: ignore
+        def deco(fn):
+            return fn
+
+        return deco
+
+    def retry_if_exception(*a, **kw):  # type: ignore
+        return None
+
+    def stop_after_attempt(*a, **kw):  # type: ignore
+        return None
+
+    def wait_exponential_jitter(*a, **kw):  # type: ignore
+        return None
+
+    def before_sleep_log(*a, **kw):  # type: ignore
+        return None
 
 # ── reference-слой ───────────────────────────────────────────────────────────
 
@@ -138,7 +176,7 @@ def _setup_logging() -> None:
 
 _setup_logging()
 
-from pricing import quantize_qty, quantize_price  # noqa: E402
+from pricing import quantize_price, quantize_qty  # noqa: E402
 import bot as rbot  # noqa: E402
 import bot_config  # noqa: E402
 from resilience import (  # noqa: E402
@@ -230,6 +268,26 @@ def _bybit_retryable(exc: BaseException) -> bool:
         isinstance(exc, ResponseError) and exc.retryable)
 
 
+# Sprint 3: tenacity-обёртка с нормальным логированием (поверх ResilientCaller)
+# Если tenacity не установлен — no-op, работает только circuit breaker.
+if HAS_TENACITY:
+
+    def _tenacity_retry(fn, *, max_attempts: int = 4):
+        dec = retry(
+            retry=retry_if_exception(_bybit_retryable),
+            stop=stop_after_attempt(max_attempts),
+            wait=wait_exponential_jitter(initial=0.4, max=8, jitter=2),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        )
+        return dec(fn)
+
+else:  # fallback
+
+    def _tenacity_retry(fn, *, max_attempts: int = 4):  # type: ignore
+        return fn
+
+
 # ── клиент Bybit v5 ──────────────────────────────────────────────────────────
 
 
@@ -277,6 +335,25 @@ class BybitClient:
         raise BybitApiError(rc, str(data.get("retMsg", "")),
                             retryable=rc in _RETRYABLE_CODES)
 
+    def _call_resilient(self, fn, *, max_attempts: int | None = None) -> Any:
+        """Единая точка ретраев: tenacity (логирование) + ResilientCaller (breaker)."""
+        # tenacity снаружи — логирует каждую паузу перед повтором
+        def _inner():
+            return self.caller.call(fn, retryable=_bybit_retryable, max_attempts=max_attempts)  # type: ignore
+
+        if HAS_TENACITY:
+            # tenacity ретраит только retryable исключения — остальные сразу всплывают
+            dec = retry(
+                retry=retry_if_exception(_bybit_retryable),
+                stop=stop_after_attempt(max_attempts or self.caller.max_attempts),
+                wait=wait_exponential_jitter(initial=0.4, max=8, jitter=2),
+                before_sleep=before_sleep_log(logger, logging.WARNING),
+                reraise=True,
+            )
+            return dec(_inner)()
+        else:
+            return _inner()
+
     def _get(self, path: str, params: dict | None = None,
              signed: bool = False) -> dict:
         params = dict(params or {})
@@ -284,7 +361,7 @@ class BybitClient:
             def fn():
                 r = requests.get(self.base + path, params=params, timeout=10)
                 return self._check(r)
-            return self.caller.call(fn, retryable=_bybit_retryable)
+            return self._call_resilient(fn)
         qs = urllib.parse.urlencode(sorted(params.items()))
         ts = int(time.time() * 1000)
 
@@ -292,7 +369,7 @@ class BybitClient:
             r = requests.get(self.base + path + "?" + qs, timeout=10,
                              headers=self._headers(ts, self._sign(ts, qs)))
             return self._check(r)
-        return self.caller.call(fn, retryable=_bybit_retryable)
+        return self._call_resilient(fn)
 
     def _post(self, path: str, body: dict) -> dict:
         data = json.dumps(body, separators=(",", ":"))
@@ -302,7 +379,7 @@ class BybitClient:
             r = requests.post(self.base + path, data=data, timeout=10,
                               headers=self._headers(ts, self._sign(ts, data)))
             return self._check(r)
-        return self.caller.call(fn, retryable=_bybit_retryable)
+        return self._call_resilient(fn)
 
     # публичные
     def server_time(self) -> int:
@@ -312,7 +389,7 @@ class BybitClient:
             if not 200 <= r.status_code < 300:
                 raise ResponseError(r.status_code, r.text[:200])
             return int(r.json().get("time", 0))
-        return self.caller.call(fn, retryable=_bybit_retryable)
+        return self._call_resilient(fn)
 
     def instruments(self, symbol: str | None = None) -> list[dict]:
         p = {"category": "linear"}
@@ -324,6 +401,30 @@ class BybitClient:
         lst = self._get("/v5/market/tickers",
                         {"category": "linear", "symbol": symbol}).get("list", [])
         return lst[0] if lst else None
+
+    def orderbook(self, symbol: str, limit: int = 1) -> dict:
+        """Лучшие уровни стакана: {"bids": [(px, qty)], "asks": [(px, qty)]}.
+
+        Нужен для maker-выходов и фильтра проскальзывания: решение о том,
+        крестить спред маркетом, принимается по фактической глубине top-of-book.
+        """
+        r = self._get("/v5/market/orderbook",
+                      {"category": "linear", "symbol": symbol,
+                       "limit": str(max(1, min(200, limit)))})
+        book = r or {}
+
+        def levels(key: str) -> list[tuple[float, float]]:
+            out = []
+            for row in book.get(key) or []:
+                try:
+                    px, qty = _f(row[0]), _f(row[1])
+                except Exception:  # noqa: BLE001 — битый уровень пропускаем
+                    continue
+                if px > 0 and qty > 0:
+                    out.append((px, qty))
+            return out
+
+        return {"bids": levels("b"), "asks": levels("a")}
 
     # приватные
     def set_leverage(self, symbol: str, leverage: float) -> dict:
@@ -368,16 +469,312 @@ class BybitClient:
         return lst[0] if lst else None
 
 
+class MainnetQuoteFeed:
+    """Публичный поток котировок Mainnet для paper-симуляции: WS + REST-фолбэк.
+
+    Фоновый поток со своим event loop: подписка tickers.<symbol> по мере
+    запросов символов, app-level ping каждые ping_sec с контролем pong,
+    backoff-реконнект. Пока соединения нет дольше rest_fallback_after_sec,
+    цены освежаются одним REST-запросом /v5/market/tickers (весь linear
+    сразу, ~1 запрос). Основной поток бота только читает готовый словарь
+    цен — запись ведёт один поток, чтение атомарно под GIL, блокировок на
+    горячем пути нет.
+    """
+
+    WS_URL = "wss://stream.bybit.com/v5/public/linear"
+    REST_URL = "https://api.bybit.com/v5/market/tickers"
+
+    def __init__(self, ttl_ms: int = 3000, ping_sec: float = 15,
+                 stale_pong_sec: float = 20, rest_fallback_after_sec: float = 30,
+                 rest_interval_sec: float = 2.0) -> None:
+        self.ttl_ms = ttl_ms
+        self.ping_sec = ping_sec
+        self.stale_pong_sec = stale_pong_sec
+        self.rest_fallback_after_sec = rest_fallback_after_sec
+        self.rest_interval_sec = rest_interval_sec
+        self._prices: dict[str, tuple[int, float]] = {}
+        self._wanted: set[str] = set()
+        self._subscribed: set[str] = set()
+        self._pending: list[str] = []
+        self._lock = threading.Lock()
+        self._stop_evt = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # ── API основного потока ──────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_evt.clear()
+        self._thread = threading.Thread(target=self._run, name="quote-feed",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        if self._thread:
+            self._thread.join(timeout=3)
+
+    def touch(self, symbol: str) -> None:
+        """Попросить котировки символа (идемпотентно, без блокировки надолго)."""
+        with self._lock:
+            if symbol not in self._wanted:
+                self._wanted.add(symbol)
+                self._pending.append(symbol)
+
+    def last_price(self, symbol: str) -> float | None:
+        """Свежая цена из кэша или None (читатель никогда не ходит в сеть)."""
+        self.touch(symbol)
+        hit = self._prices.get(symbol)
+        if not hit or int(time.time() * 1000) - hit[0] > self.ttl_ms:
+            return None
+        return hit[1]
+
+    # ── фоновый поток ─────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        try:
+            import websockets
+        except ImportError:
+            logger.warning("websockets не установлен — котировки только по "
+                           "REST-фолбэку")
+            self._loop_rest_only()
+            return
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._main(websockets))
+        except Exception as e:  # noqa: BLE001 — фид не должен ронять процесс
+            logger.error("лента котировок остановлена: %s", e)
+
+    def _loop_rest_only(self) -> None:
+        """Без websockets: тупо опрашиваем REST раз в rest_interval_sec."""
+        while not self._stop_evt.is_set():
+            n = self._rest_snapshot()
+            if n == 0:
+                time.sleep(self.rest_interval_sec)
+
+    async def _main(self, websockets: Any) -> None:
+        attempt = 0
+        down_since: float | None = None
+        fallback: asyncio.Task | None = None
+        while not self._stop_evt.is_set():
+            try:
+                async with websockets.connect(
+                        self.WS_URL, ping_interval=None, open_timeout=10,
+                        close_timeout=5, max_queue=256) as ws:
+                    attempt = 0
+                    with self._lock:
+                        self._pending.extend(
+                            s for s in self._wanted if s not in self._subscribed)
+                    await self._flush_subscribe(ws)
+                    if down_since is not None:
+                        logger.info("лента котировок восстановилась")
+                        down_since = None
+                    if fallback is not None:
+                        fallback.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await fallback
+                        fallback = None
+                    await self._pump(ws)
+            except Exception as e:
+                if self._stop_evt.is_set():
+                    return
+                with self._lock:
+                    self._subscribed.clear()   # после реконнекта подписка заново
+                if down_since is None:
+                    down_since = time.monotonic()
+                    logger.warning("лента котировок оборвалась (%s)", e)
+                    if self.rest_fallback_after_sec > 0 and fallback is None:
+                        fallback = asyncio.create_task(self._rest_fallback(down_since))
+                attempt += 1
+                delay = min(60.0, 1.0 * 2 ** (attempt - 1)) * (0.7 + 0.6 * random.random())
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._stop_wait(), timeout=delay)
+        if fallback is not None:
+            fallback.cancel()
+
+    async def _stop_wait(self) -> None:
+        while not self._stop_evt.is_set():
+            await asyncio.sleep(0.1)
+
+    async def _flush_subscribe(self, ws: Any) -> None:
+        while True:
+            with self._lock:
+                batch, self._pending = self._pending[:10], self._pending[10:]
+            if not batch:
+                return
+            await ws.send(json.dumps(
+                {"op": "subscribe", "args": [f"tickers.{s}" for s in batch]}))
+            with self._lock:
+                self._subscribed.update(batch)
+
+    async def _pump(self, ws: Any) -> None:
+        """Приём тикеров с подпиской новых символов, ping/pong и сторожем."""
+        last_pong = time.monotonic()
+
+        async def pinger() -> None:
+            nonlocal last_pong
+            while True:
+                await asyncio.sleep(self.ping_sec)
+                await ws.send(json.dumps({"op": "ping"}))
+                sent_at = time.monotonic()
+                await asyncio.sleep(self.stale_pong_sec)
+                if last_pong < sent_at:
+                    raise RuntimeError("нет pong — соединение мёртвое")
+
+        async def subscriber() -> None:
+            while True:
+                await asyncio.sleep(0.3)
+                with self._lock:
+                    dirty = list(self._pending)
+                    self._pending.clear()
+                for i in range(0, len(dirty), 10):
+                    chunk = dirty[i:i + 10]
+                    await ws.send(json.dumps(
+                        {"op": "subscribe", "args": [f"tickers.{s}" for s in chunk]}))
+                    with self._lock:
+                        self._subscribed.update(chunk)
+
+        recv_task: asyncio.Task = asyncio.create_task(ws.recv())
+        aux = [asyncio.create_task(pinger()), asyncio.create_task(subscriber())]
+        try:
+            while not self._stop_evt.is_set():
+                done, _ = await asyncio.wait(
+                    {recv_task, *aux}, timeout=self.stale_pong_sec * 3,
+                    return_when=asyncio.FIRST_COMPLETED)
+                for t in aux:
+                    if t in done:
+                        t.result()
+                if recv_task in done:
+                    raw = recv_task.result()
+                    recv_task = asyncio.create_task(ws.recv())
+                    if '"pong"' in str(raw):
+                        last_pong = time.monotonic()
+                        continue
+                    self._on_ticker(raw)
+                if not done:
+                    raise RuntimeError("лента молчит дольше лимита")
+        finally:
+            recv_task.cancel()
+            for t in aux:
+                t.cancel()
+            await asyncio.gather(recv_task, *aux, return_exceptions=True)
+
+    def _on_ticker(self, raw: str | bytes) -> None:
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            return
+        topic = msg.get("topic") or ""
+        if not topic.startswith("tickers."):
+            return
+        symbol = topic.split(".", 1)[1]
+        data = msg.get("data") or {}
+        try:
+            px = _f(data.get("lastPrice"))
+        except Exception:  # noqa: BLE001
+            return
+        if px > 0:
+            self._prices[symbol] = (int(time.time() * 1000), px)
+
+    async def _rest_fallback(self, down_since: float) -> None:
+        """Пока WS лежит дольше порога — освежать цены одним REST-запросом."""
+        delay = self.rest_fallback_after_sec - (time.monotonic() - down_since)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        logger.warning("WS котировок недоступен дольше %.0f с — REST-фолбэк",
+                       self.rest_fallback_after_sec)
+        while not self._stop_evt.is_set():
+            self._rest_snapshot()
+            await asyncio.sleep(self.rest_interval_sec)
+
+    def _rest_snapshot(self) -> int:
+        """Один запрос /v5/market/tickers → обновить цены всех нужных символов."""
+        wanted = set(self._wanted)
+        if not wanted:
+            return 0
+        try:
+            r = requests.get(self.REST_URL, params={"category": "linear"},
+                             timeout=5)
+            rows = ((r.json() or {}).get("result") or {}).get("list") or []
+        except Exception as e:  # noqa: BLE001
+            logger.debug("REST-фолбэк котировок не удался: %s", e)
+            return 0
+        now = int(time.time() * 1000)
+        n = 0
+        for row in rows:
+            sym = row.get("symbol")
+            if sym not in wanted:
+                continue
+            px = _f(row.get("lastPrice") or row.get("markPrice"))
+            if px > 0:
+                self._prices[sym] = (now, px)
+                n += 1
+        return n
+
+
+class MainnetPublic:
+    """Котировки Mainnet для paper-симуляции: WS-лента + REST-фолбэк.
+
+    Зачем не тестнет: стаканы Testnet по альткоинам заморожены (BEATUSDT
+    3.09 против 0.13 на mainnet), из-за этого TP-лимитки не пересекались,
+    а time_exit закрывался ровно по цене входа — PnL состоял из одних
+    комиссий. Симуляция по mainnet считает PnL по реальному движению рынка.
+
+    Источник цены — MainnetQuoteFeed (публичный WS tickers, при обрыве —
+    один общий REST-запрос). Если ленты нет вовсе (feed=None или цена не
+    успела прийти), работает прежний точечный REST-запрос с TTL-кэшем.
+    """
+
+    BASE = "https://api.bybit.com"
+
+    def __init__(self, feed: MainnetQuoteFeed | None = None,
+                 timeout: float = 5.0, ttl_ms: int = 1500):
+        self.feed = feed
+        self.timeout = timeout
+        self.ttl_ms = ttl_ms
+        self._cache: dict[str, tuple[int, float]] = {}
+
+    def last_price(self, symbol: str) -> float | None:
+        if self.feed is not None:
+            px = self.feed.last_price(symbol)
+            if px is not None:
+                return px
+        now = int(time.time() * 1000)
+        hit = self._cache.get(symbol)
+        if hit and now - hit[0] < self.ttl_ms:
+            return hit[1]
+        p: float | None = None
+        try:
+            r = requests.get(f"{self.BASE}/v5/market/tickers",
+                             params={"category": "linear", "symbol": symbol},
+                             timeout=self.timeout)
+            lst = ((r.json() or {}).get("result") or {}).get("list") or []
+            if lst:
+                p = _f(lst[0].get("lastPrice") or lst[0].get("markPrice"))
+                if p <= 0:
+                    p = None
+        except Exception:
+            p = None
+        if p is not None:
+            self._cache[symbol] = (now, p)
+        return p
+
+
 class PaperClient:
     """Симуляция исполнения для paper-режима: ордера не уходят на биржу.
 
-    Публичные вызовы (время, инструменты, тикер) — реальные, с Testnet.
-    Приватные (ордера, позиции) симулируются локально: маркет-филл сразу по
-    текущей цене, лимитки срабатывают, когда тестовый тикер пересекает уровень.
+    Публичные вызовы (время, инструменты) — реальные, с Testnet; котировки
+    для симуляции — публичный Mainnet (см. MainnetPublic). Приватные
+    (ордера, позиции) симулируются локально: маркет-филл сразу по текущей
+    цене, лимитки срабатывают, когда mainnet-тикер пересекает уровень.
     """
 
-    def __init__(self, cfg: BybitConfig, fee_rate: float = 0.00055):
+    def __init__(self, cfg: BybitConfig, fee_rate: float = 0.00055,
+                 feed: "MainnetQuoteFeed | None" = None):
         self.bybit = BybitClient(cfg)
+        self.mainnet = MainnetPublic(feed=feed)
         self.fee_rate = fee_rate
         self.orders: dict[str, dict] = {}
         self.positions: dict[str, dict] = {}
@@ -390,20 +787,38 @@ class PaperClient:
         return self.bybit.instruments(symbol)
 
     def ticker(self, symbol: str) -> dict | None:
-        try:
-            t = self.bybit.ticker(symbol)
-            if t:
-                p = _f(t.get("lastPrice") or t.get("markPrice"))
-                if p > 0:
-                    self.ref[symbol] = p
-                return t
-        except Exception:
-            pass
+        # Котировки симуляции — публичный Mainnet; фолбэк на тестнет-тикер,
+        # если mainnet недоступен (иначе симуляция ослепла бы целиком).
+        p = self.mainnet.last_price(symbol)
+        if p is None:
+            try:
+                t = self.bybit.ticker(symbol)
+                if t:
+                    p = _f(t.get("lastPrice") or t.get("markPrice")) or None
+            except Exception:
+                p = None
+        if p is not None:
+            self.ref[symbol] = p
+            return {"lastPrice": str(p), "markPrice": str(p)}
         rp = self.ref.get(symbol)
         return ({"lastPrice": str(rp), "markPrice": str(rp)} if rp else None)
 
     def set_leverage(self, symbol: str, leverage: float) -> dict:
         return {}
+
+    def orderbook(self, symbol: str, limit: int = 1) -> dict:
+        """Синтетический стакан вокруг mainnet-цены (спред 0.04%).
+
+        В paper-режиме глубина не моделируется — важен уровень цены:
+        maker-выход ставится у лучшего уровня, фильтр проскальзывания
+        оценивает полуспред по той же синтетике.
+        """
+        px = _f((self.ticker(symbol) or {}).get("lastPrice") or 0)
+        if px <= 0:
+            return {"bids": [], "asks": []}
+        half = max(px * 0.0002, 1e-12)
+        qty = 10.0 ** 9
+        return {"bids": [(px - half, qty)], "asks": [(px + half, qty)]}
 
     def create_order(self, *, symbol: str, side: str, order_type: str, qty: float,
                      price: float | None = None, reduce_only: bool = False,
@@ -497,13 +912,67 @@ class InstrumentInfo:
     max_order_qty: float
     max_notional: float
 
+    def anomaly_reason(self, price: float, entry_usdt: float) -> str | None:
+        """Жёсткая валидация min_qty/qty_step относительно текущей цены.
+
+        Возвращает строку-причину аномалии или None если шаг в порядке.
+        Проверяет что минимальный лот и шаг не раздувают номинал в разы
+        относительно entry_usdt — защита от замороженных стаканов как
+        OPGUSDT (testnet 628 vs mainnet 0.10, min_qty=1 → номинал 628 USDT
+        при entry 20).
+        """
+        if price <= 0 or entry_usdt <= 0:
+            return None
+        # min_qty * price — минимальный номинал одним ордером
+        min_notional = self.min_qty * price
+        step_notional = self.qty_step * price
+        # Порог 5× entry для min_qty — ловит OPG: 1*628=628 > 20*5=100
+        # Для шага порог выше (10×), т.к. для высоковатых инструментов
+        # (BTC 60k *0.001=60 > 20*2) это нормально — минимальный лот уже
+        # превышает entry, а шаг сам по себе не должен блокировать.
+        if self.min_qty > 0 and min_notional > entry_usdt * 5:
+            return (f"min_qty {self.min_qty:g}*price {price:.6g}="
+                    f"{min_notional:.1f} USDT >> entry {entry_usdt:.1f} "
+                    f"(>5×, аномальный лот/цена, вероятно замороженный стакан)")
+        if self.qty_step > 0 and step_notional > entry_usdt * 10:
+            return (f"qty_step {self.qty_step:g}*price {price:.6g}="
+                    f"{step_notional:.1f} USDT > entry*10 — шаг лота аномален")
+        # Доп. проверка: minNotional биржи тоже не должен быть >> entry
+        # (иногда minNotionalValue >> entry из-за кривого инструмента)
+        return None
+
+
+def _validate_instrument_size(
+    info: InstrumentInfo, price: float, entry_usdt: float
+) -> str | None:
+    """Обёртка над InstrumentInfo.anomaly_reason для вызова из DcaBot."""
+    return info.anomaly_reason(price, entry_usdt)
+
+
+def _price_divergence_reason(
+    signal_price: float | None, venue_price: float | None,
+    threshold: float = 5.0
+) -> str | None:
+    """Проверка расхождения цены сигнала (mainnet) и venue (testnet).
+
+    Если обе цены >0 и отношение > threshold (в любую сторону) — вероятно
+    замороженный/битый стакан testnet (OPGUSDT: 0.10 vs 628 ~ 6000×).
+    """
+    if signal_price and venue_price and signal_price > 0 and venue_price > 0:
+        ratio = max(venue_price, signal_price) / min(venue_price, signal_price)
+        if ratio > threshold:
+            return (f"расхождение цен signal {signal_price:.6g} vs "
+                    f"venue {venue_price:.6g} = {ratio:.1f}× > {threshold:g}× — "
+                    f"вероятно замороженный стакан testnet")
+    return None
+
 
 def _parse_instrument(row: dict) -> InstrumentInfo | None:
     lot = row.get("lotSizeFilter") or {}
     prc = row.get("priceFilter") or {}
     lev = row.get("leverageFilter") or {}
     try:
-        return InstrumentInfo(
+        info = InstrumentInfo(
             symbol=str(row.get("symbol", "")),
             qty_step=_f(lot.get("qtyStep") or 1),
             min_qty=_f(lot.get("minOrderQty") or 0),
@@ -512,6 +981,14 @@ def _parse_instrument(row: dict) -> InstrumentInfo | None:
             max_order_qty=_f(lot.get("maxOrderQty") or 0),
             max_notional=_f(lot.get("maxNotionalValue") or 0),
         )
+        # Базовая валидация шагов: биржа не должна отдавать 0/отрицательные шаги
+        if info.qty_step <= 0 or info.tick_size <= 0:
+            logger.warning("битый инструмент %s: qty_step=%s tick=%s",
+                           info.symbol, info.qty_step, info.tick_size)
+            return None
+        if info.min_qty < 0 or info.qty_step < 0:
+            return None
+        return info
     except Exception:
         return None
 
@@ -525,7 +1002,12 @@ class DcaBot:
     def __init__(self, *, p: DcaParams, bp, client: Any, mode: str,
                  journal_path: str, state_path: str, screener_path: str,
                  trail_trigger_pct: float = 0.0, trail_step_pct: float = 0.0,
-                 max_signal_age: int = 300) -> None:
+                 max_signal_age: int = 300,
+                 exit_maker_enabled: bool = True,
+                 exit_maker_timeout_sec: float = 15.0,
+                 max_exit_slippage_pct: float = 0.5,
+                 exit_force_after_sec: float = 180.0,
+                 signal_poll_sec: float = 0.5) -> None:
         self.p = p
         self.bp = bp
         self.client = client
@@ -537,6 +1019,18 @@ class DcaBot:
         self.trail_trigger = trail_trigger_pct
         self.trail_step = trail_step_pct
         self.max_signal_age = max_signal_age
+        # ── защита от проскальзывания на выходах (SC-004: p95 close до 10%) ──
+        # Выход сначала пробует стать maker'ом (PostOnly-лимитка у лучшей
+        # встречной цены) с таймаутом; маркет-ордер разрешён только если
+        # полуспред стакана укладывается в max_exit_slippage_pct, иначе
+        # попытка maker повторяется до дедлайна exit_force_after_sec, после
+        # которого позиция закрывается маркетом безусловно (страховка от
+        # «вечного» выхода по стопу/таймеру).
+        self.exit_maker_enabled = bool(exit_maker_enabled)
+        self.exit_maker_timeout_sec = max(0.0, _f(exit_maker_timeout_sec))
+        self.max_exit_slippage_pct = max(0.0, _f(max_exit_slippage_pct))
+        self.exit_force_after_sec = max(0.0, _f(exit_force_after_sec))
+        self.signal_poll_sec = max(0.05, _f(signal_poll_sec) or 0.5)
         self._instruments: dict[str, InstrumentInfo] = {}
         self._last_prices: dict[str, float] = {}
         self._load_state()
@@ -588,18 +1082,29 @@ class DcaBot:
                     self.state_path)
         self._startup_reconcile()
         last_hb = time.monotonic()
+        # Двухчастотный цикл: новые сигналы вычитываются часто
+        # (signal_poll_sec, по умолчанию 0.5 с — иначе 3-секундный такт
+        # монитора добавлял к задержке сигнал→вход в среднем 1.5 с и в p95
+        # выдавал >2 с), сопровождение циклов — реже (monitor_interval_sec).
+        next_signal_poll = 0.0
+        next_monitor = 0.0
         while True:
             try:
-                self._poll_signals()
-                self._monitor_cycles()
-                self._save_state()
-                if time.monotonic() - last_hb >= self.bp.heartbeat_sec:
-                    last_hb = time.monotonic()
-                    logger.info("heartbeat: открыто циклов=%d обработано сигналов=%d",
-                                sum(1 for c in self.cycles.values()
-                                    if not c.get("closed")),
-                                len(self.processed))
-                time.sleep(self.bp.monitor_interval_sec)
+                now = time.monotonic()
+                if now >= next_signal_poll:
+                    self._poll_signals()
+                    next_signal_poll = now + max(0.05, self.signal_poll_sec)
+                if now >= next_monitor:
+                    self._monitor_cycles()
+                    self._save_state()
+                    next_monitor = now + self.bp.monitor_interval_sec
+                    if now - last_hb >= self.bp.heartbeat_sec:
+                        last_hb = now
+                        logger.info("heartbeat: открыто циклов=%d обработано сигналов=%d",
+                                    sum(1 for c in self.cycles.values()
+                                        if not c.get("closed")),
+                                    len(self.processed))
+                time.sleep(0.05)
             except KeyboardInterrupt:
                 logger.info("остановка по Ctrl+C")
                 self._save_state()
@@ -676,6 +1181,30 @@ class DcaBot:
             return
 
         pt = self._testnet_price(symbol)
+        # ── защита от замороженного стакана testnet (OPGUSDT: 628 vs 0.10) ──
+        # Жесткая валидация цены venue относительно цены сигнала (mainnet)
+        div_reason = _price_divergence_reason(
+            _f(sig.get("price")), pt, threshold=5.0)
+        if div_reason:
+            self._reject(sig_id, "exchange_limits", symbol=symbol,
+                         reason_detail=div_reason)
+            return
+        # Ранняя проверка лота по текущей цене (до открытия цикла):
+        # если у инструмента min_qty*price аномален — отклонить сразу,
+        # не дожидаясь расчёта qty в _open_cycle.
+        if pt and pt > 0:
+            try:
+                pre_info = self._instrument(symbol)
+                if pre_info is not None:
+                    pre_anomaly = _validate_instrument_size(
+                        pre_info, pt, self.p.entry_usdt)
+                    if pre_anomaly:
+                        self._reject(sig_id, "exchange_limits", symbol=symbol,
+                                     reason_detail=pre_anomaly)
+                        return
+            except Exception:
+                pass  # инструмент недоступен — проверим в _open_cycle
+
         self.journal.write("signal_received", signal_id=sig_id, symbol=symbol,
                            price_mainnet=sig.get("price"),
                            price_venue=sig.get("price_venue") or "bybit_mainnet",
@@ -756,6 +1285,23 @@ class DcaBot:
             self._reject(sig_id, "exchange_limits", symbol=symbol,
                          reason_detail=f"плечо {self.p.leverage} > max "
                                        f"{info.max_leverage}")
+            return
+        # ── жёсткая валидация лота относительно текущей цены (1114/906) ──
+        # Проверка расхождения цен повторно (на случай прямого вызова _open_cycle)
+        sig_price = _f(sig.get("price"))
+        div_reason = _price_divergence_reason(sig_price, ref if pt else None, threshold=5.0)
+        # Если ref взят из signal_price (pt отсутствует), сравнение не нужно
+        if pt is not None:
+            # pt уже в ref, но проверяем именно pt vs signal
+            div_reason = _price_divergence_reason(sig_price, pt, threshold=5.0)
+            if div_reason:
+                self._reject(sig_id, "exchange_limits", symbol=symbol,
+                             reason_detail=div_reason)
+                return
+        anomaly = _validate_instrument_size(info, ref, self.p.entry_usdt)
+        if anomaly:
+            self._reject(sig_id, "exchange_limits", symbol=symbol,
+                         reason_detail=anomaly)
             return
 
         qty = quantize_qty(self.p.entry_usdt / ref, info.qty_step)
@@ -966,55 +1512,237 @@ class DcaBot:
             self._close(c, "take_profit", price, now, fee)
         elif role == "close":
             self._close(c, c.get("close_reason") or "manual", price, now, fee)
+        elif role == "close_maker":
+            # Частичный филл maker-выхода, замеченный монитором: списать
+            # объём с позиции; полная финализация — в потоке выхода.
+            self._apply_close_fill(c, qty, price, fee, role="close_maker")
+            if _f(c.get("qty")) <= 0:
+                self._finalize_close(c, c.get("close_reason") or "manual")
 
-    def _close(self, c: dict, reason: str, price: float, now: int, fee: float) -> None:
-        for link, o in list(c["links"].items()):
-            if o["role"] in ("tp", "dca"):
-                self._safe_cancel(c, link)
-        c["exit_price"] = price
-        c["exit_ts"] = now
-        c["fee"] += fee
-        gross = ((price - c["avg_entry"]) * c["qty"] if c["side"] == "Buy"
-                 else (c["avg_entry"] - price) * c["qty"])
-        c["pnl"] = gross - c["fee"]
-        c["closed"] = True
-        self.journal.write("order_filled", signal_id=c["signal_id"],
-                           cycle_id=c["cycle_id"], symbol=c["symbol"],
-                           role="close", mode="close",
-                           expected_price=c["tp_price"],
-                           avg_fill_price=round(price, 8),
-                           price_venue="bybit_testnet",
-                           ts_signal=c["signal_ts"], ts_confirmed=now)
-        self.journal.cycle_closed(c["cycle_id"], c["symbol"],
-                                  exit_reason=reason, pnl=round(c["pnl"], 4),
-                                  close_ts=now)
-        logger.info("цикл %s закрыт: %s pnl=%.4f", c["symbol"], reason, c["pnl"])
-        self.cycles.pop(c["cycle_id"], None)
+    # ── выход с защитой от проскальзывания ────────────────────────────────────
 
     def _market_close(self, c: dict, reason: str) -> None:
+        """Закрыть позицию, не кроша её в тонкий стакан.
+
+        1. Maker-фаза: PostOnly-лимитка у лучшей встречной цены с таймаутом
+           exit_maker_timeout_sec; частичные филлы списываются с позиции.
+        2. Маркет разрешён только при полуспреде <= max_exit_slippage_pct;
+           иначе попытка maker повторяется до дедлайна exit_force_after_sec
+           (событие exit_deferred в журнале).
+        3. После дедлайна маркет уходит безусловно: стоп/таймер обязаны
+           исполняться. Неисполнение не роняет цикл — монитор повторит.
+        """
         for link, o in list(c["links"].items()):
             if o["role"] in ("tp", "dca"):
                 self._safe_cancel(c, link)
-        link = _link(c["signal_id"], f"_c_{reason}")
         c["close_reason"] = reason
         exit_side = "Sell" if c["side"] == "Buy" else "Buy"
+        deadline = time.time() + self.exit_force_after_sec
+        maker_seq = int(c.get("maker_seq") or 0)
+        while True:
+            if _f(c.get("qty")) <= 0:
+                self._finalize_close(c, c.get("close_reason") or reason)
+                return
+            if self.exit_maker_enabled and self.exit_maker_timeout_sec > 0:
+                maker_seq += 1
+                c["maker_seq"] = maker_seq
+                if self._maker_close_attempt(c, exit_side, maker_seq):
+                    return
+                if _f(c.get("qty")) <= 0:
+                    self._finalize_close(c, c.get("close_reason") or reason)
+                    return
+            book = self._expected_exit_price(c, exit_side)
+            if book is None:
+                spread_ok = False          # пустой стакан — крестить нечем
+            else:
+                _, _, half_spread_pct = book
+                spread_ok = (self.max_exit_slippage_pct <= 0 or
+                             half_spread_pct <= self.max_exit_slippage_pct)
+            if not spread_ok and time.time() < deadline:
+                if book is not None:
+                    self.journal.write(
+                        "exit_deferred", cycle_id=c["cycle_id"],
+                        symbol=c["symbol"], reason=reason,
+                        best_price=round(book[0], 10),
+                        mid_price=round(book[1], 10),
+                        half_spread_pct=round(book[2], 4),
+                        limit_pct=self.max_exit_slippage_pct,
+                        deadline_in_sec=round(deadline - time.time(), 1))
+                    logger.warning(
+                        "выход %s (%s) отложен: полуспред %.3f%% > %.3f%% — "
+                        "жду maker-филл вместо маркет-ордера",
+                        c["symbol"], reason, book[2],
+                        self.max_exit_slippage_pct)
+                time.sleep(1.0)            # не крутить горячий цикл по пустому стакану
+                continue
+            if self._market_close_once(c, exit_side):
+                return
+            logger.error("закрытие %s (%s) не исполнилось — повтор на следующем "
+                         "такте монитора", c["symbol"], reason)
+            return
+
+    def _safe_orderbook(self, symbol: str) -> dict:
         try:
-            self._place(c, side=exit_side, order_type="Market", qty=c["qty"],
-                        price=None, reduce_only=True, tif="IOC", role="close",
-                        link=link)
+            ob = self.client.orderbook(symbol)
+        except Exception as e:  # noqa: BLE001
+            self.journal.write("api_error", operation="orderbook",
+                               symbol=symbol, error=str(e))
+            return {"bids": [], "asks": []}
+        return ob if isinstance(ob, dict) else {"bids": [], "asks": []}
+
+    @staticmethod
+    def _best_exit_price(ob: dict, exit_side: str) -> float:
+        """Лучшая встречная цена для выхода: bid для продажи, ask для покупки."""
+        levels = ob.get("bids") if exit_side == "Sell" else ob.get("asks")
+        if not levels:
+            return 0.0
+        return _f(levels[0][0])
+
+    def _expected_exit_price(self, c: dict, exit_side: str):
+        """(лучшая цена выхода, mid, полуспред %) или None, если стакана нет."""
+        ob = self._safe_orderbook(c["symbol"])
+        best = self._best_exit_price(ob, exit_side)
+        opposite = self._best_exit_price(
+            ob, "Buy" if exit_side == "Sell" else "Sell")
+        if best <= 0 or opposite <= 0:
+            return None
+        mid = (best + opposite) / 2
+        if mid <= 0:
+            return None
+        half_spread_pct = abs(mid - best) / mid * 100
+        return best, mid, half_spread_pct
+
+    def _maker_close_attempt(self, c: dict, exit_side: str, seq: int) -> bool:
+        """Одна попытка maker-выхода: PostOnly-лимитка у лучшей встречной цены.
+
+        True — позиция полностью вышла. Частичный филл учитывается, остаток
+        закрывает следующая попытка либо маркет-фаза. Отказ PostOnly
+        (ордер пересёк бы спред) — обычный исход, ведёт к проверке спреда.
+        """
+        ob = self._safe_orderbook(c["symbol"])
+        px = self._best_exit_price(ob, exit_side)
+        if px <= 0:
+            return False
+        px = quantize_price(px, c["tick_size"])
+        link = _link(c["signal_id"], f"_mk{seq}")
+        try:
+            self._place(c, side=exit_side, order_type="Limit", qty=_f(c["qty"]),
+                        price=px, reduce_only=True, tif="PostOnly",
+                        role="close_maker", link=link)
+        except Exception as e:  # noqa: BLE001
+            self.journal.write("api_error", operation="place_maker_close",
+                               symbol=c["symbol"], error=str(e))
+            return False
+        order = self._wait_fill(c, link, int(self.exit_maker_timeout_sec * 1000))
+        status = str((order or {}).get("orderStatus") or "")
+        if status != "Filled":
+            self._safe_cancel(c, link)     # снять остаток зависшей лимитки
+            try:
+                # Филл мог пройти между последним опросом и отменой: дочитать
+                # финальный cumExecQty, иначе позиция разойдётся с биржей.
+                o2 = self.client.get_order(c["symbol"], link)
+                if o2 is not None:
+                    order = o2
+            except Exception:  # noqa: BLE001 — останется последний снапшот
+                pass
+        cum = _f(order.get("cumExecQty")) if order else 0.0
+        if cum > 0:
+            price = _f(order.get("avgPrice") or px)
+            fee = _f(order.get("cumExecFee"))
+            self._apply_close_fill(c, cum, price, fee, role="close_maker")
+        if status == "Filled" or _f(c.get("qty")) <= 0:
+            self._finalize_close(c, c.get("close_reason") or "manual")
+            return True
+        return False
+
+    def _market_close_once(self, c: dict, exit_side: str) -> bool:
+        """Один маркет-IOC на остаток позиции. True — позиция вышла."""
+        reason = c.get("close_reason") or "manual"
+        expected = self._expected_exit_price(c, exit_side)
+        link = _link(c["signal_id"], f"_c_{reason}")
+        try:
+            self._place(c, side=exit_side, order_type="Market",
+                        qty=_f(c["qty"]), price=None, reduce_only=True,
+                        tif="IOC", role="close", link=link)
             order = self._wait_fill(c, link, self.bp.fill_timeout_ms)
-            cum = _f(order.get("cumExecQty", 0)) if order else 0.0
+            cum = _f(order.get("cumExecQty")) if order else 0.0
             if order is None or cum <= 0:
                 raise BybitOrderError("рыночное закрытие не исполнилось")
             price = _f(order.get("avgPrice") or order.get("price"))
-            fee = _f(order.get("cumExecFee", 0))
-            self._on_fill(c, link, "close", cum, price, fee,
-                          int(time.time() * 1000), order)
-        except Exception as e:
+            fee = _f(order.get("cumExecFee"))
+            # Контроль факта: если исполнились хуже ожидаемой цены сильнее
+            # лимита — зафиксировать нарушение (позиция уже вышла, но метрика
+            # должна показывать, где фильтр не спас).
+            if expected is not None and self.max_exit_slippage_pct > 0 \
+                    and expected[0] > 0:
+                adverse = ((expected[0] - price) / expected[0] * 100
+                           if exit_side == "Sell"
+                           else (price - expected[0]) / expected[0] * 100)
+                if adverse > self.max_exit_slippage_pct:
+                    self.journal.write("exit_slippage_breach",
+                                       cycle_id=c["cycle_id"],
+                                       symbol=c["symbol"],
+                                       expected_price=round(expected[0], 10),
+                                       filled_price=round(price, 10),
+                                       slippage_pct=round(adverse, 4),
+                                       limit_pct=self.max_exit_slippage_pct)
+            self._apply_close_fill(c, cum, price, fee, role="close")
+        except Exception as e:  # noqa: BLE001
             self.journal.write("api_error", operation="market_close",
                                symbol=c["symbol"], reason=reason, error=str(e))
             logger.error("закрытие %s (%s) не удалось: %s",
                          c["symbol"], reason, e)
+            return False
+        if _f(c.get("qty")) <= 0:
+            self._finalize_close(c, reason)
+            return True
+        return False
+
+    def _apply_close_fill(self, c: dict, qty: float, price: float,
+                          fee: float, role: str) -> None:
+        """Списать часть позиции (поддержка частичных филлов выхода)."""
+        now = int(time.time() * 1000)
+        qty = min(qty, _f(c.get("qty")))
+        if qty <= 0:
+            return
+        gross = ((price - c["avg_entry"]) * qty if c["side"] == "Buy"
+                 else (c["avg_entry"] - price) * qty)
+        c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
+        c["fee"] += fee
+        c["qty"] = round(_f(c.get("qty")) - qty, 12)
+        c["exit_price"] = price
+        c["exit_ts"] = now
+        self.journal.write("order_filled", signal_id=c["signal_id"],
+                           cycle_id=c["cycle_id"], symbol=c["symbol"],
+                           role=role, mode="close",
+                           expected_price=c.get("tp_price"),
+                           avg_fill_price=round(price, 8),
+                           qty_closed=qty, qty_left=c["qty"],
+                           price_venue="bybit_testnet",
+                           ts_signal=c["signal_ts"], ts_confirmed=now)
+        logger.info("закрытие %s: %.6g @%.6g, осталось %.6g",
+                    c["symbol"], qty, price, c["qty"])
+
+    def _finalize_close(self, c: dict, reason: str) -> None:
+        """Финализация цикла после полного выхода: PnL, журнал, удаление."""
+        pnl = _f(c.get("realized_pnl")) - c["fee"]
+        c["pnl"] = pnl
+        c["closed"] = True
+        self.journal.cycle_closed(c["cycle_id"], c["symbol"],
+                                  exit_reason=reason, pnl=round(pnl, 4),
+                                  close_ts=int(time.time() * 1000))
+        logger.info("цикл %s закрыт: %s pnl=%.4f", c["symbol"], reason, pnl)
+        self.cycles.pop(c["cycle_id"], None)
+
+    def _close(self, c: dict, reason: str, price: float, now: int, fee: float) -> None:
+        """Выход по TP-лимитке/чужому ордеру: полный объём одной ценой."""
+        for link, o in list(c["links"].items()):
+            if o["role"] in ("tp", "dca"):
+                self._safe_cancel(c, link)
+        c["close_reason"] = reason
+        c["exit_ts"] = now
+        self._apply_close_fill(c, _f(c["qty"]), price, fee, role="close")
+        self._finalize_close(c, reason)
 
     # ── мониторинг ────────────────────────────────────────────────────────────
 
@@ -1281,7 +2009,8 @@ def main(argv: list[str] | None = None) -> int:
 
     dca_raw = bot_config.read_dca_section(args.config)
     p = bot_config.dca_params_from_config(dca_raw)
-    bp = bot_config.bot_params_from_config(bot_config.read_section(args.config, "bot"))
+    bot_section = bot_config.read_section(args.config, "bot")
+    bp = bot_config.bot_params_from_config(bot_section)
     bybit_cfg = BybitConfig.from_dict(
         bot_config.read_section(args.config, "bybit"), env=os.environ)
     sc_raw = bot_config.read_section(args.config, "screener")
@@ -1293,8 +2022,18 @@ def main(argv: list[str] | None = None) -> int:
                      "в config.yml или BYBIT_API_KEY/BYBIT_API_SECRET")
         return 1
 
+    # Лента публичных котировок Mainnet для paper-симуляции: PnL считается
+    # по реальному движению рынка, а не по замороженным стаканам Testnet.
+    feed = None
+    if mode == "paper":
+        feed = MainnetQuoteFeed(
+            ttl_ms=int(_f(dca_raw.get("quote_feed_ttl_ms") or 3000)),
+            rest_fallback_after_sec=_f(dca_raw.get("quote_rest_fallback_sec") or 30),
+        )
+        feed.start()
+
     client = BybitClient(bybit_cfg) if mode == "live" else PaperClient(
-        bybit_cfg, fee_rate=p.fee_rate)
+        bybit_cfg, fee_rate=p.fee_rate, feed=feed)
 
     try:
         st = client.server_time()
@@ -1315,11 +2054,20 @@ def main(argv: list[str] | None = None) -> int:
         trail_trigger_pct=_f(dca_raw.get("trail_trigger_pct") or 0),
         trail_step_pct=_f(dca_raw.get("trail_step_pct") or 0),
         max_signal_age=args.max_signal_age,
+        exit_maker_enabled=bool(dca_raw.get("exit_maker_enabled", True)),
+        exit_maker_timeout_sec=_f(dca_raw.get("exit_maker_timeout_sec") or 15),
+        max_exit_slippage_pct=_f(dca_raw.get("max_exit_slippage_pct") or 0.5),
+        exit_force_after_sec=_f(dca_raw.get("exit_force_after_sec") or 180),
+        signal_poll_sec=_f(bot_section.get("signal_poll_sec") or 0.5),
     )
-    if args.once:
-        bot.once()
-    else:
-        bot.run()
+    try:
+        if args.once:
+            bot.once()
+        else:
+            bot.run()
+    finally:
+        if feed is not None:
+            feed.stop()
     return 0
 
 

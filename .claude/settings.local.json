@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip list *)",
+      "Bash(mkdir -p specs/001-bybit-dca-testnet/checklists)",
+      "Bash(cp .specify/templates/spec-template.md specs/001-bybit-dca-testnet/spec.md)",
+      "Bash(printf '{\\\\n  \"feature_directory\": \"specs/001-bybit-dca-testnet\"\\\\n}\\\\n')",
+      "Bash(echo \"exit=$? \\(1 = ничего не найдено, это ok\\)\")",
+      "Read(//tmp/**)",
+      "Bash(timeout 240 pip install --quiet requests websockets)",
+      "Bash(python3 -c \"import requests, websockets; print\\('requests', requests.__version__\\); print\\('websockets', websockets.__version__\\)\")",
+      "Bash(python3 -m venv .venv-screener)",
+      "Bash(timeout 300 /tmp/.venv-screener/bin/pip install --quiet requests websockets)",
+      "Bash(/tmp/.venv-screener/bin/python -c \"import requests, websockets; print\\('requests', requests.__version__, '| websockets', websockets.__version__\\)\")",
+      "Bash(python3 -m py_compile specs/001-bybit-dca-testnet/reference/screener.py)",
+      "Bash(python3 specs/001-bybit-dca-testnet/reference/test_screener.py)",
+      "Bash(python3 specs/001-bybit-dca-testnet/reference/test_report.py)",
+      "Bash(python3 -m py_compile specs/001-bybit-dca-testnet/reference/report.py)",
+      "Bash(rm -rf specs/001-bybit-dca-testnet/reference/__pycache__ /tmp/demo-events.jsonl)",
+      "Bash(echo \"--- код завершения поиска: $? ---\")",
+      "Bash(python3 -)",
+      "Bash(python3 tests/test_bot.py)",
+      "Bash(/data/data/com.termux/files/usr/bin/python3 --version)",
+      "Bash(/data/data/com.termux/files/usr/bin/python3 -c ' *)",
+      "Bash(grep -viE 'deprecat|iscoroutine|return asyncio|is_coroutine|^\\\\s*$|ResourceWarning')",
+      "Bash(timeout 120 /data/data/com.termux/files/usr/bin/python3 -c ' *)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(python3 -m py_compile core/*.py server/*.py infra/*.p)",
+      "Bash(timeout 420 /data/data/com.termux/files/usr/bin/pip3 install -r requirements.txt --break-system-packages)",
+      "Bash(timeout 180 /data/data/com.termux/files/usr/bin/python3 -c ' *)"
+    ]
+  }
+}

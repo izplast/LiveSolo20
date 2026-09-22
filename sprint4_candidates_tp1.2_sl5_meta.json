@@ -1,0 +1,86 @@
+{
+  "sprint": 4,
+  "seed": 42,
+  "timestamp": "2026-08-24T21:19:32Z",
+  "git_commit": "172d11c",
+  "holdout_days": 30,
+  "tp_pct": 1.2,
+  "sl_pct": 5.0,
+  "cost_tp": 0.00135,
+  "cost_taker": 0.0021000000000000003,
+  "cost_gap": 0.0024000000000000002,
+  "param_grid": {
+    "natr_below_min": [
+      0.7,
+      0.95,
+      1.2
+    ],
+    "natr_above_max": [
+      4.0,
+      5.0,
+      6.0
+    ],
+    "color_upper": [
+      75.0,
+      80.0,
+      85.0
+    ],
+    "color_lower": [
+      15.0,
+      20.0,
+      25.0
+    ],
+    "long_lows_min": [
+      85.0,
+      90.0,
+      95.0
+    ],
+    "short_highs_max": [
+      85.0,
+      90.0,
+      95.0
+    ],
+    "uhlo_length": [
+      10,
+      15,
+      20
+    ],
+    "cooldown_s": [
+      120,
+      300,
+      600
+    ]
+  },
+  "n_trials": 6561,
+  "dsr_threshold": 0.6,
+  "wf_windows": 4,
+  "stratified": false,
+  "buckets": null,
+  "symbols": [
+    "AKEUSDT",
+    "FARTCOINUSDT",
+    "INJUSDT",
+    "JTOUSDT",
+    "MMTUSDT",
+    "NEARUSDT",
+    "OPENUSDT",
+    "ORDIUSDT",
+    "RAREUSDT",
+    "STRKUSDT",
+    "USELESSUSDT",
+    "WLFIUSDT"
+  ],
+  "n_symbols": 12,
+  "args": {
+    "sample": 21,
+    "seed": 42,
+    "stratified": false,
+    "dsr_threshold": 0.6,
+    "wf_windows": 4,
+    "universe": "data/symbol_universe.txt",
+    "from_raw": "grid_search_raw_v4.pkl",
+    "tp": 1.2,
+    "sl": 5.0
+  },
+  "pbo": 1.0
+}
