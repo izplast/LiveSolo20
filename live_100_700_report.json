@@ -1,52 +1,66 @@
 {
-  "generated": "2026-09-22T07:55:23.669574+00:00",
+  "generated": "2026-09-23T04:13:36.206484+00:00",
   "rank_range": "100-2500",
   "duration_sec": 36000,
   "interval_sec": 60,
   "pool_size": 600,
-  "total_signals": 14,
+  "total_signals": 16,
   "top": [
     {
-      "symbol": "COOKIEUSDT",
-      "rank": 1338,
-      "count": 5,
-      "avg_vol_ratio": 8.766,
-      "avg_atr": 1.338
+      "symbol": "FOLKSUSDT",
+      "rank": 574,
+      "count": 4,
+      "avg_vol_ratio": 5.857,
+      "avg_atr": 1.402
     },
     {
-      "symbol": "WETUSDT",
-      "rank": 1058,
+      "symbol": "B3USDT",
+      "rank": 722,
+      "count": 3,
+      "avg_vol_ratio": 3.673,
+      "avg_atr": 1.758
+    },
+    {
+      "symbol": "NILUSDT",
+      "rank": 558,
+      "count": 3,
+      "avg_vol_ratio": 4.073,
+      "avg_atr": 0.942
+    },
+    {
+      "symbol": "BSVUSDT",
+      "rank": 123,
       "count": 2,
-      "avg_vol_ratio": 3.557,
-      "avg_atr": 1.116
+      "avg_vol_ratio": 2.553,
+      "avg_atr": 0.989
     },
     {
-      "symbol": "BTWUSDT",
-      "rank": 9999,
-      "count": 2,
-      "avg_vol_ratio": 5.229,
-      "avg_atr": 1.101
-    },
-    {
-      "symbol": "CARVUSDT",
-      "rank": 762,
-      "count": 2,
-      "avg_vol_ratio": 2.711,
-      "avg_atr": 1.173
-    },
-    {
-      "symbol": "INUSDT",
-      "rank": 1181,
-      "count": 2,
-      "avg_vol_ratio": 2.992,
-      "avg_atr": 1.038
-    },
-    {
-      "symbol": "CASHCATUSDT",
-      "rank": 208,
+      "symbol": "4USDT",
+      "rank": 779,
       "count": 1,
-      "avg_vol_ratio": 3.942,
-      "avg_atr": 0.935
+      "avg_vol_ratio": 5.22,
+      "avg_atr": 0.91
+    },
+    {
+      "symbol": "DRIFTUSDT",
+      "rank": 1028,
+      "count": 1,
+      "avg_vol_ratio": 2.673,
+      "avg_atr": 2.149
+    },
+    {
+      "symbol": "FIGHTUSDT",
+      "rank": 1474,
+      "count": 1,
+      "avg_vol_ratio": 3.294,
+      "avg_atr": 1.099
+    },
+    {
+      "symbol": "HNTUSDT",
+      "rank": 310,
+      "count": 1,
+      "avg_vol_ratio": 3.443,
+      "avg_atr": 1.354
     }
   ],
   "csv": "live_100_700_signals.csv"

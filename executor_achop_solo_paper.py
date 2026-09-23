@@ -1274,15 +1274,15 @@ class DcaBot:
             except Exception:
                 pass  # инструмент недоступен — проверим в _open_cycle
 
-        # ── ACHOP фильтр (только для bot3: 42.0-58.0 боковик — пропуск) ──
+        # ── ACHOP фильтр (только для bot3: 45.0-55.0 боковик — пропуск) ──
         if "achop" in os.path.basename(__file__) and compute_achop is not None:
             try:
                 achop_val = _achop_for_symbol(symbol)
                 if achop_val is not None:
-                    if 42.0 <= achop_val <= 58.0:
+                    if 45.0 <= achop_val <= 55.0:
                         self._reject(sig_id, "ACHOP Sideways", symbol=symbol,
-                                     reason_detail=f"ACHOP {achop_val:.1f} in 42.0-58.0 боковик")
-                        logger.info("ACHOP фильтр %s %.1f в боковике 42.0-58.0 — пропуск", symbol, achop_val)
+                                     reason_detail=f"ACHOP {achop_val:.1f} in 45.0-55.0 боковик")
+                        logger.info("ACHOP фильтр %s %.1f в боковике 45.0-55.0 — пропуск", symbol, achop_val)
                         return
                     else:
                         logger.info("ACHOP %s %.1f вне боковика — вход разрешён", symbol, achop_val)
