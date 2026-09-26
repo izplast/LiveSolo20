@@ -520,6 +520,7 @@ class MidcapScreener:
                  concurrency: int = 20, dry_run: bool = False,
                   timeline_path: str = "live_100_700_timeline.csv",
                  uhlo_length: int = 15,
+                 uhlo_length_15m: int = 20,
                  ws_url: str | None = None, ws_chunk: int = WS_CHUNK_SIZE):
         self.rank_start = rank_start
         self.rank_end = rank_end
@@ -531,6 +532,7 @@ class MidcapScreener:
         self.natr_min = natr_min
         self.natr_period = natr_period
         self.uhlo_length = uhlo_length
+        self.uhlo_length_15m = uhlo_length_15m
         self.concurrency = concurrency
         self.dry_run = dry_run
         self.ws_url = ws_url
@@ -586,7 +588,7 @@ class MidcapScreener:
         log(f"Seed истории M1+15m для {len(self.symbols)} символов...")
         sem = asyncio.Semaphore(self.concurrency)
         cache_len = max(self.natr_period + 5, 25)
-        cache_len_15m = max(self.uhlo_length + 5, 25)
+        cache_len_15m = max(self.uhlo_length_15m + 5, 25)
 
         async def one(sym: str):
             async with sem:
@@ -653,7 +655,7 @@ class MidcapScreener:
         if natr is None or natr < self.natr_min:
             return (None, None, False, f"NATR<{self.natr_min}")
         uhlo1 = compute_uhlo(klines, length=self.uhlo_length)
-        uhlo15 = compute_uhlo(klines15, length=self.uhlo_length)
+        uhlo15 = compute_uhlo(klines15, length=self.uhlo_length_15m)
         # extreme UHLO filter: 2 предыдущие закрытые 1m свечи [-2],[-3] срезом klines[:-1], klines[:-2]
         if len(klines) >= 17:
             try:
@@ -734,7 +736,7 @@ class MidcapScreener:
             dq = self.klines_cache.get(sig.symbol)
             dq15 = self.klines_cache_15m.get(sig.symbol)
             uhlo1 = compute_uhlo(list(dq), length=self.uhlo_length) if dq and len(dq) >= 15 else None
-            uhlo15 = compute_uhlo(list(dq15), length=self.uhlo_length) if dq15 and len(dq15) >= 15 else None
+            uhlo15 = compute_uhlo(list(dq15), length=self.uhlo_length_15m) if dq15 and len(dq15) >= 15 else None
             color = "green" if sig.side == "Buy" else "red" if sig.side == "Sell" else "none"
             diagnostics = {
                 "uhlo_1m": uhlo1,
@@ -992,7 +994,7 @@ class MidcapScreener:
                     natr = compute_natr(klines, period=self.natr_period)
                     natr_pass = natr is not None and natr >= self.natr_min and (vr is not None and vr >= self.vol_mult)
                     uhlo1 = compute_uhlo(klines, length=self.uhlo_length)
-                    uhlo15 = compute_uhlo(klines15, length=self.uhlo_length) if klines15 else None
+                    uhlo15 = compute_uhlo(klines15, length=self.uhlo_length_15m) if klines15 else None
                     color = classify_color(uhlo1, uhlo15)
                     if fast_uhlo_corner(uhlo1):
                         color = "none"
@@ -1094,7 +1096,7 @@ class MidcapScreener:
         mode = "DRY-RUN" if self.dry_run else f"WS {self.ws_url or BYBIT_WS_PUBLIC}"
         log(f"Мониторинг запущен: {mode}, длительность {self.duration_sec}s "
             f"({self.duration_sec/3600:.1f}ч), пул {len(self.symbols)} # {self.rank_start}-{self.rank_end}")
-        log(f"CSV сигналов: {self.csv_path}, Timeline: {self.timeline_path}, vol_mult={self.vol_mult}, NATR>={self.natr_min}, UHLO={self.uhlo_length}, chunk={self.ws_chunk}")
+        log(f"CSV сигналов: {self.csv_path}, Timeline: {self.timeline_path}, vol_mult={self.vol_mult}, NATR>={self.natr_min}, UHLO={self.uhlo_length}/{self.uhlo_length_15m} (1м/15м), chunk={self.ws_chunk}")
 
         self.start_ts = time.time()
         end_ts = self.start_ts + self.duration_sec
@@ -1296,7 +1298,8 @@ def parse_args(argv=None):
     ap.add_argument("--timeline", type=str, default=DEFAULT_TIMELINE_CSV, help="путь к timeline CSV для бота")
     ap.add_argument("--vol-mult", type=float, default=DEFAULT_VOL_MULT, help="порог volume_ratio")
     ap.add_argument("--natr-min", type=float, default=DEFAULT_NATR_MIN, help="мин NATR")
-    ap.add_argument("--uhlo-length", type=int, default=15, help="длина UHLO для тренда 1м/15м")
+    ap.add_argument("--uhlo-length", type=int, default=15, help="длина UHLO для тренда 1м")
+    ap.add_argument("--uhlo-length-15m", type=int, default=20, help="длина UHLO для тренда 15м")
     ap.add_argument("--concurrency", type=int, default=20, help="параллельных REST-запросов для seed")
     ap.add_argument("--ws-url", type=str, default=None, help="переопределить WS URL (по умолчанию mainnet)")
     ap.add_argument("--testnet", action="store_true", help="использовать Testnet WS wss://stream-testnet.bybit.com/v5/public/linear")
@@ -1321,6 +1324,7 @@ async def amain(argv=None):
         interval_sec=args.interval, duration_sec=args.duration,
         csv_path=args.csv, timeline_path=args.timeline,
         vol_mult=args.vol_mult, natr_min=args.natr_min, uhlo_length=args.uhlo_length,
+        uhlo_length_15m=args.uhlo_length_15m,
         concurrency=args.concurrency, dry_run=args.dry_run,
         ws_url=ws_url, ws_chunk=args.ws_chunk,
     )
