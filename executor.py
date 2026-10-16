@@ -2007,7 +2007,23 @@ class DcaBot:
                     self.journal.write("api_error", operation="cancel_exchange",
                                        symbol=d.symbol, link=d.ref_id,
                                        error=str(e))
+        self._resync_all_stops()
         self._save_state()
+
+    def _resync_all_stops(self) -> None:
+        """После рестарта выставить биржевые стопы всем открытым позициям.
+
+        Позиции, открытые старым кодом (без stop_armed), получают stopLoss
+        сразу на старте, а не после первой докупки.
+        """
+        for c in self.cycles.values():
+            if c.get("closed") or c.get("closing"):
+                continue
+            if not c.get("stop_level") or _f(c.get("qty")) <= 0:
+                continue
+            if c.get("stop_armed"):
+                continue
+            self._sync_exchange_stop(c)
 
     def _finalize_orphan(self, c: dict, default_reason: str) -> None:
         """Цикл, чьей позиции нет на бирже: закрыть локально (T029)."""
