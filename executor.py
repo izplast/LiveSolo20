@@ -1329,7 +1329,16 @@ class DcaBot:
     def _apply_leverage(self, symbol: str) -> None:
         if symbol in self.leverage_applied:
             return
-        self.client.set_leverage(symbol, self.p.leverage)  # FR-018: один раз
+        try:
+            self.client.set_leverage(symbol, self.p.leverage)  # FR-018: один раз
+        except BybitApiError as e:
+            if e.ret_code != 110043:
+                raise
+            # Плечо уже такое (напр. стейт потерян после рестарта): успех.
+            self.journal.write("leverage_already_set", symbol=symbol,
+                               leverage=self.p.leverage, ret_code=110043)
+            logger.info("плечо %s уже %s (110043) — продолжаем",
+                        symbol, self.p.leverage)
         self.leverage_applied.add(symbol)
         logger.info("плечо %s → %s", symbol, self.p.leverage)
 
