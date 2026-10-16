@@ -7,10 +7,10 @@ BOT3_FILE="logs/bot3.log"
 BOT4_FILE="logs/bot4.log"
 LOG="logs/watchdog.log"
 RESTART_CMD="nohup python3 live_screener_midcap.py >> logs/screener_v2_live.log 2>&1 &"
-BOT_RESTART_CMD="nohup python3 bot.py >> logs/bot.log 2>&1 &"
-PAPER_RESTART_CMD="nohup python3 executor_dca_paper.py >> logs/paper_dca.log 2>&1 &"
-BOT3_RESTART_CMD="nohup python3 executor_achop_paper.py >> logs/bot3.log 2>&1 &"
-BOT4_RESTART_CMD="nohup python3 executor_achop_solo_paper.py >> logs/bot4.log 2>&1 &"
+BOT_RESTART_CMD="nohup python3 bot.py --live >> logs/bot.log 2>&1 &"
+PAPER_RESTART_CMD="nohup python3 executor_dca_paper.py --live >> logs/paper_dca.log 2>&1 &"
+BOT3_RESTART_CMD="nohup python3 executor_achop_paper.py --live >> logs/bot3.log 2>&1 &"
+BOT4_RESTART_CMD="nohup python3 executor_achop_solo_paper.py --live >> logs/bot4.log 2>&1 &"
 mkdir -p logs
 echo "$(date '+%Y-%m-%d %H:%M:%S') WATCHDOG started PID $$, watching $FILE, $BOT_FILE, $PAPER_FILE, $BOT3_FILE and $BOT4_FILE (threshold 300s)" >> "$LOG"
 while true; do
@@ -51,6 +51,9 @@ while true; do
     fi
 
     # --- Bot check (bot.py + executor.py) ---
+    # Live-режим: бот1 может висеть как bot.py --live (обёртка) или как
+    # executor.py --live напрямую — оба варианта считаются живыми, чтобы
+    # watchdog не плодил paper-дубль поверх live-процесса.
     BOT_PID=$(pgrep -f "bot\.py" | head -1)
     EXEC_PID=$(pgrep -f "executor\.py" | head -1)
     BOT_AGE=999999
@@ -59,21 +62,23 @@ while true; do
         MTIME_B=$(stat -c %Y "$BOT_FILE" 2>/dev/null || echo 0)
         BOT_AGE=$((NOW_B - MTIME_B))
     fi
-    if [ -z "$BOT_PID" ] || [ "$BOT_AGE" -gt 300 ]; then
-        if [ -z "$BOT_PID" ]; then
+    if [ -z "$BOT_PID" ] && [ -z "$EXEC_PID" ] || [ "$BOT_AGE" -gt 300 ]; then
+        if [ -z "$BOT_PID" ] && [ -z "$EXEC_PID" ]; then
             REASON="no process"
         else
             REASON="stale ${BOT_AGE}s >300s"
         fi
         echo "[$TS] WATCHDOG: $BOT_FILE $REASON -> pkill + restart bot" >> "$LOG"
-        pkill -f executor.py 2>>"$LOG" || true
-        pkill -f bot.py 2>>"$LOG" || true
+        # Точное совпадение: ' executor.py' с пробелом/концом, иначе снесём
+        # executor_dca/achop (у них тот же префикс 'executor').
+        pkill -f " executor\.py( |$)" 2>>"$LOG" || true
+        pkill -f "bot\.py" 2>>"$LOG" || true
         sleep 2
         if pgrep -f "bot\.py" >/dev/null 2>&1; then
-            pkill -9 -f bot.py 2>>"$LOG" || true
+            pkill -9 -f "bot\.py" 2>>"$LOG" || true
         fi
-        if pgrep -f "executor\.py" >/dev/null 2>&1; then
-            pkill -9 -f executor.py 2>>"$LOG" || true
+        if pgrep -f " executor\.py( |$)" >/dev/null 2>&1; then
+            pkill -9 -f " executor\.py( |$)" 2>>"$LOG" || true
         fi
         eval $BOT_RESTART_CMD
         echo "[$TS] WATCHDOG: restarted bot.py PID $! ($REASON)" >> "$LOG"
