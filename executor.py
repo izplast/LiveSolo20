@@ -1508,6 +1508,28 @@ class DcaBot:
         # стоп нужно перевыставить (иначе защищает старую цену).
         self._sync_exchange_stop(c)
 
+    def _tp_filled_close(self, c: dict) -> bool:
+        """TP-лимитка исполнилась, а локальный qty ещё > 0: закрыть как TP.
+
+        Вызывается из _sync_position строго после сверки филлов — обычный
+        путь (филл TP через _on_fill) сюда не доходит, только рассинхрон.
+        """
+        tp_link = c.get("tp_link")
+        if not tp_link:
+            return False
+        try:
+            o = self.client.get_order(c["symbol"], tp_link)
+        except Exception:
+            return False
+        if not o or str(o.get("orderStatus")) != "Filled":
+            return False
+        if _f(o.get("cumExecQty")) <= 0:
+            return False
+        price = _f(o.get("avgPrice") or o.get("price"))
+        fee = _f(o.get("cumExecFee"))
+        self._close(c, "take_profit", price, int(time.time() * 1000), fee)
+        return True
+
     def _sync_exchange_stop(self, c: dict) -> None:
         """Выставить/обновить биржевой stopLoss = stop_level.
 
@@ -1576,6 +1598,9 @@ class DcaBot:
             return  # следующий такт
         ex_qty = _f((pos or {}).get("size") or (pos or {}).get("qty") or 0)
         if _f(c.get("qty")) > 0 and ex_qty <= 0:
+            # size 0, но TP-лимитка исполнилась: это take_profit, а не стоп.
+            if self._tp_filled_close(c):
+                return
             for link, o in list(c["links"].items()):
                 if o["role"] in ("tp", "dca", "close_maker"):
                     self._safe_cancel(c, link)
