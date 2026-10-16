@@ -1911,7 +1911,7 @@ class DcaBot:
                 if mk_link:
                     self._safe_cancel(c, mk_link)
                 ob = self._safe_orderbook(c["symbol"])
-                px = self._best_exit_price(ob, exit_side)
+                px = self._maker_exit_price(ob, exit_side)
                 if px > 0:
                     try:
                         seq = int(c.get("maker_seq") or 0) + 1
@@ -1952,8 +1952,25 @@ class DcaBot:
 
     @staticmethod
     def _best_exit_price(ob: dict, exit_side: str) -> float:
-        """Лучшая встречная цена для выхода: bid для продажи, ask для покупки."""
+        """Лучшая встречная цена для выхода: bid для продажи, ask для покупки.
+
+        Только для ожидаемой цены маркета и полуспреда (_expected_exit_price).
+        Для PostOnly-котировки — _maker_exit_price (не пересекает стакан).
+        """
         levels = ob.get("bids") if exit_side == "Sell" else ob.get("asks")
+        if not levels:
+            return 0.0
+        return _f(levels[0][0])
+
+    @staticmethod
+    def _maker_exit_price(ob: dict, exit_side: str) -> float:
+        """Цена PostOnly-выхода, не пересекающая стакан.
+
+        Sell → лучший ask (встаём в очередь продавцов), Buy → лучший bid.
+        Вызыватель квантует к tick_size; биржа с PostOnly всё равно
+        отклонит пересекающий ордер — такой отказ пишется в журнал.
+        """
+        levels = ob.get("asks") if exit_side == "Sell" else ob.get("bids")
         if not levels:
             return 0.0
         return _f(levels[0][0])
