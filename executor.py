@@ -228,22 +228,34 @@ class BybitConfig:
     api_key: str = ""
     api_secret: str = ""
     testnet: bool = True
+    demo: bool = False
     recv_window_ms: int = 5000
 
     @property
     def base_url(self) -> str:
+        if self.demo:
+            return "https://api-demo.bybit.com"
         return ("https://api-testnet.bybit.com" if self.testnet
                 else "https://api.bybit.com")
+
+    @property
+    def venue_label(self) -> str:
+        if self.demo:
+            return "bybit_demo"
+        return "bybit_testnet" if self.testnet else "bybit_mainnet"
 
     @classmethod
     def from_dict(cls, d: dict, env: dict | None = None) -> "BybitConfig":
         env = env if env is not None else {}
+        demo = str(env.get("BYBIT_DEMO", d.get("demo", "false"))).lower() in (
+            "1", "true", "yes", "y", "on", "4")
         testnet = str(env.get("BYBIT_TESTNET", d.get("testnet", "true"))).lower() in (
             "1", "true", "yes")
         return cls(
             api_key=str(env.get("BYBIT_API_KEY") or d.get("api_key") or ""),
             api_secret=str(env.get("BYBIT_API_SECRET") or d.get("api_secret") or ""),
             testnet=testnet,
+            demo=demo,
             recv_window_ms=int(d.get("recv_window_ms") or 5000),
         )
 
@@ -431,6 +443,18 @@ class BybitClient:
         return self._post("/v5/position/set-leverage", {
             "category": "linear", "symbol": symbol,
             "buyLeverage": str(leverage), "sellLeverage": str(leverage)})
+
+    def set_trading_stop(self, symbol: str, stop_loss: str | None) -> dict:
+        """Биржевой stopLoss на всю позицию (страховка от смерти процесса).
+
+        stop_loss — цена строкой; None/'' — снять (stopLoss '0').
+        Срабатывает маркетом на бирже; ботовый hard_sl остаётся страховкой
+        второго контура (paper, обрыв API, рассинхрон).
+        """
+        return self._post("/v5/position/trading-stop", {
+            "category": "linear", "symbol": symbol,
+            "stopLoss": stop_loss if stop_loss else "0",
+            "positionIdx": 0})
 
     def create_order(self, *, symbol: str, side: str, order_type: str, qty: float,
                      price: float | None = None, reduce_only: bool = False,
@@ -779,6 +803,7 @@ class PaperClient:
         self.orders: dict[str, dict] = {}
         self.positions: dict[str, dict] = {}
         self.ref: dict[str, float] = {}
+        self.stops: dict[str, str] = {}
 
     def server_time(self) -> int:
         return self.bybit.server_time()
@@ -900,6 +925,12 @@ class PaperClient:
             return None
         return {"side": pos["side"], "qty": str(pos["qty"]),
                 "avgPrice": str(pos["avg"]), "positionStatus": "Normal"}
+
+    def set_trading_stop(self, symbol: str, stop_loss: str | None) -> dict:
+        """Paper: стоп не исполняется движком (ботовый hard_sl в мониторе
+        продолжает работать) — только храним значение для паритета API."""
+        self.stops[symbol] = stop_loss if stop_loss else "0"
+        return {}
 
 
 @dataclass
@@ -1469,6 +1500,74 @@ class DcaBot:
             if qty < c["min_qty"]:
                 qty = c["min_qty"]
             self._place_dca(c, next_level, qty)
+        # stop_level зависит от avg_entry — после каждой докупки биржевой
+        # стоп нужно перевыставить (иначе защищает старую цену).
+        self._sync_exchange_stop(c)
+
+    def _sync_exchange_stop(self, c: dict) -> None:
+        """Выставить/обновить биржевой stopLoss = stop_level.
+
+        Страховка от смерти процесса: сработает на бирже, даже если бот мёртв.
+        Ботовый hard_sl остаётся вторым контуром (paper, обрыв API).
+        """
+        lvl = c.get("stop_level")
+        if not lvl or _f(c.get("qty")) <= 0 or c.get("closed") or c.get("closing"):
+            return
+        px = quantize_price(_f(lvl), c["tick_size"])
+        if px <= 0:
+            return
+        try:
+            self.client.set_trading_stop(c["symbol"], str(px))
+            c["stop_price"] = px
+            c["stop_armed"] = True
+        except Exception as e:  # noqa: BLE001
+            self.journal.write("api_error", operation="set_trading_stop",
+                               symbol=c["symbol"], error=str(e))
+
+    def _clear_exchange_stop(self, c: dict) -> None:
+        """Снять биржевой стоп (цикл закрыт — чужой триггер не нужен)."""
+        if not c.get("stop_armed"):
+            return
+        c["stop_armed"] = False
+        try:
+            self.client.set_trading_stop(c["symbol"], None)
+        except Exception as e:  # noqa: BLE001
+            self.journal.write("api_error", operation="clear_trading_stop",
+                               symbol=c["symbol"], error=str(e))
+
+    def _sync_position(self, c: dict) -> None:
+        """Биржа закрыла позицию сама (сработал выставленный stopLoss).
+
+        Без этой сверки бот слал бы маркеты в пустую позицию каждый такт.
+        Цена выхода точно неизвестна — оцениваем по stop_price, помечаем
+        estimated=True в журнале.
+        """
+        try:
+            pos = self.client.get_position(c["symbol"])
+        except Exception:
+            return  # следующий такт
+        ex_qty = _f((pos or {}).get("size") or (pos or {}).get("qty") or 0)
+        if _f(c.get("qty")) > 0 and ex_qty <= 0:
+            for link, o in list(c["links"].items()):
+                if o["role"] in ("tp", "dca", "close_maker"):
+                    self._safe_cancel(c, link)
+            est = _f(c.get("stop_price")) or 0.0
+            if est > 0:
+                qty = _f(c.get("qty"))
+                gross = ((est - c["avg_entry"]) * qty if c["side"] == "Buy"
+                         else (c["avg_entry"] - est) * qty)
+                c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
+                c["exit_price"] = est
+                self.journal.write("order_filled", signal_id=c["signal_id"],
+                                   cycle_id=c["cycle_id"], symbol=c["symbol"],
+                                   role="close", mode="exchange_stop",
+                                   avg_fill_price=round(est, 8),
+                                   qty_closed=qty, qty_left=0,
+                                   estimated=True,
+                                   ts_signal=c["signal_ts"],
+                                   ts_confirmed=int(time.time() * 1000))
+            c["qty"] = 0.0
+            self._finalize_close(c, "exchange_sl")
 
     # ── филлы ─────────────────────────────────────────────────────────────────
 
@@ -1521,65 +1620,98 @@ class DcaBot:
 
     # ── выход с защитой от проскальзывания ────────────────────────────────────
 
-    def _market_close(self, c: dict, reason: str) -> None:
-        """Закрыть позицию, не кроша её в тонкий стакан.
+    def _close_fast(self, c: dict, reason: str) -> None:
+        """hard_sl / кап убытка: отмена TP/DCA + один маркет-IOC сразу.
 
-        1. Maker-фаза: PostOnly-лимитка у лучшей встречной цены с таймаутом
-           exit_maker_timeout_sec; частичные филлы списываются с позиции.
-        2. Маркет разрешён только при полуспреде <= max_exit_slippage_pct;
-           иначе попытка maker повторяется до дедлайна exit_force_after_sec
-           (событие exit_deferred в журнале).
-        3. После дедлайна маркет уходит безусловно: стоп/таймер обязаны
-           исполняться. Неисполнение не роняет цикл — монитор повторит.
+        Без maker-фазы и без фильтра спреда — стоп обязан исполняться.
+        Неисполнение не роняет цикл: стоп на mark всё ещё пробит,
+        _check_exits повторит на следующем такте.
         """
         for link, o in list(c["links"].items()):
             if o["role"] in ("tp", "dca"):
                 self._safe_cancel(c, link)
         c["close_reason"] = reason
         exit_side = "Sell" if c["side"] == "Buy" else "Buy"
-        deadline = time.time() + self.exit_force_after_sec
-        maker_seq = int(c.get("maker_seq") or 0)
-        while True:
-            if _f(c.get("qty")) <= 0:
-                self._finalize_close(c, c.get("close_reason") or reason)
-                return
-            if self.exit_maker_enabled and self.exit_maker_timeout_sec > 0:
-                maker_seq += 1
-                c["maker_seq"] = maker_seq
-                if self._maker_close_attempt(c, exit_side, maker_seq):
-                    return
-                if _f(c.get("qty")) <= 0:
-                    self._finalize_close(c, c.get("close_reason") or reason)
-                    return
+        if _f(c.get("qty")) <= 0:
+            self._finalize_close(c, reason)
+            return
+        if not self._market_close_once(c, exit_side):
+            logger.error("быстрое закрытие %s (%s) не исполнилось — "
+                         "повтор на следующем такте", c["symbol"], reason)
+
+    def _close_slow(self, c: dict, reason: str) -> None:
+        """time_exit / trailing: взвести closing-машину, исполнение по тикам.
+
+        Не блокирует монитор: каждый такт делает максимум один шаг
+        (maker-попытка без ожидания либо маркет при узком спреде/дедлайне),
+        частичные филлы подбирает штатная сверка в _monitor_cycle.
+        """
+        for link, o in list(c["links"].items()):
+            if o["role"] in ("tp", "dca"):
+                self._safe_cancel(c, link)
+        c["close_reason"] = reason
+        c["closing"] = {"reason": reason,
+                        "deadline": time.time() + self.exit_force_after_sec,
+                        "mk_link": None, "mk_ts": 0.0}
+        self._drive_closing(c)
+
+    def _drive_closing(self, c: dict) -> None:
+        """Один шаг closing-машины (вызывается раз в такт монитора)."""
+        st = c.get("closing")
+        if not st:
+            return
+        if _f(c.get("qty")) <= 0:
+            self._finalize_close(c, st.get("reason") or c.get("close_reason") or "manual")
+            c.pop("closing", None)
+            return
+        exit_side = "Sell" if c["side"] == "Buy" else "Buy"
+        if self.exit_maker_enabled and self.exit_maker_timeout_sec > 0:
             book = self._expected_exit_price(c, exit_side)
-            if book is None:
-                spread_ok = False          # пустой стакан — крестить нечем
+            spread_ok = (book is not None and
+                         (self.max_exit_slippage_pct <= 0 or
+                          book[2] <= self.max_exit_slippage_pct))
+            if time.time() >= st["deadline"] or spread_ok:
+                if self._market_close_once(c, exit_side):
+                    c.pop("closing", None)
+                return  # неудача — повтор на следующем такте
+            # Maker без блокирующего ожидания: выставили PostOnly и ушли,
+            # филл подберёт сверка; протухшую (старше таймаута) пересоздаём.
+            mk_link = st.get("mk_link")
+            if mk_link not in c.get("links", {}):
+                mk_link = None
+            if mk_link is None or time.time() - _f(st.get("mk_ts")) > self.exit_maker_timeout_sec:
+                if mk_link:
+                    self._safe_cancel(c, mk_link)
+                ob = self._safe_orderbook(c["symbol"])
+                px = self._best_exit_price(ob, exit_side)
+                if px > 0:
+                    try:
+                        seq = int(c.get("maker_seq") or 0) + 1
+                        c["maker_seq"] = seq
+                        link = _link(c["signal_id"], f"_mk{seq}")
+                        self._place(c, side=exit_side, order_type="Limit",
+                                    qty=_f(c["qty"]), price=quantize_price(px, c["tick_size"]),
+                                    reduce_only=True, tif="PostOnly",
+                                    role="close_maker", link=link)
+                        st["mk_link"] = link
+                        st["mk_ts"] = time.time()
+                    except Exception as e:  # noqa: BLE001 — PostOnly-отказ и т.п.
+                        self.journal.write("api_error", operation="place_maker_close",
+                                           symbol=c["symbol"], error=str(e))
             else:
-                _, _, half_spread_pct = book
-                spread_ok = (self.max_exit_slippage_pct <= 0 or
-                             half_spread_pct <= self.max_exit_slippage_pct)
-            if not spread_ok and time.time() < deadline:
                 if book is not None:
                     self.journal.write(
                         "exit_deferred", cycle_id=c["cycle_id"],
-                        symbol=c["symbol"], reason=reason,
+                        symbol=c["symbol"], reason=st.get("reason"),
                         best_price=round(book[0], 10),
                         mid_price=round(book[1], 10),
                         half_spread_pct=round(book[2], 4),
                         limit_pct=self.max_exit_slippage_pct,
-                        deadline_in_sec=round(deadline - time.time(), 1))
-                    logger.warning(
-                        "выход %s (%s) отложен: полуспред %.3f%% > %.3f%% — "
-                        "жду maker-филл вместо маркет-ордера",
-                        c["symbol"], reason, book[2],
-                        self.max_exit_slippage_pct)
-                time.sleep(1.0)            # не крутить горячий цикл по пустому стакану
-                continue
+                        deadline_in_sec=round(st["deadline"] - time.time(), 1))
+        else:
             if self._market_close_once(c, exit_side):
-                return
-            logger.error("закрытие %s (%s) не исполнилось — повтор на следующем "
-                         "такте монитора", c["symbol"], reason)
-            return
+                c.pop("closing", None)
+            # неудача — повтор на следующем такте
 
     def _safe_orderbook(self, symbol: str) -> dict:
         try:
@@ -1611,49 +1743,6 @@ class DcaBot:
             return None
         half_spread_pct = abs(mid - best) / mid * 100
         return best, mid, half_spread_pct
-
-    def _maker_close_attempt(self, c: dict, exit_side: str, seq: int) -> bool:
-        """Одна попытка maker-выхода: PostOnly-лимитка у лучшей встречной цены.
-
-        True — позиция полностью вышла. Частичный филл учитывается, остаток
-        закрывает следующая попытка либо маркет-фаза. Отказ PostOnly
-        (ордер пересёк бы спред) — обычный исход, ведёт к проверке спреда.
-        """
-        ob = self._safe_orderbook(c["symbol"])
-        px = self._best_exit_price(ob, exit_side)
-        if px <= 0:
-            return False
-        px = quantize_price(px, c["tick_size"])
-        link = _link(c["signal_id"], f"_mk{seq}")
-        try:
-            self._place(c, side=exit_side, order_type="Limit", qty=_f(c["qty"]),
-                        price=px, reduce_only=True, tif="PostOnly",
-                        role="close_maker", link=link)
-        except Exception as e:  # noqa: BLE001
-            self.journal.write("api_error", operation="place_maker_close",
-                               symbol=c["symbol"], error=str(e))
-            return False
-        order = self._wait_fill(c, link, int(self.exit_maker_timeout_sec * 1000))
-        status = str((order or {}).get("orderStatus") or "")
-        if status != "Filled":
-            self._safe_cancel(c, link)     # снять остаток зависшей лимитки
-            try:
-                # Филл мог пройти между последним опросом и отменой: дочитать
-                # финальный cumExecQty, иначе позиция разойдётся с биржей.
-                o2 = self.client.get_order(c["symbol"], link)
-                if o2 is not None:
-                    order = o2
-            except Exception:  # noqa: BLE001 — останется последний снапшот
-                pass
-        cum = _f(order.get("cumExecQty")) if order else 0.0
-        if cum > 0:
-            price = _f(order.get("avgPrice") or px)
-            fee = _f(order.get("cumExecFee"))
-            self._apply_close_fill(c, cum, price, fee, role="close_maker")
-        if status == "Filled" or _f(c.get("qty")) <= 0:
-            self._finalize_close(c, c.get("close_reason") or "manual")
-            return True
-        return False
 
     def _market_close_once(self, c: dict, exit_side: str) -> bool:
         """Один маркет-IOC на остаток позиции. True — позиция вышла."""
@@ -1725,6 +1814,7 @@ class DcaBot:
 
     def _finalize_close(self, c: dict, reason: str) -> None:
         """Финализация цикла после полного выхода: PnL, журнал, удаление."""
+        self._clear_exchange_stop(c)
         pnl = _f(c.get("realized_pnl")) - c["fee"]
         c["pnl"] = pnl
         c["closed"] = True
@@ -1782,34 +1872,47 @@ class DcaBot:
                 c["links"].pop(link, None)
         if c.get("closed"):
             return
+        # Биржа могла закрыть позицию сама (сработал выставленный stopLoss):
+        # сверить остатки до проверки выходов, иначе бот будет слать маркеты
+        # в пустую позицию до бесконечности.
+        if c.get("stop_armed") and not c.get("closing"):
+            self._sync_position(c)
+            if c.get("closed"):
+                return
+        if c.get("closing"):
+            self._drive_closing(c)
+            return
         self._check_exits(c, now)
 
     def _check_exits(self, c: dict, now: int) -> None:
         p = self.p
-        if now - c["open_ts"] >= p.max_hold_minutes * 60_000:
-            self._market_close(c, "time_exit")
-            return
+        # Порядок важен: сначала стопы (hard_sl и кап), потом таймер.
+        # Иначе при одновременном срабатывании выход запишется как time_exit
+        # и статистика стопов занизится.
+        sl_hit = cap_hit = False
+        mark = 0.0
         try:
             t = self.client.ticker(c["symbol"])
         except Exception:
             t = None
-        if not t:
+        if t:
+            mark = _f(t.get("markPrice") or t.get("lastPrice"))
+        if mark > 0:
+            sl = c.get("stop_level")
+            if sl:
+                sl_hit = (mark <= sl) if c["side"] == "Buy" else (mark >= sl)
+            if not sl_hit and p.max_cycle_loss_usdt and c["qty"] > 0:
+                loss = ((c["avg_entry"] - mark) * c["qty"] if c["side"] == "Buy"
+                        else (mark - c["avg_entry"]) * c["qty"])
+                cap_hit = loss >= p.max_cycle_loss_usdt
+        if sl_hit or cap_hit:
+            self._close_fast(c, "hard_sl")
             return
-        mark = _f(t.get("markPrice") or t.get("lastPrice"))
+        if now - c["open_ts"] >= p.max_hold_minutes * 60_000:
+            self._close_slow(c, "time_exit")
+            return
         if mark <= 0:
             return
-        sl = c.get("stop_level")
-        if sl:
-            hit = (mark <= sl) if c["side"] == "Buy" else (mark >= sl)
-            if hit:
-                self._market_close(c, "hard_sl")
-                return
-        if p.max_cycle_loss_usdt and c["qty"] > 0:
-            loss = ((c["avg_entry"] - mark) * c["qty"] if c["side"] == "Buy"
-                    else (mark - c["avg_entry"]) * c["qty"])
-            if loss >= p.max_cycle_loss_usdt:
-                self._market_close(c, "hard_sl")
-                return
         if self.trail_trigger > 0 and self.trail_step > 0:
             upct = ((mark - c["avg_entry"]) / c["avg_entry"] * 100
                     if c["side"] == "Buy"
@@ -1830,7 +1933,7 @@ class DcaBot:
                            if c["side"] == "Buy"
                            else (mark - c["trail_peak"]) / c["trail_peak"] * 100)
                 if retrace >= self.trail_step:
-                    self._market_close(c, "trailing")
+                    self._close_slow(c, "trailing")
 
     # ── сверка на старте ──────────────────────────────────────────────────────
 
