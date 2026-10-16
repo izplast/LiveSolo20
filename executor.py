@@ -1674,23 +1674,31 @@ class DcaBot:
     # ── выход с защитой от проскальзывания ────────────────────────────────────
 
     def _close_fast(self, c: dict, reason: str) -> None:
-        """hard_sl / кап убытка: отмена TP/DCA + один маркет-IOC сразу.
+        """hard_sl / loss_cap: отмена TP/DCA + маркет-IOC сразу и добивка.
 
-        Без maker-фазы и без фильтра спреда — стоп обязан исполняться.
-        Неисполнение не роняет цикл: стоп на mark всё ещё пробит,
-        _check_exits повторит на следующем такте.
+        После первого вызова взводит c["closing"] = {"reason": reason,
+        "fast": True}: каждый такт монитора (_drive_closing) добивает
+        маркет-IOC reduceOnly остаток до qty=0 независимо от текущей
+        mark-цены. Медленный путь (maker/спред) для fast=True не используется.
+        Частичный филл IOC не роняет цикл — остаток забирается следующим
+        тактом, даже если цена откатилась выше стопа.
         """
         for link, o in list(c["links"].items()):
             if o["role"] in ("tp", "dca"):
                 self._safe_cancel(c, link)
         c["close_reason"] = reason
-        exit_side = "Sell" if c["side"] == "Buy" else "Buy"
         if _f(c.get("qty")) <= 0:
+            c.pop("closing", None)
             self._finalize_close(c, reason)
             return
-        if not self._market_close_once(c, exit_side):
-            logger.error("быстрое закрытие %s (%s) не исполнилось — "
-                         "повтор на следующем такте", c["symbol"], reason)
+        c["closing"] = {"reason": reason, "fast": True}
+        exit_side = "Sell" if c["side"] == "Buy" else "Buy"
+        if self._market_close_once(c, exit_side):
+            c.pop("closing", None)
+        else:
+            logger.error("быстрое закрытие %s (%s) не завершено "
+                         "(частичный филл/отказ) — добивка на следующем такте",
+                         c["symbol"], reason)
 
     def _close_slow(self, c: dict, reason: str) -> None:
         """time_exit / trailing: взвести closing-машину, исполнение по тикам.
@@ -1718,6 +1726,12 @@ class DcaBot:
             c.pop("closing", None)
             return
         exit_side = "Sell" if c["side"] == "Buy" else "Buy"
+        if st.get("fast"):
+            # Быстрое закрытие: только маркет-IOC reduceOnly на остаток,
+            # независимо от mark-цены; maker/спред-фильтр не применяется.
+            if self._market_close_once(c, exit_side):
+                c.pop("closing", None)
+            return  # частичный филл/отказ — добивка на следующем такте
         if self.exit_maker_enabled and self.exit_maker_timeout_sec > 0:
             book = self._expected_exit_price(c, exit_side)
             spread_ok = (book is not None and
@@ -1801,7 +1815,9 @@ class DcaBot:
         """Один маркет-IOC на остаток позиции. True — позиция вышла."""
         reason = c.get("close_reason") or "manual"
         expected = self._expected_exit_price(c, exit_side)
-        link = _link(c["signal_id"], f"_c_{reason}")
+        seq = int(c.get("close_seq") or 0) + 1
+        c["close_seq"] = seq
+        link = _link(c["signal_id"], f"_c{seq}")
         try:
             self._place(c, side=exit_side, order_type="Market",
                         qty=_f(c["qty"]), price=None, reduce_only=True,
@@ -1965,8 +1981,11 @@ class DcaBot:
                 loss = ((c["avg_entry"] - mark) * c["qty"] if c["side"] == "Buy"
                         else (mark - c["avg_entry"]) * c["qty"])
                 cap_hit = loss >= p.max_cycle_loss_usdt
-        if sl_hit or cap_hit:
+        if sl_hit:
             self._close_fast(c, "hard_sl")
+            return
+        if cap_hit:
+            self._close_fast(c, "loss_cap")
             return
         if now - c["open_ts"] >= p.max_hold_minutes * 60_000:
             self._close_slow(c, "time_exit")
