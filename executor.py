@@ -444,16 +444,19 @@ class BybitClient:
             "category": "linear", "symbol": symbol,
             "buyLeverage": str(leverage), "sellLeverage": str(leverage)})
 
-    def set_trading_stop(self, symbol: str, stop_loss: str | None) -> dict:
+    def set_trading_stop(self, symbol: str, stop_loss: str | None,
+                           trigger: str = "MarkPrice") -> dict:
         """Биржевой stopLoss на всю позицию (страховка от смерти процесса).
 
         stop_loss — цена строкой; None/'' — снять (stopLoss '0').
+        Триггер всегда MarkPrice явно — ботовый hard_sl тоже считается от mark.
         Срабатывает маркетом на бирже; ботовый hard_sl остаётся страховкой
         второго контура (paper, обрыв API, рассинхрон).
         """
         return self._post("/v5/position/trading-stop", {
             "category": "linear", "symbol": symbol,
             "stopLoss": stop_loss if stop_loss else "0",
+            "slTriggerBy": trigger,
             "positionIdx": 0})
 
     def create_order(self, *, symbol: str, side: str, order_type: str, qty: float,
@@ -926,7 +929,8 @@ class PaperClient:
         return {"side": pos["side"], "qty": str(pos["qty"]),
                 "avgPrice": str(pos["avg"]), "positionStatus": "Normal"}
 
-    def set_trading_stop(self, symbol: str, stop_loss: str | None) -> dict:
+    def set_trading_stop(self, symbol: str, stop_loss: str | None,
+                           trigger: str = "MarkPrice") -> dict:
         """Paper: стоп не исполняется движком (ботовый hard_sl в мониторе
         продолжает работать) — только храним значение для паритета API."""
         self.stops[symbol] = stop_loss if stop_loss else "0"
@@ -1509,6 +1513,9 @@ class DcaBot:
 
         Страховка от смерти процесса: сработает на бирже, даже если бот мёртв.
         Ботовый hard_sl остаётся вторым контуром (paper, обрыв API).
+        Если стоп уже по ту сторону mark — биржа такой отклонит, поэтому
+        сразу закрываем ботом (_close_fast). Прочие ошибки постановки —
+        stop_arm_failed в журнал, повтор на следующем такте.
         """
         lvl = c.get("stop_level")
         if not lvl or _f(c.get("qty")) <= 0 or c.get("closed") or c.get("closing"):
@@ -1516,13 +1523,34 @@ class DcaBot:
         px = quantize_price(_f(lvl), c["tick_size"])
         if px <= 0:
             return
+        mark = self._stop_mark(c["symbol"])
+        if mark > 0 and self._stop_breached(c["side"], mark, px):
+            self._close_fast(c, "hard_sl")
+            return
         try:
-            self.client.set_trading_stop(c["symbol"], str(px))
+            self.client.set_trading_stop(c["symbol"], str(px), trigger="MarkPrice")
             c["stop_price"] = px
             c["stop_armed"] = True
         except Exception as e:  # noqa: BLE001
-            self.journal.write("api_error", operation="set_trading_stop",
-                               symbol=c["symbol"], error=str(e))
+            if self._stop_breached(c["side"], self._stop_mark(c["symbol"]), px):
+                self._close_fast(c, "hard_sl")
+            else:
+                self.journal.write("stop_arm_failed", cycle_id=c["cycle_id"],
+                                   symbol=c["symbol"], stop_price=px,
+                                   error=str(e))
+
+    def _stop_mark(self, symbol: str) -> float:
+        try:
+            t = self.client.ticker(symbol)
+        except Exception:
+            return 0.0
+        return _f((t or {}).get("markPrice") or (t or {}).get("lastPrice"))
+
+    @staticmethod
+    def _stop_breached(side: str, mark: float, stop_px: float) -> bool:
+        if mark <= 0 or stop_px <= 0:
+            return False
+        return (mark <= stop_px) if side == "Buy" else (mark >= stop_px)
 
     def _clear_exchange_stop(self, c: dict) -> None:
         """Снять биржевой стоп (цикл закрыт — чужой триггер не нужен)."""
@@ -1877,6 +1905,13 @@ class DcaBot:
         # в пустую позицию до бесконечности.
         if c.get("stop_armed") and not c.get("closing"):
             self._sync_position(c)
+            if c.get("closed"):
+                return
+        # Стоп не выставлен (ошибка постановки ранее): повтор каждую минуту
+        # такта; при пробитом стопе _sync_exchange_stop закроет сам.
+        if (not c.get("stop_armed") and c.get("stop_level")
+                and not c.get("closing")):
+            self._sync_exchange_stop(c)
             if c.get("closed"):
                 return
         if c.get("closing"):
