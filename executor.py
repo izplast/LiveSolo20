@@ -1623,7 +1623,10 @@ class DcaBot:
 
         Без этой сверки бот слал бы маркеты в пустую позицию каждый такт.
         Цена выхода — фактическая из /v5/position/closed-pnl (фолбэк —
-        /v5/execution/list); realized и fee — оттуда же. stop_price +
+        /v5/execution/list). По докам Bybit closedPnl уже чистый:
+        Position P&L − openFee − closeFee − funding, поэтому он идёт в
+        realized как есть, без повторного вычета fee (openFee+closeFee
+        пишется в журнал только информационно). stop_price +
         estimated=True — только фолбэк, если API не ответил.
         """
         try:
@@ -1640,21 +1643,32 @@ class DcaBot:
                     self._safe_cancel(c, link)
             actual = self._fetch_exchange_exit(c)
             if actual is not None:
-                exit_price, gross, fee = actual
+                exit_price, net, fee, source = actual
                 qty = _f(c.get("qty"))
-                if gross is None:
+                if net is None:
+                    # execution-фолбэк: gross без комиссий — fee вычитается
+                    # штатно через c["fee"] в _finalize_close.
                     gross = ((exit_price - c["avg_entry"]) * qty
                              if c["side"] == "Buy"
                              else (c["avg_entry"] - exit_price) * qty)
-                c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
-                c["fee"] = _f(c.get("fee")) + fee
+                    c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
+                    c["fee"] = _f(c.get("fee")) + fee
+                else:
+                    # closedPnl чистый (комиссии open/close и фандинг уже
+                    # внутри) — он авторитетен за всю позицию: локальный
+                    # c["fee"] (вход/докупки) обнуляем, иначе двойной вычет.
+                    # Сюда доходим только без активных добивок (closing
+                    # guard в мониторе), т.е. prior realized всегда 0.
+                    c["realized_pnl"] = _f(c.get("realized_pnl")) + net
+                    c["fee"] = 0.0
                 c["exit_price"] = exit_price
                 self.journal.write("order_filled", signal_id=c["signal_id"],
                                    cycle_id=c["cycle_id"], symbol=c["symbol"],
                                    role="close", mode="exchange_stop",
                                    avg_fill_price=round(exit_price, 8),
                                    qty_closed=qty, qty_left=0,
-                                   estimated=False, price_source="closed_pnl",
+                                   estimated=False, price_source=source,
+                                   fee=round(fee, 8),
                                    ts_signal=c["signal_ts"],
                                    ts_confirmed=int(time.time() * 1000))
                 c["qty"] = 0.0
@@ -1679,12 +1693,13 @@ class DcaBot:
             self._finalize_close(c, "exchange_sl")
 
     def _fetch_exchange_exit(self, c: dict):
-        """(exit_price, gross|None, fee) из closed-pnl/execution или None.
+        """(exit_price, net|None, fee, source) из closed-pnl/execution или None.
 
-        closed-pnl первичен (avgExitPrice/closedPnl по символу и времени
-        не раньше open_ts); execution/list — фолбэк (средневзвешенная цена
-        и сумма execFee после open_ts). None — API не ответил: вызыватель
-        использует оценку по stop_price.
+        closed-pnl первичен: avgExitPrice + чистый closedPnl (комиссии
+        open/close и фандинг уже внутри) + openFee+closeFee информационно.
+        execution/list — фолбэк: (средневзвешенная цена, None, сумма
+        execFee, "execution") — там gross считается без комиссий.
+        None — API не ответил: вызыватель использует оценку по stop_price.
         """
         symbol = c["symbol"]
         since = int(c.get("open_ts") or 0)
@@ -1702,9 +1717,9 @@ class DcaBot:
         if rows:
             best = self._pick_closed_row(rows, symbol, since)
             if best is not None:
-                px, gross, fee = best
+                px, net, fee = best
                 if px > 0:
-                    return px, gross, fee
+                    return px, net, fee, "closed_pnl"
         execs: list[dict] | None = None
         for method in ("executions", "closed_executions"):
             fn = getattr(self.client, method, None)
@@ -1726,12 +1741,17 @@ class DcaBot:
         if execs:
             agg = self._aggregate_executions(execs, symbol, since)
             if agg is not None and agg[0] > 0:
-                return agg
+                return agg[0], None, agg[2], "execution"
         return None
 
     @staticmethod
     def _pick_closed_row(rows: list[dict], symbol: str, since: int):
-        """Новейшая строка closed-pnl по символу не раньше open_ts."""
+        """Новейшая строка closed-pnl по символу не раньше open_ts.
+
+        Возвращает (avgExitPrice, чистый closedPnl|None, openFee+closeFee).
+        closedPnl чистый по докам Bybit (минус open/close комиссии и
+        фандинг) — вычитать fee повторно нельзя.
+        """
         best = None
         best_ts = -1
         for r in rows:
@@ -1750,12 +1770,14 @@ class DcaBot:
             gp = r.get("closedPnl")
             if gp is None:
                 gp = r.get("realisedPnl", r.get("realizedPnl"))
-            gross = _f(gp) if gp is not None else None
-            fee = _f(r.get("cumExecFee") or r.get("execFee")
-                     or r.get("fee") or r.get("closeFee") or 0)
+            net = _f(gp) if gp is not None else None
+            fee = _f(r.get("openFee") or 0) + _f(r.get("closeFee") or 0)
+            if fee <= 0:
+                fee = _f(r.get("cumExecFee") or r.get("execFee")
+                         or r.get("fee") or r.get("closeFee") or 0)
             if ts >= best_ts:
                 best_ts = ts
-                best = (px, gross, fee)
+                best = (px, net, fee)
         return best
 
     @staticmethod

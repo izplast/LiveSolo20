@@ -1,4 +1,9 @@
-"""Item 5: цена выхода exchange_sl — фактическая из closed-pnl, а не stop_price."""
+"""Item 5 + П.2: цена выхода exchange_sl — фактическая из closed-pnl.
+
+По докам Bybit v5 closedPnl чистый (Position P&L - openFee - closeFee -
+funding), поэтому в realized он идёт как есть, без повторного вычета fee;
+openFee+closeFee пишутся в журнал только информационно.
+"""
 import time
 from exit_fake import FakeClient, make_bot, cyc, check
 
@@ -13,8 +18,11 @@ class PnlClient(FakeClient):
 
 
 now = int(time.time() * 1000)
-rows = [{"symbol": "TSTUSDT", "avgExitPrice": "97.1", "closedPnl": "-2.9",
-         "cumExecFee": "0.07", "updatedTime": str(now)}]
+# Buy 1.0 @100, выход 97.1: position P&L -2.9, openFee 0.05, closeFee 0.07,
+# funding 0 -> чистый closedPnl = -3.02
+rows = [{"symbol": "TSTUSDT", "avgExitPrice": "97.1", "closedPnl": "-3.02",
+         "openFee": "0.05", "closeFee": "0.07",
+         "updatedTime": str(now)}]
 client = PnlClient(rows)
 client.pos_qty = 0.0
 bot = make_bot(client)
@@ -43,8 +51,13 @@ check("один order_filled exchange_stop", len(fills) == 1, fills)
 check("цена из closed-pnl (97.1, не stop 97.5)",
       abs(fills[0].get("avg_fill_price", 0) - 97.1) < 1e-9, fills)
 check("не estimated", fills[0].get("estimated") is False, fills)
-check("pnl = closedPnl - fee_entry - fee_exit",
-      abs(c.get("pnl", 0) - (-2.9 - 0.05 - 0.07)) < 1e-9, c.get("pnl"))
+check("price_source=closed_pnl", fills[0].get("price_source") == "closed_pnl")
+check("fee в журнале = openFee+closeFee (инфо, 0.12)",
+      abs(fills[0].get("fee", 0) - 0.12) < 1e-9, fills)
+check("pnl = чистый closedPnl без повторного вычета (-3.02)",
+      abs(c.get("pnl", 0) - (-3.02)) < 1e-9, c.get("pnl"))
+check("c[fee] обнулён (net уже включает комиссии)",
+      abs(c.get("fee", -1) - 0.0) < 1e-9, c.get("fee"))
 
 # --- фолбэк: API молчит -> оценка по stop_price + estimated=True ---
 client2 = FakeClient()
