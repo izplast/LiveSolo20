@@ -20,20 +20,23 @@ if __name__ != "__main__":
         if not _k.startswith("_"):
             globals()[_k] = getattr(_ref, _k)
 else:
-    # Daemon for prompt: keep alive and launch executor
+    # Daemon for prompt: keep alive and launch executor.
+    # Проброс --live: `python3 bot.py --live` -> `executor.py --live`
+    # (иначе watchdog рестартом скидывал бы live-бота в paper).
     import time, logging, subprocess, sys
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", handlers=[logging.FileHandler("logs/bot_live.log"), logging.StreamHandler()])
     log = logging.getLogger("bot")
-    log.info("bot.py daemon started")
+    _extra = ["--live"] if "--live" in sys.argv else []
+    log.info(f"bot.py daemon started (extra={_extra})")
     try:
-        proc = subprocess.Popen([sys.executable, "executor.py"])
+        proc = subprocess.Popen([sys.executable, "executor.py"] + _extra)
         log.info(f"executor PID {proc.pid}")
         while True:
             log.info("bot heartbeat: alive")
             time.sleep(60)
             if proc.poll() is not None:
                 log.warning(f"executor exited {proc.returncode}, restarting")
-                proc = subprocess.Popen([sys.executable, "executor.py"])
+                proc = subprocess.Popen([sys.executable, "executor.py"] + _extra)
     except KeyboardInterrupt:
         try:
             proc.terminate()

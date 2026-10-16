@@ -97,10 +97,14 @@ bot:
   signal_poll_sec: 0.5
 
 bybit:
-  # Ключи API Testnet (https://testnet.bybit.com → API → Create New Key,
-  # разрешения: Spot/Contract trade — Read-Write). Можно задать переменными
-  # окружения BYBIT_API_KEY / BYBIT_API_SECRET — они имеют приоритет.
-  testnet: true               # true — api-testnet.bybit.com (demo-контур)
+  # Три контура (приоритет demo > testnet > mainnet):
+  #   demo: true    — https://api-demo.bybit.com (демо-трейдинг, котировки как на mainnet)
+  #   testnet: true — https://api-testnet.bybit.com (старый тестнет, стаканы часто заморожены)
+  #   оба false     — https://api.bybit.com (mainnet! не включать без причины)
+  # Переменные окружения BYBIT_DEMO / BYBIT_TESTNET / BYBIT_API_KEY / BYBIT_API_SECRET
+  # имеют приоритет над значениями ниже. Ключи демо — только через env, не в файл.
+  testnet: false              # false — ушли с api-testnet.bybit.com на демо
+  demo: true                  # true — api-demo.bybit.com (ключи пользователя — демо)
   api_key: ""                 # placeholder; заполнить перед --live
   api_secret: ""              # placeholder; заполнить перед --live
   recv_window_ms: 5000
@@ -143,6 +147,19 @@ screener:
                               # выше этого множителя × среднего за 20 свечей И
                               # длинная верхняя тень (0 — защита выключена)
   pump_wick_ratio: 0.5        # порог верхней тени: доля размаха бара
+  # ── Минутные фильтры F6/F4/F7/F1 (Alpha Zoo → 1m; канон tools/indicators.py) ─
+  # Вето поверх UHLO-тренда: режут перегретые входы. Пороги = дефолты CLI
+  # скринеров (--vwap-max-std/--hv-corr-max/--body-range-max/--no-f1).
+  # Скринеры пока берут значения из CLI-дефолтов, а не из этого файла —
+  # при смене здесь дублируй флагами запуска (иначе расхождение).
+  factor_vwap_max_std: 1.5   # F6: макс (close-VWAP20)/std20 для LONG (зеркально SHORT)
+  factor_hv_corr_max: 0.6    # F4: макс corr(high,volume,10) — выше = выдохшийся памп
+  factor_body_range_max: 0.7 # F7: макс тело/диапазон свечи в сторону входа
+  factor_f1_enabled: true    # F1: вето при -sign(dVol)*dClose против стороны
+  factor_enforce: false      # false = shadow (считать+писать в diagnostics, не резать);
+                             # true = жёсткое вето (--factor-enforce). Валидация 14.10:
+                             # veto 92% без роста win% → enforce включать только
+                             # после подбора порогов по shadow-статистике
   short_highs_max: 90.0       # SHORT не входим, пока 1м «зажат на пике» без
                               # импульса вниз: UHLO highs 1м выше порога (цена
                               # прижата к максимумам окна). Красный требует
