@@ -317,16 +317,27 @@ def load_universe_dynamic() -> Dict[str, str]:
         if not symbols:
             raise RuntimeError("build_midcap_universe empty")
         log.info(f"Dynamic universe #100-700 via live_screener_midcap: {len(symbols)} Bybit symbols")
-        # 1a. Фильтрация Testnet через restPrivate.load_markets() — исключить символы не на Testnet (XPLUSUSDT)
+        # 1a. Фильтрация venue через instruments-info — исключить символы не на контуре.
+        # Контур выбирается так же, как в executor.BybitConfig: demo > testnet.
+        # Demo зеркалит mainnet (стаканы живые), testnet часто заморожен.
         try:
-            # Bybit Testnet instruments
+            import os as _os
+            _demo = str(_os.environ.get("BYBIT_DEMO", "")).lower() in ("1", "true", "yes", "y", "on", "4")
+            try:
+                from live_screener_midcap import VENUE_BASE_URL as _venue_base  # noqa
+            except Exception:
+                _venue_base = None
+            if _venue_base:
+                _base = _venue_base
+            else:
+                _base = "https://api-demo.bybit.com" if _demo else "https://api-testnet.bybit.com"
             testnet_symbols: set[str] = set()
             cursor = None
             for _ in range(5):  # пагинация, достаточно для 1000 лимита
                 params = {"category": "linear", "limit": 1000}
                 if cursor:
                     params["cursor"] = cursor
-                r = requests.get("https://api-testnet.bybit.com/v5/market/instruments-info", params=params, timeout=10)
+                r = requests.get(_base + "/v5/market/instruments-info", params=params, timeout=10)
                 j = r.json()
                 lst = (j.get("result") or {}).get("list") or []
                 for it in lst:
@@ -338,11 +349,11 @@ def load_universe_dynamic() -> Dict[str, str]:
             if testnet_symbols:
                 before = len(symbols)
                 symbols = [s for s in symbols if s in testnet_symbols]
-                log.info(f"Testnet filter: {len(symbols)}/{before} Bybit symbols remain (XPLUSUSDT filtered)")
+                log.info(f"Venue filter ({_base}): {len(symbols)}/{before} Bybit symbols remain (XPLUSUSDT filtered)")
             else:
-                log.warning("Testnet symbols empty — skip filter")
+                log.warning("Venue symbols empty — skip filter")
         except Exception as e:
-            log.warning(f"Testnet filter failed (skip): {e}")
+            log.warning(f"Venue filter failed (skip): {e}")
         ensure_markets()
         swap_symbols: Dict[str, str] = {}
         for bsym in symbols:

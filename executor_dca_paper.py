@@ -237,22 +237,34 @@ class BybitConfig:
     api_key: str = ""
     api_secret: str = ""
     testnet: bool = True
+    demo: bool = False
     recv_window_ms: int = 5000
 
     @property
     def base_url(self) -> str:
+        if self.demo:
+            return "https://api-demo.bybit.com"
         return ("https://api-testnet.bybit.com" if self.testnet
                 else "https://api.bybit.com")
+
+    @property
+    def venue_label(self) -> str:
+        if self.demo:
+            return "bybit_demo"
+        return "bybit_testnet" if self.testnet else "bybit_mainnet"
 
     @classmethod
     def from_dict(cls, d: dict, env: dict | None = None) -> "BybitConfig":
         env = env if env is not None else {}
+        demo = str(env.get("BYBIT_DEMO", d.get("demo", "false"))).lower() in (
+            "1", "true", "yes", "y", "on", "4")
         testnet = str(env.get("BYBIT_TESTNET", d.get("testnet", "true"))).lower() in (
             "1", "true", "yes")
         return cls(
             api_key=str(env.get("BYBIT_API_KEY") or d.get("api_key") or ""),
             api_secret=str(env.get("BYBIT_API_SECRET") or d.get("api_secret") or ""),
             testnet=testnet,
+            demo=demo,
             recv_window_ms=int(d.get("recv_window_ms") or 5000),
         )
 
