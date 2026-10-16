@@ -40,6 +40,14 @@ from typing import Any, Dict, List, Tuple
 
 import requests
 
+# --- минутные фильтры F1/F4/F6/F7 (канон: tools/indicators.py) ---
+try:
+    from tools.indicators import minute_factor_gates
+    HAS_FACTOR_GATES = True
+except ImportError:
+    minute_factor_gates = None  # type: ignore
+    HAS_FACTOR_GATES = False
+
 # --- websockets (обязателен для WS-режима) ---
 try:
     import websockets
@@ -81,8 +89,9 @@ DEFAULT_INTERVAL_SEC = 60
 DEFAULT_DURATION_SEC = 10 * 3600  # 10 часов
 DEFAULT_CSV = "live_100_700_signals.csv"
 DEFAULT_TIMELINE_CSV = "live_100_700_timeline.csv"
-DEFAULT_VOL_MULT = 2.5
+DEFAULT_VOL_MULT = 1.5
 DEFAULT_NATR_MIN = 0.90
+DEFAULT_NATR_MAX = 1.5
 DEFAULT_NATR_PERIOD = 14
 WS_CHUNK_SIZE = 10
 WS_PING_INTERVAL = 15
@@ -383,6 +392,37 @@ def compute_uhlo(klines: List[List[Any]], length: int = 15) -> dict | None:
     return {"highs": 100 - u_highs, "lows": 100 - u_lows}
 
 
+def compute_uhlo_last3(klines: List[List[Any]], length: int = 15) -> tuple:
+    """UHLO-состояния трёх последних срезов за один проход.
+
+    Возвращает (u_prev2, u_prev1, u_full) — эквивалент
+    compute_uhlo(klines[:-2]), compute_uhlo(klines[:-1]), compute_uhlo(klines),
+    но без тройного пересчёта (пул 600 монет, каждая оценка — 4 прохода).
+    Формула состояния — та же, что в compute_uhlo этого файла.
+    """
+    n = len(klines)
+    if n < 3:
+        return (None, None, None)
+    unreached_highs, unreached_lows = [], []
+    states: List[dict] = []
+    for idx, k in enumerate(klines):
+        h = float(k[2])
+        l = float(k[3])
+        unreached_highs = [x for x in unreached_highs if h <= x]
+        unreached_lows = [x for x in unreached_lows if l >= x]
+        if len(unreached_highs) > length:
+            unreached_highs.pop()
+        if len(unreached_lows) > length:
+            unreached_lows.pop()
+        if idx >= n - 3:
+            u_highs = 100 * len(unreached_highs) / length
+            u_lows = 100 * len(unreached_lows) / length
+            states.append({"highs": 100 - u_highs, "lows": 100 - u_lows})
+        unreached_highs.insert(0, h)
+        unreached_lows.insert(0, l)
+    return (states[0], states[1], states[2])
+
+
 def classify_color(a: dict | None, b: dict | None) -> str:
     FAST_MIN, FAST_MAX, SLOW_MIN, SLOW_MAX = 80.0, 20.0, 80.0, 20.0
     if not a or not b:
@@ -516,11 +556,17 @@ class MidcapScreener:
     def __init__(self, rank_start: int = MIDCAP_START, rank_end: int = MIDCAP_END,
                  interval_sec: int = DEFAULT_INTERVAL_SEC, duration_sec: int = DEFAULT_DURATION_SEC,
                  csv_path: str = DEFAULT_CSV, vol_mult: float = DEFAULT_VOL_MULT,
-                 natr_min: float = DEFAULT_NATR_MIN, natr_period: int = DEFAULT_NATR_PERIOD,
+                 natr_min: float = DEFAULT_NATR_MIN, natr_max: float = DEFAULT_NATR_MAX, natr_period: int = DEFAULT_NATR_PERIOD,
                  concurrency: int = 20, dry_run: bool = False,
                   timeline_path: str = "live_100_700_timeline.csv",
                  uhlo_length: int = 15,
                  uhlo_length_15m: int = 20,
+                 vwap_max_std: float = 1.5,
+                 hv_corr_max: float = 0.6,
+                 body_range_max: float = 0.7,
+                 f1_enabled: bool = True,
+                 factor_enforce: bool = False,
+                 cooldown_sec: int = 300,
                  ws_url: str | None = None, ws_chunk: int = WS_CHUNK_SIZE):
         self.rank_start = rank_start
         self.rank_end = rank_end
@@ -530,9 +576,18 @@ class MidcapScreener:
         self.timeline_path = timeline_path
         self.vol_mult = vol_mult
         self.natr_min = natr_min
+        self.natr_max = natr_max
         self.natr_period = natr_period
         self.uhlo_length = uhlo_length
         self.uhlo_length_15m = uhlo_length_15m
+        self.vwap_max_std = vwap_max_std
+        self.hv_corr_max = hv_corr_max
+        self.body_range_max = body_range_max
+        self.f1_enabled = f1_enabled
+        self.factor_enforce = factor_enforce
+        self.cooldown_sec = cooldown_sec
+        self.last_signal_ts: Dict[str, int] = {}
+        self._bad_kline: Counter = Counter()
         self.concurrency = concurrency
         self.dry_run = dry_run
         self.ws_url = ws_url
@@ -643,51 +698,80 @@ class MidcapScreener:
         """Чистая функция без побочных эффектов: возвращает reject_reason для RejectedCoins."""
         dq = self.klines_cache.get(sym)
         dq15 = self.klines_cache_15m.get(sym)
-        if not dq or not dq15 or len(dq) < 15 or len(dq15) < 15:
+        if not dq or not dq15:
             return (None, None, False, "no_history")
-        klines = list(dq)
-        klines15 = list(dq15)
+        # Только закрытые бары: WS пишет в deque и confirm=false обновления
+        # формирующейся свечи (перезапись dq[-1]), поэтому режем по wall-clock.
+        # Иначе объём последнего бара неполный, а UHLO/NATR «подглядывают»
+        # внутрь минуты; 15m-бар в момент 1m-confirm почти всегда формирующийся.
+        now_ms = int(time.time() * 1000)
+        klines = [r for r in dq if r[0] + 60_000 <= now_ms]
+        klines15 = [r for r in dq15 if r[0] + 900_000 <= now_ms]
+        # Минимумы: 1m — 21 бар (volume_ratio берёт средний за 20 + текущий),
+        # 15m — не меньше uhlo_length_15m (иначе compute_uhlo делит усечённое
+        # окно на полную длину и classify_color получает смещённый мусор).
+        if len(klines) < max(21, self.uhlo_length) or len(klines15) < max(self.uhlo_length_15m, 15):
+            return (None, None, False, "no_history")
         vr = volume_ratio(klines)
         natr = compute_natr(klines, period=self.natr_period)
-        natr_pass = natr is not None and natr >= self.natr_min and (vr is not None and vr >= self.vol_mult)
         if vr is None or vr < self.vol_mult:
             return (None, None, False, f"vol<{self.vol_mult}")
         if natr is None or natr < self.natr_min:
             return (None, None, False, f"NATR<{self.natr_min}")
-        uhlo1 = compute_uhlo(klines, length=self.uhlo_length)
+        if natr > self.natr_max:
+            return (None, None, False, f"NATR>{self.natr_max}")
+        # Дальше NATR+объём заведомо пройдены — отдельного флага не нужно.
+        rank = self.rank_map.get(sym, 0)
+        natr_v = float(natr)
+        # UHLO 1m для трёх срезов за один проход (было 3 пересчёта).
+        # extreme-фильтр: 2 предыдущие закрытые свечи не в углу 100/0.
+        try:
+            uhlo_prev2, uhlo_prev1, uhlo1 = compute_uhlo_last3(klines, self.uhlo_length)
+        except Exception:
+            uhlo_prev2 = uhlo_prev1 = uhlo1 = None
         uhlo15 = compute_uhlo(klines15, length=self.uhlo_length_15m)
-        # extreme UHLO filter: 2 предыдущие закрытые 1m свечи [-2],[-3] срезом klines[:-1], klines[:-2]
-        if len(klines) >= 17:
-            try:
-                uhlo_prev1 = compute_uhlo(klines[:-1], length=self.uhlo_length)
-                uhlo_prev2 = compute_uhlo(klines[:-2], length=self.uhlo_length)
-                for uh in (uhlo_prev1, uhlo_prev2):
-                    if uh and ((uh.get("highs", 0) >= 99.9 and uh.get("lows", 0) <= 0.1) or (uh.get("lows", 0) >= 99.9 and uh.get("highs", 0) <= 0.1)):
-                        return (None, None, natr_pass, "rejected_uhlo_100_0_extreme")
-            except Exception:
-                pass
+        for uh in (uhlo_prev1, uhlo_prev2):
+            if uh and ((uh.get("highs", 0) >= 99.9 and uh.get("lows", 0) <= 0.1) or (uh.get("lows", 0) >= 99.9 and uh.get("highs", 0) <= 0.1)):
+                return (None, (sym, rank, natr_v), True, "rejected_uhlo_100_0_extreme")
         color = classify_color(uhlo1, uhlo15)
         if fast_uhlo_corner(uhlo1):
             color = "none"
-            # отдельный reject только если natr_pass уже true иначе уже отфильтровано выше
-            if natr_pass:
-                return (None, (sym, self.rank_map.get(sym, 0), float(natr) if natr else 0), True, "uhlo_corner")
-        trend_ok = color in ("green", "red")
-        if natr_pass and not trend_ok:
-            return (None, (sym, self.rank_map.get(sym, 0), float(natr) if natr else 0), True, "NATR_no_trend")
-        if natr_pass and trend_ok:
-            rank = self.rank_map.get(sym, 0)
-            ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            time_str = datetime.now().strftime("%H:%M:%S")
-            price = float(klines[-1][4])
-            side = "Buy" if color == "green" else "Sell"
-            ts_ms = int(klines[-1][0])
-            sig = Signal(timestamp=ts_str, rank=rank, symbol=sym,
-                         price=price, volume_ratio=float(vr) if vr else 0,
-                         atr=float(natr) if natr else 0,
-                         time_str=time_str, ts_ms=ts_ms, side=side)
-            return (sig, None, True, None)
-        return (None, None, False, None)
+            return (None, (sym, rank, natr_v), True, "uhlo_corner")
+        if color not in ("green", "red"):
+            return (None, (sym, rank, natr_v), True, "NATR_no_trend")
+        # Дальше только тренд green/red.
+        side = "Buy" if color == "green" else "Sell"
+        ts_ms = int(klines[-1][0])
+        # Кулдаун по символу: в устойчивом тренде сигнал был бы каждую
+        # минуту (дедуп symbol:ts_ms от этого не спасает) — режем повторы.
+        last_ts = self.last_signal_ts.get(sym)
+        if last_ts is not None and ts_ms - last_ts < self.cooldown_sec * 1000:
+            return (None, None, True, "cooldown")
+        # Минутные фильтры F6/F4/F7/F1: вето перегретых входов.
+        # Недостаток данных = пропуск (pass), явный перегрев = reject.
+        # Валидация на 180 прод-сигналах (TP1.2/SL2.5/90м): veto 92% при
+        # win% vetoed 61.2 vs kept 60.0 — как жёсткое вето не годится,
+        # поэтому дефолт shadow (factor_enforce=False): считаем и пишем
+        # в diagnostics/journal, сигнал идёт дальше.
+        if HAS_FACTOR_GATES:
+            passed, reason, _fvals = minute_factor_gates(
+                klines, side,
+                vwap_max_std=self.vwap_max_std,
+                hv_corr_max=self.hv_corr_max,
+                body_range_max=self.body_range_max,
+                f1_enabled=self.f1_enabled,
+            )
+            if not passed and self.factor_enforce:
+                return (None, None, True, reason)
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        time_str = datetime.now().strftime("%H:%M:%S")
+        price = float(klines[-1][4])
+        sig = Signal(timestamp=ts_str, rank=rank, symbol=sym,
+                     price=price, volume_ratio=float(vr) if vr else 0,
+                     atr=float(natr) if natr else 0,
+                     time_str=time_str, ts_ms=ts_ms, side=side)
+        self.last_signal_ts[sym] = ts_ms
+        return (sig, None, True, None)
 
     def _snapshot_timeline_state(self) -> Tuple[List[Tuple[str,int,float]], int]:
         # Локальный сбор RejectedCoins — без глобального состояния, исключает Race Condition
@@ -745,6 +829,24 @@ class MidcapScreener:
                 "color": color,
                 "natr": sig.atr,
             }
+            # Shadow-режим F-фильтров: что бы решило вето (не блокирует сигнал).
+            if HAS_FACTOR_GATES and dq and len(dq) >= 2:
+                try:
+                    _passed, _reason, _fvals = minute_factor_gates(
+                        list(dq), sig.side,
+                        vwap_max_std=self.vwap_max_std,
+                        hv_corr_max=self.hv_corr_max,
+                        body_range_max=self.body_range_max,
+                        f1_enabled=self.f1_enabled,
+                    )
+                    diagnostics["factor_shadow"] = {
+                        "passed": _passed, "reason": _reason,
+                        "values": {k: (round(v, 4) if v is not None else None)
+                                   for k, v in _fvals.items()},
+                        "enforced": self.factor_enforce,
+                    }
+                except Exception:
+                    pass
         except Exception:
             diagnostics = None
         try:
@@ -781,6 +883,9 @@ class MidcapScreener:
             v = float(k.get("volume") or 0)
             confirm = bool(k.get("confirm"))
         except Exception:
+            # Битая свеча: считаем (раньше молча терялась — при битом потоке
+            # по символу узнавали только по no_history), сводка в timeline-лог.
+            self._bad_kline[symbol] += 1
             return None
         if start == 0 or o == 0:
             return None
@@ -992,7 +1097,7 @@ class MidcapScreener:
                     klines15 = list(dq15)
                     vr = volume_ratio(klines)
                     natr = compute_natr(klines, period=self.natr_period)
-                    natr_pass = natr is not None and natr >= self.natr_min and (vr is not None and vr >= self.vol_mult)
+                    natr_pass = natr is not None and natr >= self.natr_min and natr <= self.natr_max and (vr is not None and vr >= self.vol_mult)
                     uhlo1 = compute_uhlo(klines, length=self.uhlo_length)
                     uhlo15 = compute_uhlo(klines15, length=self.uhlo_length_15m) if klines15 else None
                     color = classify_color(uhlo1, uhlo15)
@@ -1002,14 +1107,28 @@ class MidcapScreener:
                     if natr_pass and not trend_ok:
                         return (None, (sym, self.rank_map.get(sym, 0), float(natr)), True)
                     if natr_pass and trend_ok:
+                        side = "Buy" if color == "green" else "Sell"
+                        last_ts = self.last_signal_ts.get(sym)
+                        if last_ts is not None and last[0] - last_ts < self.cooldown_sec * 1000:
+                            return (None, None, natr_pass)
+                        if HAS_FACTOR_GATES and self.factor_enforce:
+                            passed, _reason, _fvals = minute_factor_gates(
+                                klines, side,
+                                vwap_max_std=self.vwap_max_std,
+                                hv_corr_max=self.hv_corr_max,
+                                body_range_max=self.body_range_max,
+                                f1_enabled=self.f1_enabled,
+                            )
+                            if not passed:
+                                return (None, None, natr_pass)
                         rank = self.rank_map.get(sym, 0)
                         ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         time_str = datetime.now().strftime("%H:%M:%S")
-                        side = "Buy" if color == "green" else "Sell"
                         sig = Signal(timestamp=ts_str, rank=rank, symbol=sym,
                                      price=float(last[4]), volume_ratio=float(vr) if vr else 0,
                                      atr=float(natr) if natr else 0,
                                      time_str=time_str, ts_ms=last[0], side=side)
+                        self.last_signal_ts[sym] = last[0]
                         return (sig, None, True)
                     return (None, None, natr_pass)
                 except Exception as e:
@@ -1047,6 +1166,8 @@ class MidcapScreener:
             if iteration % 5 == 0 and hasattr(self, '_last_rejected_cnt') and self._last_rejected_cnt:
                 top = self._last_rejected_cnt.most_common(3)
                 log(f"RejectedCoins: {dict(self._last_rejected_cnt)} | топ: {top} | примеры: {list(self._last_rejected_examples.items())[:3]}")
+            if iteration % 5 == 0 and self._bad_kline:
+                log(f"BadKline: битых WS-свечей {sum(self._bad_kline.values())} по {len(self._bad_kline)} символам | топ: {self._bad_kline.most_common(5)}")
             # забрать накопленные сигналы за минуту
             async with self._lock:
                 minute_signals = list(self._pending_signals)
@@ -1096,7 +1217,7 @@ class MidcapScreener:
         mode = "DRY-RUN" if self.dry_run else f"WS {self.ws_url or BYBIT_WS_PUBLIC}"
         log(f"Мониторинг запущен: {mode}, длительность {self.duration_sec}s "
             f"({self.duration_sec/3600:.1f}ч), пул {len(self.symbols)} # {self.rank_start}-{self.rank_end}")
-        log(f"CSV сигналов: {self.csv_path}, Timeline: {self.timeline_path}, vol_mult={self.vol_mult}, NATR>={self.natr_min}, UHLO={self.uhlo_length}/{self.uhlo_length_15m} (1м/15м), chunk={self.ws_chunk}")
+        log(f"CSV сигналов: {self.csv_path}, Timeline: {self.timeline_path}, vol_mult={self.vol_mult}, NATR={self.natr_min}..{self.natr_max}, UHLO={self.uhlo_length}/{self.uhlo_length_15m} (1м/15м), chunk={self.ws_chunk}")
 
         self.start_ts = time.time()
         end_ts = self.start_ts + self.duration_sec
@@ -1240,7 +1361,7 @@ class MidcapScreener:
         cnt = Counter(s.symbol for s in self.signals)
         rank_lookup = self.rank_map
         top = cnt.most_common(15)
-        print(f"\n[{now_dt}] === ТОП монет #100-700 по количеству качественных сигналов ===")
+        print(f"\n[{now_dt}] === ТОП монет #{self.rank_start}-{self.rank_end} по количеству качественных сигналов ===")
         for i, (sym, n) in enumerate(top, 1):
             rank = rank_lookup.get(sym, "?")
             sigs = [s for s in self.signals if s.symbol == sym]
@@ -1249,18 +1370,27 @@ class MidcapScreener:
             print(f"[{now_dt}] {i:2d}. Rank #{rank:3} | {sym:12s} | сигналов: {n:3d} | avg Vol_ratio: {avg_vol:.2f} | avg ATR: {avg_atr:.3f}")
         print(f"[{now_dt}] " + "=" * 60)
 
+        # Коридоры ранга — динамические от rank_start..rank_end (были
+        # захардкожены 100-300/301-500/501-700 и молча теряли хвост пула).
         buckets = defaultdict(int)
+        lo, hi = self.rank_start, self.rank_end
+        span = max(1, hi - lo + 1)
+        bounds = [lo + span * i // 3 for i in range(4)]
+        labels = [f"{bounds[i]}-{bounds[i+1]-1}" for i in range(3)]
+        labels[-1] = f"{bounds[2]}-{hi}"
         for s in self.signals:
             r = s.rank
-            if 100 <= r <= 300:
-                buckets["100-300"] += 1
-            elif 301 <= r <= 500:
-                buckets["301-500"] += 1
-            elif 501 <= r <= 700:
-                buckets["501-700"] += 1
+            if r < lo or r > hi:
+                buckets["вне пула"] += 1
+            elif r < bounds[1]:
+                buckets[labels[0]] += 1
+            elif r < bounds[2]:
+                buckets[labels[1]] += 1
+            else:
+                buckets[labels[2]] += 1
         if buckets:
             print(f"[{now_dt}] По коридорам ранга:")
-            for k in ["100-300", "301-500", "501-700"]:
+            for k in labels + (["вне пула"] if buckets.get("вне пула") else []):
                 print(f"[{now_dt}]   #{k}: {buckets[k]} сигналов")
 
     def save_report_json(self, path: str = "live_100_700_report.json"):
@@ -1289,7 +1419,7 @@ class MidcapScreener:
 # CLI
 # ---------------------------------------------------------------------------
 def parse_args(argv=None):
-    ap = argparse.ArgumentParser(description="Midcap #100-700 screener WS (kline.1) — с timeline для бота")
+    ap = argparse.ArgumentParser(description=f"Midcap #{MIDCAP_START}-{MIDCAP_END} screener WS (kline.1) — с timeline для бота")
     ap.add_argument("--rank-start", type=int, default=MIDCAP_START, help="начало ранга (100)")
     ap.add_argument("--rank-end", type=int, default=MIDCAP_END, help="конец ранга (700)")
     ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_SEC, help="таймер timeline сек (60)")
@@ -1298,8 +1428,15 @@ def parse_args(argv=None):
     ap.add_argument("--timeline", type=str, default=DEFAULT_TIMELINE_CSV, help="путь к timeline CSV для бота")
     ap.add_argument("--vol-mult", type=float, default=DEFAULT_VOL_MULT, help="порог volume_ratio")
     ap.add_argument("--natr-min", type=float, default=DEFAULT_NATR_MIN, help="мин NATR")
+    ap.add_argument("--natr-max", type=float, default=DEFAULT_NATR_MAX, help="макс NATR (реджект NATR>max)")
     ap.add_argument("--uhlo-length", type=int, default=15, help="длина UHLO для тренда 1м")
     ap.add_argument("--uhlo-length-15m", type=int, default=20, help="длина UHLO для тренда 15м")
+    ap.add_argument("--vwap-max-std", type=float, default=1.5, help="F6: макс отклонение close от VWAP20 в std (0 — выкл)")
+    ap.add_argument("--hv-corr-max", type=float, default=0.6, help="F4: макс corr(high,volume,10) (1.0 — выкл)")
+    ap.add_argument("--body-range-max", type=float, default=0.7, help="F7: макс тело/диапазон свечи (1.0 — выкл)")
+    ap.add_argument("--no-f1", action="store_true", help="выключить F1 vol_reversal вето")
+    ap.add_argument("--factor-enforce", action="store_true", help="F-фильтры как жёсткое вето (дефолт: shadow, только лог)")
+    ap.add_argument("--cooldown-sec", type=int, default=300, help="пауза между сигналами по одному символу (0 — выкл)")
     ap.add_argument("--concurrency", type=int, default=20, help="параллельных REST-запросов для seed")
     ap.add_argument("--ws-url", type=str, default=None, help="переопределить WS URL (по умолчанию mainnet)")
     ap.add_argument("--testnet", action="store_true", help="использовать Testnet WS wss://stream-testnet.bybit.com/v5/public/linear")
@@ -1323,8 +1460,11 @@ async def amain(argv=None):
         rank_start=args.rank_start, rank_end=args.rank_end,
         interval_sec=args.interval, duration_sec=args.duration,
         csv_path=args.csv, timeline_path=args.timeline,
-        vol_mult=args.vol_mult, natr_min=args.natr_min, uhlo_length=args.uhlo_length,
+        vol_mult=args.vol_mult, natr_min=args.natr_min, natr_max=args.natr_max, uhlo_length=args.uhlo_length,
         uhlo_length_15m=args.uhlo_length_15m,
+        vwap_max_std=args.vwap_max_std, hv_corr_max=args.hv_corr_max,
+        body_range_max=args.body_range_max, f1_enabled=not args.no_f1,
+        factor_enforce=args.factor_enforce, cooldown_sec=args.cooldown_sec,
         concurrency=args.concurrency, dry_run=args.dry_run,
         ws_url=ws_url, ws_chunk=args.ws_chunk,
     )

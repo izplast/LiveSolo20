@@ -1,6 +1,13 @@
 """
 tools/indicators.py — индикаторы для ботов.
 ACHOP: Adaptive Choppiness Index с ALMA-сглаживанием.
+Минутные фильтры F1/F4/F6/F7 (Alpha Zoo → 1m адаптация, IC-проверка
+на 30 монетах x 14 дней, форвард 15 мин; композит IC +0.028):
+  F6 vwap_revert    -(close-vwap20)/std20   — перегрев vs VWAP
+  F4 highvol_corr    -corr(high,volume,10)  — выдохшийся памп
+  F1 vol_reversal    -sign(dVol1)*dClose1    — объёмное подтверждение
+  F7 body_range      (close-open)/(high-low)— убеждённость свечи
+Формат свечей везде: [ts_ms, open, high, low, close, volume].
 """
 from __future__ import annotations
 
@@ -131,3 +138,152 @@ def compute_achop(candles: List[List[Any]], cycle_part: float = 0.15) -> float |
     # ALMA сглаживание
     achop = _alma(chops, window=5, offset=0.85, sigma=6.0)
     return max(0.0, min(100.0, achop))
+
+
+# ---------------------------------------------------------------------------
+# Минутные фильтры F1/F4/F6/F7 (Zoo: alpha101 #12/#44/#5/#101, gtja191_002)
+# ---------------------------------------------------------------------------
+
+def compute_vwap_dev(candles: List[List[Any]], length: int = 20) -> float | None:
+    """F6: отклонение close от VWAP в единицах std(length).
+
+    +2.0 = цена на 2 сигмы выше VWAP (перегрев для LONG).
+    None если свечей < length или объём нулевой.
+    """
+    if len(candles) < length:
+        return None
+    win = candles[-length:]
+    try:
+        tp = [(float(k[2]) + float(k[3]) + float(k[4])) / 3.0 for k in win]
+        vol = [float(k[5]) for k in win]
+        closes = [float(k[4]) for k in win]
+    except (ValueError, TypeError, IndexError):
+        return None
+    vsum = sum(vol)
+    if vsum <= 1e-12:
+        return None
+    vwap = sum(t * v for t, v in zip(tp, vol)) / vsum
+    mean = sum(closes) / len(closes)
+    var = sum((c - mean) ** 2 for c in closes) / len(closes)
+    if var <= 1e-18:
+        return None
+    return (closes[-1] - vwap) / math.sqrt(var)
+
+
+def compute_highvol_corr(candles: List[List[Any]], window: int = 10) -> float | None:
+    """F4: корреляция Пирсона high vs volume за window.
+
+    Высокое +значение = рост на растущем объёме (памп/распределение).
+    None если свечей < window или дисперсия нулевая.
+    """
+    if len(candles) < window:
+        return None
+    win = candles[-window:]
+    try:
+        hs = [float(k[2]) for k in win]
+        vs = [float(k[5]) for k in win]
+    except (ValueError, TypeError, IndexError):
+        return None
+    mh = sum(hs) / window
+    mv = sum(vs) / window
+    cov = sum((h - mh) * (v - mv) for h, v in zip(hs, vs))
+    sh = math.sqrt(sum((h - mh) ** 2 for h in hs))
+    sv = math.sqrt(sum((v - mv) ** 2 for v in vs))
+    if sh <= 1e-12 or sv <= 1e-12:
+        return None
+    corr = cov / (sh * sv)
+    return max(-1.0, min(1.0, corr))
+
+
+def compute_vol_reversal(candles: List[List[Any]]) -> float | None:
+    """F1 (alpha101 #12): -sign(dVol1) * dClose1, в единицах цены.
+
+    > 0 согласуется с лонгом (просадка на растущем объёме = выкуп),
+    < 0 — с шортом. Нужны минимум 2 свечи.
+    """
+    if len(candles) < 2:
+        return None
+    try:
+        dvol = float(candles[-1][5]) - float(candles[-2][5])
+        dclose = float(candles[-1][4]) - float(candles[-2][4])
+    except (ValueError, TypeError, IndexError):
+        return None
+    if dvol > 0:
+        return -dclose
+    if dvol < 0:
+        return dclose
+    return 0.0
+
+
+def compute_body_range(candles: List[List[Any]]) -> float | None:
+    """F7 (alpha101 #101): тело/диапазон последней свечи, [-1, 1].
+
+    +1 = закрытие на хае полным телом (перегрев для LONG).
+    None если диапазон нулевой.
+    """
+    if not candles:
+        return None
+    try:
+        o = float(candles[-1][1])
+        h = float(candles[-1][2])
+        l = float(candles[-1][3])
+        c = float(candles[-1][4])
+    except (ValueError, TypeError, IndexError):
+        return None
+    rng = h - l
+    if rng <= 1e-12:
+        return None
+    return (c - o) / rng
+
+
+def minute_factor_gates(
+    candles: List[List[Any]],
+    side: str,
+    vwap_max_std: float = 1.5,
+    hv_corr_max: float = 0.6,
+    body_range_max: float = 0.7,
+    f1_enabled: bool = True,
+) -> tuple[bool, str | None, dict]:
+    """Каскад минутных фильтров F6/F4/F7/F1 для стороны Buy/Sell.
+
+    Возвращает (passed, reject_reason|None, values dict).
+    Порядок вето: vwap_overext → highvol_corr_pump → body_overext →
+    vol_reversal_against. Недостаток данных = пропуск фильтра (pass),
+    строгий в этом каскаде только явный перегрев.
+    """
+    values: dict = {}
+    is_buy = side == "Buy"
+
+    vwap_dev = compute_vwap_dev(candles)
+    values["vwap_dev"] = vwap_dev
+    if vwap_dev is not None:
+        if is_buy and vwap_dev > vwap_max_std:
+            return (False, "vwap_overext", values)
+        if not is_buy and vwap_dev < -vwap_max_std:
+            return (False, "vwap_overext", values)
+
+    hv_corr = compute_highvol_corr(candles)
+    values["hv_corr"] = hv_corr
+    if hv_corr is not None and hv_corr > hv_corr_max:
+        return (False, "highvol_corr_pump", values)
+
+    body = compute_body_range(candles)
+    values["body_range"] = body
+    if body is not None:
+        if is_buy and body > body_range_max:
+            return (False, "body_overext", values)
+        if not is_buy and body < -body_range_max:
+            return (False, "body_overext", values)
+
+    if f1_enabled:
+        f1 = compute_vol_reversal(candles)
+        values["vol_reversal"] = f1
+        if f1 is not None:
+            if is_buy and f1 < 0:
+                return (False, "vol_reversal_against", values)
+            if not is_buy and f1 > 0:
+                return (False, "vol_reversal_against", values)
+    else:
+        values["vol_reversal"] = None
+
+    return (True, None, values)
