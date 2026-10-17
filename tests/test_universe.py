@@ -15,26 +15,41 @@ import live_screener_midcap as ls
 
 # real CoinGecko data fetched live during this session (symbol -> (coingecko_id, rank))
 CG_ID_RANK = {
-    "PEPE": ("pepe", 60),          # топ-100 -> 1000PEPEUSDT выпадает из пула #100-#2500
+    "PEPE": ("pepe", 62),          # топ-100 -> 1000PEPEUSDT выпадает из пула #100-#2500
     "BONK": ("bonk", 153),
     "BTT": ("bittorrent", 133),
     "FLOKI": ("floki", 170),
     "LUNC": ("terra-luna", 156),
-    "TURBO": ("turbo", 398),
-    "TAG": ("tagger", 396),
-    "XEC": ("ecash", 231),
-    "BABYDOGE": ("baby-doge-coin", 368),
-    "G": ("g-token", 698),          # 0GUSDT -> G
-    "CAT": ("cat-call-agent", 2486),
-    # rate-limited / beyond top-2500 during this session — shown as '—' in the report
-    "MOG": (None, None),
+    "TURBO": ("turbo", 402),
+    "TAG": ("tagger", 397),
+    "XEC": ("ecash", 232),
+    "BABYDOGE": ("baby-doge-coin", 371),
+    # 1000CATUSDT -> CAT: min-rank dedup выбирает simon-s-cat #1040,
+    # а НЕ cat-call-agent #2496 (регрессия point 2).
+    "CAT": ("simon-s-cat", 1040),
+    "MOG": ("mog-coin", 537),
+    "NEX": ("nexus-4", 506),
+    "SATS": ("sats-ordinals", 787),
+    "TOSHI": ("toshi", 492),
+    # числовые тикеры: прежняя нормализация срезала их как префикс (0G->G, 2Z->Z, 4STOCK->STOCK)
+    "0G": ("zero-gravity", 226),
+    "2Z": ("doublezero", 203),
+    "4STOCK": ("4stock", 1877),
+    # NEIROCTO: вне CoinGecko топ-2500 (Bybit base NEIROCTO != CG symbol NEIRO)
     "NEIROCTO": (None, None),
-    "NEX": (None, None),
+    # вне CoinGecko топ-2500
     "RATS": (None, None),
-    "SATS": (None, None),
-    "STOCK": (None, None),
-    "TOSHI": (None, None),
-    "Z": (None, None),
+}
+
+# bybit symbol для каждого префиксного base (19 символов)
+PREFIX_BYBIT = {
+    "PEPE": "1000PEPEUSDT", "BONK": "1000BONKUSDT", "BTT": "1000BTTUSDT",
+    "FLOKI": "1000FLOKIUSDT", "LUNC": "1000LUNCUSDT", "TURBO": "1000TURBOUSDT",
+    "TAG": "1000TAGUSDT", "XEC": "1000XECUSDT", "BABYDOGE": "1000000BABYDOGEUSDT",
+    "CAT": "1000CATUSDT", "MOG": "1000000MOGUSDT", "NEX": "10000NEXUSDT",
+    "SATS": "10000SATSUSDT", "TOSHI": "1000TOSHIUSDT", "0G": "0GUSDT",
+    "2Z": "2ZUSDT", "4STOCK": "4STOCKUSDT", "NEIROCTO": "1000NEIROCTOUSDT",
+    "RATS": "1000RATSUSDT",
 }
 
 
@@ -131,20 +146,43 @@ def test_pepe_not_readded_as_fill():
 
 
 def test_prefix_symbols_report():
-    """Show all prefix-matched symbols: symbol -> coingecko id -> rank (live data)."""
+    """Show all 19 prefix symbols: symbol -> coingecko id -> rank (live data)."""
     print("\n=== Prefix-matched symbols: symbol -> coingecko id -> rank ===")
     print(f"{'bybit symbol':22s} {'base':10s} {'coingecko id':32s} {'rank':>6s}")
-    for base, (cid, rk) in sorted(CG_ID_RANK.items()):
-        # find bybit symbol(s) mapping to this base
-        bybit = [s for s in ("1000PEPEUSDT", "1000BONKUSDT", "1000BTTUSDT", "1000FLOKIUSDT",
-                             "1000LUNCUSDT", "1000TURBOUSDT", "1000TAGUSDT", "1000XECUSDT",
-                             "1000BABYDOGEUSDT", "0GUSDT", "1000CATUSDT")
-                 if ls.normalize_bybit_base(s)[0] == base]
-        rid = str(cid) if cid else "—"
+    for base in sorted(CG_ID_RANK, key=lambda b: (CG_ID_RANK[b][1] is None, CG_ID_RANK[b][1] or 0, b)):
+        cid, rk = CG_ID_RANK[base]
+        rid = str(cid) if cid else "нет в CG топ-2500"
         rk_s = str(rk) if rk is not None else "—"
-        for s in bybit:
-            print(f"{s:22s} {base:10s} {rid:32s} {rk_s:>6s}")
-    print(f"\nPEPE rank=60 (<100) => 1000PEPEUSDT drops out of pool #100-#2500. Confirmed.")
+        print(f"{PREFIX_BYBIT[base]:22s} {base:10s} {rid:32s} {rk_s:>6s}")
+    print("\nPEPE rank<100 => 1000PEPEUSDT drops out of pool #100-#2500. Confirmed.")
+    print("1000CATUSDT -> simon-s-cat #1040 (not cat-call-agent #2496). Confirmed.")
+
+
+def test_cat_minrank_picks_simon_s_cat():
+    """Регрессия point 2: min-rank dedup выбирает simon-s-cat #1040, не cat-call-agent #2486."""
+    def ranked(limit=2500):
+        rows = [{"symbol": f"FILL{i}", "market_cap_rank": i, "id": f"f{i}"} for i in range(1, limit + 1)]
+        rows[1040 - 1] = {"symbol": "cat", "market_cap_rank": 1040, "id": "simon-s-cat"}
+        rows[2486 - 1] = {"symbol": "cat", "market_cap_rank": 2486, "id": "cat-call-agent"}
+        return rows
+
+    def instr():
+        return {"1000CATUSDT": {
+            "symbol": "1000CATUSDT", "contractType": "LinearPerpetual", "status": "Trading",
+            "baseCoin": "1000CAT", "quoteCoin": "USDT", "symbolType": "",
+            "leverageFilter": {"maxLeverage": "10"}}}
+
+    old_r, old_i = ls.fetch_coingecko_ranked, ls.fetch_bybit_instruments
+    ls.fetch_coingecko_ranked = ranked
+    ls.fetch_bybit_instruments = instr
+    try:
+        _, rank_map, _ = ls.build_midcap_universe(100, 2500, save_cache=None)
+    finally:
+        ls.fetch_coingecko_ranked = old_r
+        ls.fetch_bybit_instruments = old_i
+    assert rank_map.get("1000CATUSDT") == 1040, rank_map
+    print("test_cat_minrank_picks_simon_s_cat OK")
+
 
 
 def test_normalize_prefix():
@@ -163,5 +201,6 @@ if __name__ == "__main__":
     test_normalize_prefix()
     test_min_rank_dedup_and_pepe_exclusion()
     test_pepe_not_readded_as_fill()
+    test_cat_minrank_picks_simon_s_cat()
     test_prefix_symbols_report()
     print("POINT 1/4 OK")

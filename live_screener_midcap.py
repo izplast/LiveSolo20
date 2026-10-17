@@ -263,6 +263,68 @@ def normalize_bybit_base(symbol: str) -> Tuple[str, str]:
     return norm, base_raw.upper()
 
 
+# Числовые тикеры Bybit, которые не являются масштабирующими префиксами
+# 1000/10000/1000000, но которые прежняя (ошибочная) нормализация срезала как
+# префикс: 0GUSDT -> G, 2ZUSDT -> Z, 4STOCKUSDT -> STOCK. Держим их в отчёте
+# явно, с корректной базой, чтобы не терять из виду.
+NUMERIC_TICKERS = ("0GUSDT", "2ZUSDT", "4STOCKUSDT")
+
+
+def resolve_bybit_base(bsym: str, cg_rank: Dict[str, int], cg_id: Dict[str, str],
+                       cg_by_id: Dict[str, dict]) -> Tuple[str, str | None, int | None, bool]:
+    """Сопоставляет Bybit-символ с монетой CoinGecko.
+
+    Порядок: алиас по coingecko id (SYMBOL_ALIASES) -> матч по нормализованному
+    base -> матч по raw base. Возвращает (base, cg_id, rank, resolved).
+    """
+    norm, raw = normalize_bybit_base(bsym)
+    if norm in cg_rank:
+        return norm, cg_id.get(norm), cg_rank[norm], True
+    if raw in cg_rank:
+        return raw, cg_id.get(raw), cg_rank[raw], True
+    return norm, None, None, False
+
+
+def build_prefix_report(ranked: List[dict], tradable: Dict[str, dict]) -> List[dict]:
+    """Отчёт по префиксным тикерам Bybit: база, CoinGecko id и rank.
+
+    Покрывает все торгуемые Bybit USDT-перпы, у которых нормализация срезает
+    масштабирующий префикс 1000/10000/1000000, плюс NUMERIC_TICKERS. Для каждого
+    возвращает {symbol, base, raw, cg_id, rank, resolved}.
+    """
+    cg_id: Dict[str, str] = {}
+    cg_rank: Dict[str, int] = {}
+    cg_by_id: Dict[str, dict] = {}
+    for coin in ranked:
+        sym = str(coin.get("symbol") or "").upper()
+        rank = int(coin.get("market_cap_rank") or 0)
+        cid = str(coin.get("id") or "")
+        if cid and cid not in cg_by_id:
+            cg_by_id[cid] = coin
+        if not sym or not rank:
+            continue
+        if sym not in cg_rank or rank < cg_rank[sym]:
+            cg_rank[sym] = rank
+            cg_id[sym] = cid
+
+    rows: List[dict] = []
+    for bsym in sorted(tradable):
+        norm, raw = normalize_bybit_base(bsym)
+        if raw == norm and bsym not in NUMERIC_TICKERS:
+            continue
+        base, cid, rank, resolved = resolve_bybit_base(bsym, cg_rank, cg_id, cg_by_id)
+        rows.append({
+            "symbol": bsym,
+            "base": base,
+            "raw": raw,
+            "cg_id": cid,
+            "rank": rank,
+            "resolved": resolved,
+        })
+    rows.sort(key=lambda r: (r["rank"] is None, r["rank"] or 0, r["symbol"]))
+    return rows
+
+
 def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP_END,
                           save_cache: str | None = "data/midcap_universe.json") -> Tuple[List[str], Dict[str, int], List[dict]]:
     """
@@ -314,14 +376,20 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
     # (минимальный ранг). Ранг берётся из полного списка, а затем фильтруется по диапазону.
     cg_rank: Dict[str, int] = {}
     cg_info: Dict[str, dict] = {}
+    cg_id: Dict[str, str] = {}
+    cg_by_id: Dict[str, dict] = {}
     for coin in ranked:
         sym = str(coin.get("symbol") or "").upper()
         rank = int(coin.get("market_cap_rank") or 0)
+        cid = str(coin.get("id") or "")
+        if cid and cid not in cg_by_id:
+            cg_by_id[cid] = coin
         if not sym or not rank:
             continue
         if sym not in cg_rank or rank < cg_rank[sym]:
             cg_rank[sym] = rank
             cg_info[sym] = coin
+            cg_id[sym] = cid
 
     log(f"CoinGecko уникальных base в топ-{rank_end}: {len(cg_rank)}")
 
@@ -339,20 +407,31 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
         f"(исключено токенизированных акций symbolType=stock: {len(stock_symbols)} — "
         f"{', '.join(stock_symbols[:12])}{'...' if len(stock_symbols) > 12 else ''})")
 
+    # Отчёт по префиксным типам: база, CoinGecko id, rank — без «не получено».
+    prefix_rows = build_prefix_report(ranked, tradable)
+    if prefix_rows:
+        resolved = sum(1 for r in prefix_rows if r["resolved"])
+        log(f"Префиксный отчёт: {len(prefix_rows)} символов (1000/10000/1000000 + numeric), "
+            f"сопоставлено с CoinGecko: {resolved}")
+        for r in prefix_rows:
+            log(f"  {r['symbol']:22s} -> {r['base']:10s} "
+                f"{r['cg_id'] or 'нет в CG топ':30s} rank={r['rank'] if r['rank'] is not None else '—'}")
+        report_path = Path("data/prefix_report.json") if save_cache else None
+        if report_path:
+            try:
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                report_path.write_text(json.dumps(prefix_rows, ensure_ascii=False, indent=2),
+                                       encoding="utf-8")
+            except Exception as e:
+                log(f"Не удалось сохранить префиксный отчёт: {e}")
+
     matched: List[Tuple[int, str, str]] = []
     prefix_matched: List[Tuple[int, str, str]] = []  # 1000/10000/1000000* -> базовый токен
     seen_bybit = set()
     out_of_range: set[str] = set()  # базовый токен есть в CG, но ранг вне [rank_start, rank_end]
     for bsym in tradable:
         norm, raw = normalize_bybit_base(bsym)
-        rank = None
-        matched_base = None
-        if norm in cg_rank:
-            rank = cg_rank[norm]
-            matched_base = norm
-        elif raw in cg_rank:
-            rank = cg_rank[raw]
-            matched_base = raw
+        matched_base, _cid, rank, _resolved = resolve_bybit_base(bsym, cg_rank, cg_id, cg_by_id)
         if rank is not None:
             if rank_start <= rank <= rank_end:
                 if bsym not in seen_bybit:
