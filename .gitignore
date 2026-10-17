@@ -7,3 +7,4 @@ data/mcp_runs/
 live_*_new.csv
 live_100_700_*
 opencode.jsonc*
+data/midcap_universe.json
