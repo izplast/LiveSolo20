@@ -99,6 +99,37 @@ def test_min_rank_dedup_and_pepe_exclusion(monkeypatch=None):
     print("test_min_rank_dedup_and_pepe_exclusion OK")
 
 
+def test_pepe_not_readded_as_fill():
+    """Когда matched < 600, fill section не должен вернуть 1000PEPEUSDT
+    (PEPE rank 60 вне диапазона) с рангом 9999."""
+    ls.fetch_coingecko_ranked = fake_cg_ranked  # type: ignore
+
+    def few_instruments():
+        out = {}
+        def add(symbol, base_coin, symbol_type="", status="Trading"):
+            out[symbol] = {
+                "symbol": symbol, "contractType": "LinearPerpetual", "status": status,
+                "baseCoin": base_coin, "quoteCoin": "USDT", "symbolType": symbol_type,
+                "leverageFilter": {"maxLeverage": "10"},
+            }
+        # мало входящих в диапазон -> fill сработает
+        for rank in (150, 160, 170):
+            add(f"FILL{rank}USDT", f"FILL{rank}")
+        add("1000PEPEUSDT", "1000PEPE")  # PEPE rank 60 -> вне диапазона, не fill
+        add("1000BONKUSDT", "1000BONK")  # BONK rank 153 -> в диапазон
+        return out
+    ls.fetch_bybit_instruments = few_instruments  # type: ignore
+    try:
+        symbols, rank_map, _ = ls.build_midcap_universe(100, 2500, save_cache=None)
+    finally:
+        pass
+    syms = set(symbols)
+    assert "1000PEPEUSDT" not in syms, f"1000PEPEUSDT не должен быть в пуле даже как fill: {syms}"
+    assert rank_map.get("1000PEPEUSDT") is None
+    assert "1000BONKUSDT" in syms and rank_map["1000BONKUSDT"] == 153
+    print("test_pepe_not_readded_as_fill OK")
+
+
 def test_prefix_symbols_report():
     """Show all prefix-matched symbols: symbol -> coingecko id -> rank (live data)."""
     print("\n=== Prefix-matched symbols: symbol -> coingecko id -> rank ===")
@@ -131,5 +162,6 @@ def test_normalize_prefix():
 if __name__ == "__main__":
     test_normalize_prefix()
     test_min_rank_dedup_and_pepe_exclusion()
+    test_pepe_not_readded_as_fill()
     test_prefix_symbols_report()
     print("POINT 1/4 OK")

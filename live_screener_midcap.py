@@ -342,6 +342,7 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
     matched: List[Tuple[int, str, str]] = []
     prefix_matched: List[Tuple[int, str, str]] = []  # 1000/10000/1000000* -> базовый токен
     seen_bybit = set()
+    out_of_range: set[str] = set()  # базовый токен есть в CG, но ранг вне [rank_start, rank_end]
     for bsym in tradable:
         norm, raw = normalize_bybit_base(bsym)
         rank = None
@@ -352,12 +353,15 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
         elif raw in cg_rank:
             rank = cg_rank[raw]
             matched_base = raw
-        if rank is not None and rank_start <= rank <= rank_end:
-            if bsym not in seen_bybit:
-                matched.append((rank, bsym, matched_base))
-                seen_bybit.add(bsym)
-                if raw != norm:
-                    prefix_matched.append((rank, bsym, norm))
+        if rank is not None:
+            if rank_start <= rank <= rank_end:
+                if bsym not in seen_bybit:
+                    matched.append((rank, bsym, matched_base))
+                    seen_bybit.add(bsym)
+                    if raw != norm:
+                        prefix_matched.append((rank, bsym, norm))
+            else:
+                out_of_range.add(bsym)
 
     matched.sort(key=lambda x: x[0])
     if prefix_matched:
@@ -383,9 +387,14 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
                 log(f"Whitelist добавлен: {wl_sym} #{wl_rank}")
 
     # Дополнение до 600 монет если CoinGecko-пересечение дало меньше (гарантия пула ~600 для WS)
+    # Символы, у которых базовый токен есть в CoinGecko, но ранг вне [rank_start, rank_end]
+    # (например, 1000PEPEUSDT -> PEPE #60), намеренно НЕ возвращаются fill'ом — они выпали из пула.
     if len(symbols) < 600:
         need = 600 - len(symbols)
-        extra_candidates = [s for s in sorted(tradable.keys()) if s not in rank_map]
+        extra_candidates = [
+            s for s in sorted(tradable.keys())
+            if s not in rank_map and s not in out_of_range
+        ]
         # приоритет — не стоковые токены, но для достижения 600 берём любые
         fill = extra_candidates[:need]
         for s in fill:
