@@ -120,6 +120,11 @@ def test_normalize_prefix():
     assert ls.normalize_bybit_base("1000PEPEUSDT") == ("PEPE", "1000PEPE")
     assert ls.normalize_bybit_base("10000PEPEUSDT") == ("PEPE", "10000PEPE")
     assert ls.normalize_bybit_base("1000000PEPEUSDT") == ("PEPE", "1000000PEPE")
+    assert ls.normalize_bybit_base("PEPEUSDT") == ("PEPE", "PEPE")
+    # только точные префиксы 1000/10000/1000000 срезаются; остальные цифры — нет
+    assert ls.normalize_bybit_base("0GUSDT") == ("0G", "0G"), "0G — токен zero-gravity, не g-token"
+    assert ls.normalize_bybit_base("2ZUSDT") == ("2Z", "2Z"), "2Z не префикс 1000*"
+    assert ls.normalize_bybit_base("1000000BABYDOGEUSDT") == ("BABYDOGE", "1000000BABYDOGE")
     print("test_normalize_prefix OK")
 
 

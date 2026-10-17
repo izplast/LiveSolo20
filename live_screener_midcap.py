@@ -242,9 +242,15 @@ def fetch_coingecko_ranked(limit: int = 600) -> List[dict]:
 
 
 def normalize_bybit_base(symbol: str) -> Tuple[str, str]:
-    """Возвращает (normalized, raw) base. 1000PEPEUSDT -> (PEPE, 1000PEPE)."""
+    """Возвращает (normalized, raw) base.
+
+    Срезает только точные префиксы 1000/10000/1000000:
+    1000PEPEUSDT -> (PEPE, 1000PEPE), 1000000BABYDOGEUSDT -> (BABYDOGE, 1000000BABYDOGE).
+    Остальные цифры не трогаются: 0GUSDT -> (0G, 0G) (токен zero-gravity, не g-token),
+    2ZUSDT -> (2Z, 2Z).
+    """
     base_raw = symbol[:-4] if symbol.endswith("USDT") else symbol
-    norm = re.sub(r'^\d+', '', base_raw).upper()
+    norm = re.sub(r'^(1000000|10000|1000)(?=[A-Z])', '', base_raw).upper()
     return norm, base_raw.upper()
 
 
