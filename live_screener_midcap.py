@@ -333,7 +333,8 @@ def build_prefix_report(ranked: List[dict], tradable: Dict[str, dict]) -> List[d
 
 
 def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP_END,
-                          save_cache: str | None = "data/midcap_universe.json") -> Tuple[List[str], Dict[str, int], List[dict]]:
+                          save_cache: str | None = "data/midcap_universe.json",
+                          force: bool = False) -> Tuple[List[str], Dict[str, int], List[dict]]:
     """
     1. Грузит топ rank_end с CoinGecko
     2. Фильтрует rank_start..rank_end
@@ -352,7 +353,7 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
     if cache_path and cache_path.exists() and old_symbols:
         try:
             age = time.time() - cache_path.stat().st_mtime
-            if age <= UNIVERSE_TTL_SEC:
+            if age <= UNIVERSE_TTL_SEC and not force:
                 rank_map = {k: int(v) for k, v in old.get("rank_map", {}).items()}
                 log(f"Вселенная из кэша {cache_path} (возраст {age:.0f}s < TTL {UNIVERSE_TTL_SEC}s): "
                     f"{len(old_symbols)} символов")
