@@ -272,9 +272,12 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
         f"({cg_slice[0]['symbol'].upper()}#{cg_slice[0].get('market_cap_rank')} -> "
         f"{cg_slice[-1]['symbol'].upper()}#{cg_slice[-1].get('market_cap_rank')})")
 
+    # Минимальный ранг market_cap по symbol на ВСЕМ топ-rank_end (а не только в срезе),
+    # чтобы дубликаты symbol разрешались в пользу монеты с наибольшей капитализацией
+    # (минимальный ранг). Ранг берётся из полного списка, а затем фильтруется по диапазону.
     cg_rank: Dict[str, int] = {}
     cg_info: Dict[str, dict] = {}
-    for coin in cg_slice:
+    for coin in ranked:
         sym = str(coin.get("symbol") or "").upper()
         rank = int(coin.get("market_cap_rank") or 0)
         if not sym or not rank:
@@ -283,7 +286,10 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
             cg_rank[sym] = rank
             cg_info[sym] = coin
 
-    log(f"CoinGecko уникальных base в срезе: {len(cg_rank)}")
+    log(f"CoinGecko уникальных base в топ-{rank_end}: {len(cg_rank)}")
+
+    # cg_slice — только для лога/кэша (первый и последний в срезе)
+    cg_slice = ranked[rank_start - 1: rank_end]
 
     log(f"Загрузка Bybit instruments {BYBIT_REST}...")
     bybit_instr = fetch_bybit_instruments()
@@ -309,7 +315,7 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
         elif raw in cg_rank:
             rank = cg_rank[raw]
             matched_base = raw
-        if rank is not None:
+        if rank is not None and rank_start <= rank <= rank_end:
             if bsym not in seen_bybit:
                 matched.append((rank, bsym, matched_base))
                 seen_bybit.add(bsym)
