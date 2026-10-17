@@ -46,6 +46,7 @@ from tools.screener_common import (
     SEED_LIMIT_15M,
     SEED_LIMIT_1M,
     STALE_EXIT_SEC,
+    SYMBOL_ALIASES,
     UNIVERSE_TTL_SEC,
     WS_RECONNECT_MAX_ATTEMPTS,
     WS_RECONNECT_MAX_DELAY,
@@ -285,6 +286,12 @@ def resolve_bybit_base(bsym: str, cg_rank: Dict[str, int], cg_id: Dict[str, str]
     base -> матч по raw base. Возвращает (base, cg_id, rank, resolved).
     """
     norm, raw = normalize_bybit_base(bsym)
+    for key in (norm, raw):
+        alias_id = SYMBOL_ALIASES.get(key)
+        if alias_id and alias_id in cg_by_id:
+            rank = int(cg_by_id[alias_id].get("market_cap_rank") or 0)
+            if rank:
+                return norm, alias_id, rank, True
     if norm in cg_rank:
         return norm, cg_id.get(norm), cg_rank[norm], True
     if raw in cg_rank:

@@ -35,8 +35,8 @@ CG_ID_RANK = {
     "0G": ("zero-gravity", 226),
     "2Z": ("doublezero", 203),
     "4STOCK": ("4stock", 1877),
-    # NEIROCTO: вне CoinGecko топ-2500 (Bybit base NEIROCTO != CG symbol NEIRO)
-    "NEIROCTO": (None, None),
+    # NEIROCTO -> CoinGecko id neiro-3 (SYMBOL_ALIASES, матч по id, не по symbol)
+    "NEIROCTO": ("neiro-3", 636),
     # вне CoinGecko топ-2500
     "RATS": (None, None),
 }
@@ -184,6 +184,37 @@ def test_cat_minrank_picks_simon_s_cat():
     print("test_cat_minrank_picks_simon_s_cat OK")
 
 
+def test_alias_neirocto_resolves_via_id():
+    """SYMBOL_ALIASES: base NEIROCTO -> coingecko id neiro-3, матч ДО symbol."""
+    from tools import screener_common as sc
+    assert sc.SYMBOL_ALIASES.get("NEIROCTO") == "neiro-3", sc.SYMBOL_ALIASES
+
+    def ranked(limit=2500):
+        rows = [{"symbol": f"FILL{i}", "market_cap_rank": i, "id": f"f{i}"} for i in range(1, limit + 1)]
+        # CoinGecko тикер "neiro" (не "NEIROCTO") с id neiro-3
+        rows[636 - 1] = {"symbol": "neiro", "market_cap_rank": 636, "id": "neiro-3"}
+        return rows
+
+    def instr():
+        return {"1000NEIROCTOUSDT": {
+            "symbol": "1000NEIROCTOUSDT", "contractType": "LinearPerpetual", "status": "Trading",
+            "baseCoin": "1000NEIROCTO", "quoteCoin": "USDT", "symbolType": "",
+            "leverageFilter": {"maxLeverage": "10"}}}
+
+    old_r, old_i = ls.fetch_coingecko_ranked, ls.fetch_bybit_instruments
+    ls.fetch_coingecko_ranked = ranked
+    ls.fetch_bybit_instruments = instr
+    try:
+        _, rank_map, _ = ls.build_midcap_universe(100, 2500, save_cache=None)
+        rows = ls.build_prefix_report(ranked(), instr())
+    finally:
+        ls.fetch_coingecko_ranked = old_r
+        ls.fetch_bybit_instruments = old_i
+    assert rank_map.get("1000NEIROCTOUSDT") == 636, rank_map
+    row = [r for r in rows if r["symbol"] == "1000NEIROCTOUSDT"][0]
+    assert row["cg_id"] == "neiro-3" and row["rank"] == 636 and row["resolved"], row
+    print("test_alias_neirocto_resolves_via_id OK")
+
 
 def test_normalize_prefix():
     assert ls.normalize_bybit_base("1000PEPEUSDT") == ("PEPE", "1000PEPE")
@@ -202,5 +233,6 @@ if __name__ == "__main__":
     test_min_rank_dedup_and_pepe_exclusion()
     test_pepe_not_readded_as_fill()
     test_cat_minrank_picks_simon_s_cat()
+    test_alias_neirocto_resolves_via_id()
     test_prefix_symbols_report()
     print("POINT 1/4 OK")
