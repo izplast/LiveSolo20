@@ -1008,26 +1008,30 @@ class MidcapScreener:
             data = msg.get("data") or []
             if not isinstance(data, list):
                 data = [data]
-            # детальный дамп сырых свечей — только в DEBUG режиме (отключено в INFO по умолчанию)
-            if ENABLE_DEBUG_WS and topic.startswith("kline.1."):
+            topic_is_k1 = topic.startswith("kline.1.")
+            # детальный дамп сырых свечей — только в DEBUG режиме
+            if ENABLE_DEBUG_WS and topic_is_k1:
                 log(f"[DEBUG-WS] kline.1 {symbol} {len(data)} bar(s) raw={str(raw)[:180]}")
-                for k in data:
-                    if not isinstance(k, dict):
-                        continue
-                    try:
-                        confirm = self._apply_kline(symbol, interval, k)
-                    except Exception:
-                        import traceback
-                        log(f"[DEBUG-WS] _apply_kline failed {symbol} {interval}: {traceback.format_exc()}")
-                        continue
-                    if interval == "1" and confirm is True:
-                        # метка последней подтверждённой 1m-свечи — для stale-watchdog
-                        self._last_kline1_confirm_ms = int(time.time() * 1000)
+            # Обрабатываем закрытые/формирующиеся свечи в любом режиме;
+            # confirm=kline.1 сбрасывает таймер stale-watchdog.
+            for k in data:
+                if not isinstance(k, dict):
+                    continue
+                try:
+                    confirm = self._apply_kline(symbol, interval, k)
+                except Exception:
+                    import traceback
+                    log(f"_apply_kline failed {symbol} {interval}: {traceback.format_exc()}")
+                    continue
+                if interval == "1" and confirm is True:
+                    # метка последней подтверждённой 1m-свечи — для stale-watchdog
+                    self._last_kline1_confirm_ms = int(time.time() * 1000)
+                    if topic_is_k1:
                         try:
                             sig, _, _, _ = self._evaluate_symbol(symbol)
                         except Exception:
                             import traceback
-                            log(f"[DEBUG-WS] _evaluate_symbol failed {symbol}: {traceback.format_exc()}")
+                            log(f"_evaluate_symbol failed {symbol}: {traceback.format_exc()}")
                             continue
                         if sig:
                             await self._emit_signal(sig)
@@ -1061,10 +1065,11 @@ class MidcapScreener:
                     attempt = 0
                     self._reconnect_attempts = 0
                     self._ws_connected.set()
-                    # часы stale-watchdog начинают тикнуть с момента подключения
-                    self._last_kline1_confirm_ms = int(time.time() * 1000)
                     log(f"WS подключен: {ws_url}, подписка на {len(self.symbols)} символов x2 интервала...")
                     await self._subscribe_chunks(ws)
+                    # часы stale-watchdog начинают тикнуть с момента завершения подписки
+                    # (ждём первые confirm=kline.1), а не со старта процесса.
+                    self._last_kline1_confirm_ms = int(time.time() * 1000)
                     log(f"WS подписка завершена: {len(self.symbols)*2} топиков, ожидание свечей kline.1/kline.15")
                     # ping задача
                     async def pinger():

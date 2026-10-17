@@ -38,7 +38,7 @@ def test_timeline_stale_exit():
     s._exit_code = 0
     s._stop.clear()
 
-    asyncio.run(s._timeline_loop(end_ts=time.time() + 30))
+    asyncio.run(s._timeline_loop(end_ts=time.time() + 3))
 
     assert s._exit_code == 1, s._exit_code
     assert s._fatal_reason == "ws_stale_exit", s._fatal_reason
@@ -49,7 +49,34 @@ def test_timeline_stale_exit():
     print("test_timeline_stale_exit OK")
 
 
+def test_no_confirm_during_slow_seed():
+    """Медленный сид/подписка (150с) без единой confirm=kline.1 не должен
+    вызывать ws_stale_exit: часы начинают тикнуть только после завершения
+    подписки / первой confirm-свечи."""
+    s = ls.MidcapScreener(dry_run=True)
+    s.symbols = []
+    s.rank_map = {}
+    s.interval_sec = 1
+    s.stale_exit_sec = STALE_EXIT_SEC
+    jpath = TMP / "stale-seed-events.jsonl"
+    tpath = TMP / "stale-seed-timeline.csv"
+    s.journal = ls.Journal(str(jpath))
+    s.timeline_logger = ls.TimelineLogger(str(tpath))
+    # во время сида подтверждений ещё нет — часы не тикают
+    s._last_kline1_confirm_ms = None
+    s._exit_code = 0
+    s._stop.clear()
+
+    asyncio.run(s._timeline_loop(end_ts=time.time() + 2))
+
+    assert s._exit_code == 0, s._exit_code
+    assert s._fatal_reason is None, s._fatal_reason
+    assert not s._stop.is_set()
+    print("test_no_confirm_during_slow_seed OK")
+
+
 if __name__ == "__main__":
     test_is_stale_bounds()
     test_timeline_stale_exit()
+    test_no_confirm_during_slow_seed()
     print("POINT 1 OK")
