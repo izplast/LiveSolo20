@@ -45,6 +45,8 @@ from tools.screener_common import (
     SEED_LIMIT_15M,
     SEED_LIMIT_1M,
     STALE_EXIT_SEC,
+    WS_RECONNECT_MAX_ATTEMPTS,
+    WS_RECONNECT_MAX_DELAY,
     is_stale,
     min_history_15m,
     min_history_1m,
@@ -599,6 +601,7 @@ class MidcapScreener:
         self.factor_enforce = factor_enforce
         self.cooldown_sec = cooldown_sec
         self.stale_exit_sec = stale_exit_sec
+        self._reconnect_attempts: int = 0  # подряд неудачных попыток WS реконнекта
         self.last_signal_ts: Dict[str, int] = {}
         self._bad_kline: Counter = Counter()
         # WS/watchdog состояние
@@ -1005,6 +1008,7 @@ class MidcapScreener:
                 log(f"WS подключение: {ws_url} (попытка {attempt+1})")
                 async with websockets.connect(ws_url, ping_interval=None, open_timeout=10, close_timeout=5, max_queue=2048) as ws:
                     attempt = 0
+                    self._reconnect_attempts = 0
                     self._ws_connected.set()
                     # часы stale-watchdog начинают тикнуть с момента подключения
                     self._last_kline1_confirm_ms = int(time.time() * 1000)
@@ -1046,9 +1050,31 @@ class MidcapScreener:
                 self._ws_connected.clear()
                 if self._stop.is_set():
                     return
-                attempt += 1
-                delay = min(60.0, 1.0 * 2 ** (attempt - 1)) * (0.7 + 0.6 * random.random())
-                log(f"WS оборвался ({e}), reconnect через {delay:.1f}с (попытка {attempt})")
+                self._reconnect_attempts += 1
+                attempt = self._reconnect_attempts
+                if self._reconnect_attempts >= WS_RECONNECT_MAX_ATTEMPTS:
+                    self._fatal_reason = "ws_reconnect_exhausted"
+                    self._exit_code = 1
+                    try:
+                        self.journal.write(
+                            "ws_reconnect_exhausted",
+                            attempts=self._reconnect_attempts,
+                            max_attempts=WS_RECONNECT_MAX_ATTEMPTS,
+                            delay_max_sec=WS_RECONNECT_MAX_DELAY,
+                            error=str(e),
+                        )
+                    except Exception:
+                        pass
+                    log(
+                        f"WS реконнект исчерпан ({self._reconnect_attempts} неудач подряд) — выход код 1"
+                    )
+                    self._stop.set()
+                    return
+                delay = ws_backoff_delay(attempt)
+                log(
+                    f"WS оборвался ({e}), reconnect через {delay:.1f}с "
+                    f"(попытка {attempt}/{WS_RECONNECT_MAX_ATTEMPTS})"
+                )
                 # переподписка произойдёт в следующей итерации цикла
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=delay)

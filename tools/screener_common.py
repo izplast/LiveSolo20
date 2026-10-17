@@ -30,8 +30,9 @@ def ws_backoff_delay(attempt: int) -> float:
 
     attempt — порядковый номер неудачной попытки (1, 2, ...).
     """
-    return min(WS_RECONNECT_MAX_DELAY, 1.0 * 2 ** (attempt - 1)) * (
-        0.7 + 0.6 * random.random()
+    return min(
+        WS_RECONNECT_MAX_DELAY,
+        (1.0 * 2 ** (attempt - 1)) * (0.7 + 0.6 * random.random()),
     )
 
 
