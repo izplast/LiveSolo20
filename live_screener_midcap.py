@@ -158,6 +158,7 @@ def fetch_bybit_instruments(base: str = BYBIT_REST) -> Dict[str, dict]:
             out[it["symbol"]] = {
                 "status": it.get("status"),
                 "baseCoin": it.get("baseCoin"),
+                "symbolType": it.get("symbolType"),  # "stock" — токенизированная акция (PLTR, MSFT, V, SNDK ...)
                 "maxLeverage": float(it["leverageFilter"]["maxLeverage"]),
             }
         cursor = res.get("nextPageCursor") or None
@@ -255,6 +256,15 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
     3. Пересекает с торгуемыми на Bybit USDT Perp
     Возвращает: (symbols_sorted_by_rank, rank_map_symbol->rank, cg_slice)
     """
+    old_symbols: List[str] = []
+    if save_cache:
+        try:
+            p = Path(save_cache)
+            if p.exists():
+                old = json.loads(p.read_text(encoding="utf-8"))
+                old_symbols = old.get("symbols", [])
+        except Exception:
+            pass
     log(f"Загрузка CoinGecko топ-{rank_end}...")
     ranked = fetch_coingecko_ranked(limit=rank_end)
     cg_slice = ranked[rank_start - 1: rank_end]
@@ -277,10 +287,17 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
 
     log(f"Загрузка Bybit instruments {BYBIT_REST}...")
     bybit_instr = fetch_bybit_instruments()
-    tradable = {s: v for s, v in bybit_instr.items() if v.get("status") == "Trading"}
-    log(f"Bybit USDT Perp Trading: {len(tradable)}")
+    stock_symbols = sorted(s for s, v in bybit_instr.items() if v.get("symbolType") == "stock")
+    tradable = {
+        s: v for s, v in bybit_instr.items()
+        if v.get("status") == "Trading" and v.get("symbolType") != "stock"
+    }
+    log(f"Bybit USDT Perp Trading: {len(tradable)} "
+        f"(исключено токенизированных акций symbolType=stock: {len(stock_symbols)} — "
+        f"{', '.join(stock_symbols[:12])}{'...' if len(stock_symbols) > 12 else ''})")
 
     matched: List[Tuple[int, str, str]] = []
+    prefix_matched: List[Tuple[int, str, str]] = []  # 1000/10000/1000000* -> базовый токен
     seen_bybit = set()
     for bsym in tradable:
         norm, raw = normalize_bybit_base(bsym)
@@ -296,8 +313,13 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
             if bsym not in seen_bybit:
                 matched.append((rank, bsym, matched_base))
                 seen_bybit.add(bsym)
+                if raw != norm:
+                    prefix_matched.append((rank, bsym, norm))
 
     matched.sort(key=lambda x: x[0])
+    if prefix_matched:
+        examples = ", ".join(f"#{r} {s}→{b}" for r, s, b in prefix_matched[:8])
+        log(f"По префиксам 1000/10000/1000000 сопоставлено с базовым токеном: {len(prefix_matched)} — {examples}")
     # Ограничение пула до 600 монет для контроля WS-нагрузки (~1200 топиков)
     if len(matched) > 600:
         orig = len(matched)
@@ -328,6 +350,17 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
             rank_map[s] = 9999
         if fill:
             log(f"Пул дополнен до {len(symbols)} из Bybit tradable (+{len(fill)} вне CoinGecko топ-{rank_end})")
+
+    if old_symbols:
+        old_set = set(old_symbols)
+        new_set = set(symbols)
+        added = [s for s in symbols if s not in old_set]
+        removed = [s for s in old_symbols if s not in new_set]
+        log(f"Вселенная пула: было {len(old_symbols)}, стало {len(symbols)} (+{len(added)} / -{len(removed)})")
+        if added:
+            log(f"  добавлено: {', '.join(added[:15])}")
+        if removed:
+            log(f"  удалено: {', '.join(removed[:15])}")
 
     log(f"Midcap пул #{rank_start}-#{rank_end} на Bybit: {len(symbols)} символов")
     if matched[:5]:
