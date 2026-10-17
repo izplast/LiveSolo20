@@ -602,6 +602,7 @@ class MidcapScreener:
         self.cooldown_sec = cooldown_sec
         self.stale_exit_sec = stale_exit_sec
         self._reconnect_attempts: int = 0  # подряд неудачных попыток WS реконнекта
+        self._insufficient_history: Counter = Counter()  # оценки, пропущенные за нехваткой истории
         self.last_signal_ts: Dict[str, int] = {}
         self._bad_kline: Counter = Counter()
         # WS/watchdog состояние
@@ -660,10 +661,15 @@ class MidcapScreener:
                     raise
 
     async def seed_history(self):
-        log(f"Seed истории M1+15m для {len(self.symbols)} символов...")
+        min_1m = min_history_1m(self.natr_period, self.uhlo_length)
+        min_15m = min_history_15m(self.uhlo_length_15m)
+        log(
+            f"Seed истории M1×{SEED_LIMIT_1M}+15m×{SEED_LIMIT_15M} для {len(self.symbols)} символов "
+            f"(минимум {min_1m}/{min_15m} закрытых баров, иначе символ не оценивается)..."
+        )
         sem = asyncio.Semaphore(self.concurrency)
-        cache_len = max(self.natr_period + 5, 25)
-        cache_len_15m = max(self.uhlo_length_15m + 5, 25)
+        cache_len = SEED_LIMIT_1M
+        cache_len_15m = SEED_LIMIT_15M
 
         async def one(sym: str):
             async with sem:
@@ -707,9 +713,13 @@ class MidcapScreener:
                     self.klines_cache_15m[sym] = deque(maxlen=50)
 
         await asyncio.gather(*(one(s) for s in self.symbols))
-        ok = sum(1 for v in self.klines_cache.values() if len(v) >= 15)
-        ok15 = sum(1 for v in self.klines_cache_15m.values() if len(v) >= 15)
-        log(f"Seed готово: {ok}/{len(self.symbols)} M1 и {ok15}/{len(self.symbols)} 15m с историей >=15 баров")
+        ok = sum(1 for v in self.klines_cache.values() if len(v) >= min_1m)
+        ok15 = sum(1 for v in self.klines_cache_15m.values() if len(v) >= min_15m)
+        ins = sum(self._insufficient_history.values())
+        log(
+            f"Seed готово: {ok}/{len(self.symbols)} M1 и {ok15}/{len(self.symbols)} 15m с достаточной историей; "
+            f"пропущено оценок за нехваткой истории: {ins}"
+        )
 
     # -----------------------------------------------------------------------
     # Вычисление сигнала из текущих кэшей (без сети)
@@ -727,10 +737,12 @@ class MidcapScreener:
         now_ms = int(time.time() * 1000)
         klines = [r for r in dq if r[0] + 60_000 <= now_ms]
         klines15 = [r for r in dq15 if r[0] + 900_000 <= now_ms]
-        # Минимумы: 1m — 21 бар (volume_ratio берёт средний за 20 + текущий),
-        # 15m — не меньше uhlo_length_15m (иначе compute_uhlo делит усечённое
-        # окно на полную длину и classify_color получает смещённый мусор).
-        if len(klines) < max(21, self.uhlo_length) or len(klines15) < max(self.uhlo_length_15m, 15):
+        # Минимумы (пункт ревью 12): 1m >= max(natr_period+1, 20, uhlo_length+2),
+        # 15m >= uhlo_length_15m+2. Недостаточно истории — символ не оценивается.
+        min_1m = min_history_1m(self.natr_period, self.uhlo_length)
+        min_15m = min_history_15m(self.uhlo_length_15m)
+        if len(klines) < min_1m or len(klines15) < min_15m:
+            self._insufficient_history[sym] += 1
             return (None, None, False, "no_history")
         vr = volume_ratio(klines)
         natr = compute_natr(klines, period=self.natr_period)
@@ -1235,6 +1247,10 @@ class MidcapScreener:
                 log(f"RejectedCoins: {dict(self._last_rejected_cnt)} | топ: {top} | примеры: {list(self._last_rejected_examples.items())[:3]}")
             if iteration % 5 == 0 and self._bad_kline:
                 log(f"BadKline: битых WS-свечей {sum(self._bad_kline.values())} по {len(self._bad_kline)} символам | топ: {self._bad_kline.most_common(5)}")
+            if iteration % 5 == 0 and self._insufficient_history:
+                total = sum(self._insufficient_history.values())
+                top = self._insufficient_history.most_common(3)
+                log(f"NeedsHistory: {total} оценок пропущено за нехваткой истории | топ: {top}")
             # забрать накопленные сигналы за минуту
             async with self._lock:
                 minute_signals = list(self._pending_signals)
