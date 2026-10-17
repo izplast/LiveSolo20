@@ -42,6 +42,7 @@ import requests
 
 # --- общая логика скринеров (watchdog, бэкофф, сид, вселенная) ---
 from tools.screener_common import (
+    CG_FETCH_RETRIES,
     SEED_LIMIT_15M,
     SEED_LIMIT_1M,
     STALE_EXIT_SEC,
@@ -235,8 +236,14 @@ def fetch_coingecko_ranked(limit: int = 600) -> List[dict]:
             f"страница {page}",
         )
         if rows is None:
-            log(f"fetch_coingecko_ranked: страница {page} недоступна после повторов, останов")
-            break
+            # Не пропускаем страницу: неполная вселенная сдвигает ранги и ломает
+            # сопоставление префиксных тикеров (напр. 1000CATUSDT ловил
+            # cat-call-agent вместо simon-s-cat). Поднимаем исключение — build
+            # перейдёт на старый кэш (fallback), а не построит обрезанную вселенную.
+            raise RuntimeError(
+                f"CoinGecko: страница {page} недоступна после {CG_FETCH_RETRIES} попыток — "
+                f"неполная вселенная запрещена, работаем по старому кэшу"
+            )
         if not rows:
             break
         out.extend(rows)

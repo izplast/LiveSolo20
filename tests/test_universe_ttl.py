@@ -34,6 +34,19 @@ def _patch(mod, name, new):
     return old
 
 
+class _fast_retry:
+    """Убирает реальные паузы 30–60 с в cg_fetch_with_retry на время теста."""
+
+    def __enter__(self):
+        self.min, self.max = sc.CG_RETRY_MIN_SEC, sc.CG_RETRY_MAX_SEC
+        sc.CG_RETRY_MIN_SEC = sc.CG_RETRY_MAX_SEC = 0
+        return self
+
+    def __exit__(self, *exc):
+        sc.CG_RETRY_MIN_SEC, sc.CG_RETRY_MAX_SEC = self.min, self.max
+        return False
+
+
 def test_cache_fresh_used_without_coingecko():
     """Кэш моложе TTL -> возвращается из кэша, CoinGecko не вызывается."""
     cache = TMP / "fresh.json"
@@ -107,11 +120,11 @@ def test_cg_fetch_with_retry_then_success():
             raise RuntimeError("429 Too Many Requests")
         return {"ok": True}
 
-    res = sc.cg_fetch_with_retry(flaky, label="test")
+    with _fast_retry():
+        res = sc.cg_fetch_with_retry(flaky, label="test")
     assert res == {"ok": True}, res
     assert calls["n"] == 3, calls["n"]
     print("test_cg_fetch_with_retry_then_success OK")
-
 
 def test_cg_fetch_with_retry_exhausted():
     """cg_fetch_with_retry возвращает None после исчерпания попыток."""
@@ -121,10 +134,45 @@ def test_cg_fetch_with_retry_exhausted():
         calls["n"] += 1
         raise RuntimeError("429 Too Many Requests")
 
-    res = sc.cg_fetch_with_retry(always_fail, label="test")
+    with _fast_retry():
+        res = sc.cg_fetch_with_retry(always_fail, label="test")
     assert res is None
     assert calls["n"] == sc.CG_FETCH_RETRIES, calls["n"]
     print("test_cg_fetch_with_retry_exhausted OK")
+
+
+def test_page_failure_raises_not_partial():
+    """Сбой страницы после всех повторов -> RuntimeError, а не частичная вселенная.
+
+    Регрессия point 2: молчаливый break на недоступной странице строил обрезанную
+    вселенную (сдвиг рангов), из-за чего 1000CATUSDT матчился в cat-call-agent
+    вместо simon-s-cat. Теперь fetch_coingecko_ranked обязан поднять исключение,
+    чтобы build_midcap_universe ушёл в fallback на старый кэш.
+    """
+    calls = {"n": 0}
+
+    def fake_get(path, params=None):
+        params = params or {}
+        calls["n"] += 1
+        if int(params.get("page", 1)) == 2:
+            raise RuntimeError("429 Too Many Requests")
+        return [{"symbol": f"P{params['page']}_{i}", "market_cap_rank": (params["page"] - 1) * 250 + i + 1,
+                 "id": f"coin-{params['page']}-{i}"} for i in range(250)]
+
+    old_get = ls._cg_get
+    ls._cg_get = fake_get
+    try:
+        with _fast_retry():
+            try:
+                ls.fetch_coingecko_ranked(limit=500)
+            except RuntimeError as e:
+                assert "страница 2" in str(e), e
+            else:
+                raise AssertionError("fetch_coingecko_ranked должен поднять RuntimeError, "
+                                     "а не вернуть обрезанную вселенную")
+    finally:
+        ls._cg_get = old_get
+    print("test_page_failure_raises_not_partial OK")
 
 
 if __name__ == "__main__":
@@ -133,4 +181,5 @@ if __name__ == "__main__":
     test_fallback_to_old_cache_on_failure()
     test_cg_fetch_with_retry_then_success()
     test_cg_fetch_with_retry_exhausted()
+    test_page_failure_raises_not_partial()
     print("POINT 3 OK")
