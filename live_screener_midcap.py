@@ -40,6 +40,17 @@ from typing import Any, Dict, List, Tuple
 
 import requests
 
+# --- общая логика скринеров (watchdog, бэкофф, сид, вселенная) ---
+from tools.screener_common import (
+    SEED_LIMIT_15M,
+    SEED_LIMIT_1M,
+    STALE_EXIT_SEC,
+    is_stale,
+    min_history_15m,
+    min_history_1m,
+    ws_backoff_delay,
+)
+
 # --- минутные фильтры F1/F4/F6/F7 (канон: tools/indicators.py) ---
 try:
     from tools.indicators import minute_factor_gates
@@ -567,7 +578,8 @@ class MidcapScreener:
                  f1_enabled: bool = True,
                  factor_enforce: bool = False,
                  cooldown_sec: int = 300,
-                 ws_url: str | None = None, ws_chunk: int = WS_CHUNK_SIZE):
+                 stale_exit_sec: int = STALE_EXIT_SEC,
+                  ws_url: str | None = None, ws_chunk: int = WS_CHUNK_SIZE):
         self.rank_start = rank_start
         self.rank_end = rank_end
         self.interval_sec = interval_sec
@@ -586,8 +598,13 @@ class MidcapScreener:
         self.f1_enabled = f1_enabled
         self.factor_enforce = factor_enforce
         self.cooldown_sec = cooldown_sec
+        self.stale_exit_sec = stale_exit_sec
         self.last_signal_ts: Dict[str, int] = {}
         self._bad_kline: Counter = Counter()
+        # WS/watchdog состояние
+        self._last_kline1_confirm_ms: int | None = None  # время последней confirm=kline.1
+        self._fatal_reason: str | None = None  # причина фатального выхода (exit code 1)
+        self._exit_code: int = 0
         self.concurrency = concurrency
         self.dry_run = dry_run
         self.ws_url = ws_url
@@ -940,24 +957,26 @@ class MidcapScreener:
             # детальный дамп сырых свечей — только в DEBUG режиме (отключено в INFO по умолчанию)
             if ENABLE_DEBUG_WS and topic.startswith("kline.1."):
                 log(f"[DEBUG-WS] kline.1 {symbol} {len(data)} bar(s) raw={str(raw)[:180]}")
-            for k in data:
-                if not isinstance(k, dict):
-                    continue
-                try:
-                    confirm = self._apply_kline(symbol, interval, k)
-                except Exception:
-                    import traceback
-                    log(f"[DEBUG-WS] _apply_kline failed {symbol} {interval}: {traceback.format_exc()}")
-                    continue
-                if interval == "1" and confirm is True:
+                for k in data:
+                    if not isinstance(k, dict):
+                        continue
                     try:
-                        sig, _, _, _ = self._evaluate_symbol(symbol)
+                        confirm = self._apply_kline(symbol, interval, k)
                     except Exception:
                         import traceback
-                        log(f"[DEBUG-WS] _evaluate_symbol failed {symbol}: {traceback.format_exc()}")
+                        log(f"[DEBUG-WS] _apply_kline failed {symbol} {interval}: {traceback.format_exc()}")
                         continue
-                    if sig:
-                        await self._emit_signal(sig)
+                    if interval == "1" and confirm is True:
+                        # метка последней подтверждённой 1m-свечи — для stale-watchdog
+                        self._last_kline1_confirm_ms = int(time.time() * 1000)
+                        try:
+                            sig, _, _, _ = self._evaluate_symbol(symbol)
+                        except Exception:
+                            import traceback
+                            log(f"[DEBUG-WS] _evaluate_symbol failed {symbol}: {traceback.format_exc()}")
+                            continue
+                        if sig:
+                            await self._emit_signal(sig)
         except Exception:
             import traceback
             log(f"[DEBUG-WS] _handle_ws_message unhandled: {traceback.format_exc()} raw={str(raw)[:300]}")
@@ -987,6 +1006,8 @@ class MidcapScreener:
                 async with websockets.connect(ws_url, ping_interval=None, open_timeout=10, close_timeout=5, max_queue=2048) as ws:
                     attempt = 0
                     self._ws_connected.set()
+                    # часы stale-watchdog начинают тикнуть с момента подключения
+                    self._last_kline1_confirm_ms = int(time.time() * 1000)
                     log(f"WS подключен: {ws_url}, подписка на {len(self.symbols)} символов x2 интервала...")
                     await self._subscribe_chunks(ws)
                     log(f"WS подписка завершена: {len(self.symbols)*2} топиков, ожидание свечей kline.1/kline.15")
@@ -1162,6 +1183,26 @@ class MidcapScreener:
             t0 = time.time()
             # snapshot timeline состояния из WS-буферов
             natr_no_trend, natr_total = self._snapshot_timeline_state()
+            # Stale-watchdog: если давно нет confirm=kline.1 — фатальный выход,
+            # runsv перезапустит процесс. Проверка в таймере, не в WS-цикле.
+            now_ms = int(time.time() * 1000)
+            if self._last_kline1_confirm_ms is not None and is_stale(
+                self._last_kline1_confirm_ms, now_ms, self.stale_exit_sec
+            ):
+                self._fatal_reason = "ws_stale_exit"
+                self._exit_code = 1
+                try:
+                    self.journal.write(
+                        "ws_stale_exit",
+                        last_confirm_ms=self._last_kline1_confirm_ms,
+                        now_ms=now_ms,
+                        stale_sec=self.stale_exit_sec,
+                    )
+                except Exception:
+                    pass
+                log(f"WS stale: нет confirm=kline.1 уже {self.stale_exit_sec}с — выход код 1")
+                self._stop.set()
+                return
             # RejectedCoins — троттлинг консоли раз в 5 минут, JSONL каждую минуту уже в _snapshot
             if iteration % 5 == 0 and hasattr(self, '_last_rejected_cnt') and self._last_rejected_cnt:
                 top = self._last_rejected_cnt.most_common(3)
@@ -1297,7 +1338,7 @@ class MidcapScreener:
                     self.journal.close()
                 self.report()
                 self.save_report_json()
-            return
+            return self._exit_code
 
         # WS-режим
         self._stop.clear()
@@ -1332,6 +1373,7 @@ class MidcapScreener:
                 self.journal.close()
             self.report()
             self.save_report_json()
+        return self._exit_code
 
     def report(self):
         now_dt = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1437,6 +1479,7 @@ def parse_args(argv=None):
     ap.add_argument("--no-f1", action="store_true", help="выключить F1 vol_reversal вето")
     ap.add_argument("--factor-enforce", action="store_true", help="F-фильтры как жёсткое вето (дефолт: shadow, только лог)")
     ap.add_argument("--cooldown-sec", type=int, default=300, help="пауза между сигналами по одному символу (0 — выкл)")
+    ap.add_argument("--stale-exit-sec", type=int, default=STALE_EXIT_SEC, help="выход код 1, если нет confirm=kline.1 столько секунд (deфолт 180)")
     ap.add_argument("--concurrency", type=int, default=20, help="параллельных REST-запросов для seed")
     ap.add_argument("--ws-url", type=str, default=None, help="переопределить WS URL (по умолчанию mainnet)")
     ap.add_argument("--testnet", action="store_true", help="использовать Testnet WS wss://stream-testnet.bybit.com/v5/public/linear")
@@ -1465,16 +1508,17 @@ async def amain(argv=None):
         vwap_max_std=args.vwap_max_std, hv_corr_max=args.hv_corr_max,
         body_range_max=args.body_range_max, f1_enabled=not args.no_f1,
         factor_enforce=args.factor_enforce, cooldown_sec=args.cooldown_sec,
+        stale_exit_sec=args.stale_exit_sec,
         concurrency=args.concurrency, dry_run=args.dry_run,
         ws_url=ws_url, ws_chunk=args.ws_chunk,
     )
     await screener.run()
-    return 0
+    return self._exit_code
 
 
 def main():
     try:
-        asyncio.run(amain())
+        sys.exit(asyncio.run(amain()) or 0)
     except KeyboardInterrupt:
         log("Завершено по Ctrl+C")
 
