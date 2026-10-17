@@ -45,8 +45,10 @@ from tools.screener_common import (
     SEED_LIMIT_15M,
     SEED_LIMIT_1M,
     STALE_EXIT_SEC,
+    UNIVERSE_TTL_SEC,
     WS_RECONNECT_MAX_ATTEMPTS,
     WS_RECONNECT_MAX_DELAY,
+    cg_fetch_with_retry,
     is_stale,
     min_history_15m,
     min_history_1m,
@@ -212,21 +214,28 @@ def _cg_get(path: str, params: Dict[str, Any], retries: int = 3):
 
 
 def fetch_coingecko_ranked(limit: int = 600) -> List[dict]:
-    """Топ limit по market_cap_desc с rank 1..limit."""
+    """Топ limit по market_cap_desc с rank 1..limit.
+
+    При 429/ошибке сети повторяет страницу (не пропускает) до CG_FETCH_RETRIES
+    раз с паузой 30–60 с.
+    """
     out: List[dict] = []
     per_page = 250
     page = 1
     while len(out) < limit:
         need = min(per_page, limit - len(out))
-        rows = _cg_get("/coins/markets", {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": per_page,
-            "page": page,
-            "sparkline": False,
-        })
+        rows = cg_fetch_with_retry(
+            lambda: _cg_get("/coins/markets", {
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": per_page,
+                "page": page,
+                "sparkline": False,
+            }),
+            f"страница {page}",
+        )
         if rows is None:
-            log(f"fetch_coingecko_ranked page {page}: res is None, break")
+            log(f"fetch_coingecko_ranked: страница {page} недоступна после повторов, останов")
             break
         if not rows:
             break
@@ -263,16 +272,38 @@ def build_midcap_universe(rank_start: int = MIDCAP_START, rank_end: int = MIDCAP
     Возвращает: (symbols_sorted_by_rank, rank_map_symbol->rank, cg_slice)
     """
     old_symbols: List[str] = []
-    if save_cache:
+    cache_path: Path | None = Path(save_cache) if save_cache else None
+    if cache_path and cache_path.exists():
         try:
-            p = Path(save_cache)
-            if p.exists():
-                old = json.loads(p.read_text(encoding="utf-8"))
-                old_symbols = old.get("symbols", [])
+            old = json.loads(cache_path.read_text(encoding="utf-8"))
+            old_symbols = old.get("symbols", [])
         except Exception:
             pass
+    # TTL: если кэш свежее UNIVERSE_TTL_SEC — используем его, не тикая CoinGecko
+    if cache_path and cache_path.exists() and old_symbols:
+        try:
+            age = time.time() - cache_path.stat().st_mtime
+            if age <= UNIVERSE_TTL_SEC:
+                rank_map = {k: int(v) for k, v in old.get("rank_map", {}).items()}
+                log(f"Вселенная из кэша {cache_path} (возраст {age:.0f}s < TTL {UNIVERSE_TTL_SEC}s): "
+                    f"{len(old_symbols)} символов")
+                return old_symbols, rank_map, old.get("cg_slice", [])
+            log(f"Кэш вселенной устарел ({age:.0f}s > TTL {UNIVERSE_TTL_SEC}s), перестраиваем...")
+        except Exception as e:
+            log(f"Не удалось прочитать кэш вселенной: {e}, перестраиваем...")
+
     log(f"Загрузка CoinGecko топ-{rank_end}...")
-    ranked = fetch_coingecko_ranked(limit=rank_end)
+    try:
+        ranked = fetch_coingecko_ranked(limit=rank_end)
+    except Exception as e:
+        ranked = []
+        log(f"CoinGecko топ-{rank_end} недоступен после повторов: {e}; работаем по старому кэшу")
+    if not ranked and old_symbols:
+        log(f"Внимание: работаем по устаревшему кэшу вселенной ({len(old_symbols)} символов)")
+        rank_map = {k: int(v) for k, v in old.get("rank_map", {}).items()}
+        return old_symbols, rank_map, old.get("cg_slice", [])
+    if not ranked:
+        raise RuntimeError("не удалось построить вселенную и нет кэша для fallback")
     cg_slice = ranked[rank_start - 1: rank_end]
     log(f"CoinGecko: всего {len(ranked)}, срез #{rank_start}-#{rank_end}: {len(cg_slice)} "
         f"({cg_slice[0]['symbol'].upper()}#{cg_slice[0].get('market_cap_rank')} -> "

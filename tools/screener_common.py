@@ -19,6 +19,14 @@ WS_RECONNECT_MAX_ATTEMPTS = 5  # неудачных попыток подряд 
 WS_RECONNECT_MAX_DELAY = 60.0  # максимум паузы между попытками, секунд
 
 # ---------------------------------------------------------------------------
+# Константы вселенной / CoinGecko
+# ---------------------------------------------------------------------------
+UNIVERSE_TTL_SEC = 24 * 3600  # кэш allленной считается свежим 24 ч
+CG_FETCH_RETRIES = 5  # число попыток при 429/ошибке сети при обходе страниц
+CG_RETRY_MIN_SEC = 30  # минимальная пауза между попытками CoinGecko
+CG_RETRY_MAX_SEC = 60  # максимальная пауза между попытками CoinGecko
+
+# ---------------------------------------------------------------------------
 # Константы сида / минимума истории (пункт ревью 12)
 # ---------------------------------------------------------------------------
 SEED_LIMIT_1M = 60   # забирать 1m×60 при сиде
@@ -51,6 +59,29 @@ def is_stale(last_confirm_ms: Optional[int], now_ms: int, stale_sec: int) -> boo
     if last_confirm_ms is None:
         return True
     return (now_ms - last_confirm_ms) > stale_sec * 1000
+
+
+def cg_fetch_with_retry(fetch, label: str = "") -> Any:
+    """Запрос к CoinGecko с повтором при 429/ошибке сети (не пропускает страницу).
+
+    ``fetch`` — вызываемый без аргументов, возвращающий результат страницы или
+    возбуждающий исключение при неудаче. Возвращает результат или None после
+    исчерпания попыток.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, CG_FETCH_RETRIES + 1):
+        try:
+            return fetch()
+        except Exception as e:
+            last_err = e
+            is_429 = "429" in str(e)
+            if attempt < CG_FETCH_RETRIES:
+                wait = random.uniform(CG_RETRY_MIN_SEC, CG_RETRY_MAX_SEC)
+                log(f"CoinGecko {label} попытка {attempt}/{CG_FETCH_RETRIES} не удалась ({e}), "
+                    f"повтор через {wait:.0f}s{' (429)' if is_429 else ''}")
+                time.sleep(wait)
+    log(f"CoinGecko {label}: исчерпаны {CG_FETCH_RETRIES} попыток, последняя ошибка: {last_err}")
+    return None
 
 
 # ---------------------------------------------------------------------------
