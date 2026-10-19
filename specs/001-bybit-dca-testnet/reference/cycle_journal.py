@@ -109,20 +109,28 @@ class CycleJournal:
         except Exception:
             pass  # журнал не должен ронять бота на неожиданной ошибке записи
 
-    def cycle_opened(self, cycle_id: str, symbol: str, open_ts: int | None = None) -> None:
-        """Зафиксировать момент открытия позиции/начала цикла (вход исполнен)."""
+    def cycle_opened(self, cycle_id: str, symbol: str,
+                     open_ts: int | None = None, **fields: Any) -> None:
+        """Зафиксировать момент открытия позиции/начала цикла (вход исполнен).
+
+        Дополнительные поля (side, qty, notional, avg_price, stop_level)
+        передаются как kwargs и попадают в событие как есть.
+        """
         open_ts = self._now() if open_ts is None else int(open_ts)
         self._open_ts[cycle_id] = open_ts
-        self.write("cycle_opened", cycle_id=cycle_id, symbol=symbol, open_ts=open_ts)
+        self.write("cycle_opened", **fields, cycle_id=cycle_id, symbol=symbol,
+                   open_ts=open_ts)
 
     def cycle_closed(self, cycle_id: str, symbol: str, exit_reason: str,
-                     pnl: float | None = None, close_ts: int | None = None) -> None:
+                     pnl: float | None = None, close_ts: int | None = None,
+                     **fields: Any) -> None:
         """Зафиксировать закрытие цикла: время окончания и длительность.
 
         exit_reason: take_profit | hard_sl | trailing | time_exit | manual. pnl — в USDT.
         open_ts берётся из слоя журнала (в т.ч. восстановленный после
         перезапуска) и дублируется в событие для независимой от порядка
-        обработки строк сводкой.
+        обработки строк сводкой. Дополнительные поля (side, qty, notional,
+        avg_price, stop_level, pnl_source) передаются как kwargs.
         """
         if exit_reason not in EXIT_REASONS:
             raise ValueError(
@@ -131,17 +139,18 @@ class CycleJournal:
             )
         close_ts = self._now() if close_ts is None else int(close_ts)
         open_ts = self._open_ts.pop(cycle_id, None)
-        fields: dict[str, Any] = {
+        payload: dict[str, Any] = dict(fields)
+        payload.update({
             "cycle_id": cycle_id,
             "symbol": symbol,
             "exit_reason": exit_reason,
             "pnl": pnl,
             "close_ts": close_ts,
-        }
+        })
         if open_ts is not None:
-            fields["open_ts"] = open_ts
-            fields["duration_ms"] = max(0, close_ts - open_ts)
-        self.write("cycle_closed", **fields)
+            payload["open_ts"] = open_ts
+            payload["duration_ms"] = max(0, close_ts - open_ts)
+        self.write("cycle_closed", **payload)
 
     def close(self) -> None:
         try:
