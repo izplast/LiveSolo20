@@ -28,11 +28,8 @@ UTC = timezone.utc
 EVENT_FILES = [
     "logs/screener-events.jsonl",
     "logs/bot-events.jsonl",
-    "logs/paper-dca-events.jsonl",
-    "logs/bot3-achop-events.jsonl",
-    "logs/bot4-achop-solo-events.jsonl",
 ]
-HEARTBEAT_LOGS = ["logs/bot.log", "logs/paper_dca.log", "logs/bot3.log", "logs/bot4.log"]
+HEARTBEAT_LOGS = ["logs/bot.log"]
 TIMELINE = "live_100_700_timeline.csv"
 
 

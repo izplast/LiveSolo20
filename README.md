@@ -24,11 +24,12 @@ WebSocket-потоке. Скринер ищет монеты с волатиль
 ## Запуск тестов
 
 ```bash
-python3 tools/run_tests.py            # все автономные тесты reference/ + анализ журналов
+python3 tools/run_tests.py            # автономные reference-тесты + config + синтетические журналы
+python3 tools/run_tests.py --journal  # дополнительно анализ живых журналов (SC-001..SC-005)
 ```
 
-Ожидаемый итог: `995 ok, 0 fail` (юнит-секция `reference/test_*.py`,
-22 файла — без сети, только stdlib).
+Ожидаемый итог: `0 fail` (юнит-секция `reference/test_*.py`,
+без сети, только stdlib).
 
 ## Управление live-процессами (runsv, Termux)
 
@@ -102,6 +103,6 @@ logs/                           # журналы и история прогон�
 1. Проверить секцию `telegram` в `config/config.yml` (T031): включить `enabled`,
    указать `bot_token`/`chat_id`, чтобы получать уведомления о входах/выходах,
    TP/SL и критических ошибках API.
-2. Прогнать `python3 tools/run_tests.py` — итог `995 ok, 0 fail`.
+2. Прогнать `python3 tools/run_tests.py` — итог `0 fail`.
 3. Убедиться, что `sv status midcap-bot midcap-screener` показывает `run`.
 4. Калибровать пороги волатильности/проскальзывания по результатам DEMO.

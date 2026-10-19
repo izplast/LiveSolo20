@@ -535,9 +535,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="машиночитаемый вывод")
     args = ap.parse_args(argv)
 
-    # Если секции не указаны — запускаем все.
+    # Если секции не указаны — запускаем автономный набор. Анализ живых
+    # журналов (SC-001..SC-005) недетерминирован и включается явно --journal.
     if not (args.unit or args.config or args.journal or args.journal_sim):
-        args.unit = args.config = args.journal = args.journal_sim = True
+        args.unit = args.config = args.journal_sim = True
+        args.journal = False
 
     # Журналы по умолчанию: из config.yml, иначе стандартные пути.
     if args.journal_files is None:

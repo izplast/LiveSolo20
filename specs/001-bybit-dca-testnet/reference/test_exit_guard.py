@@ -2,9 +2,10 @@
 Автономные проверки защиты выходов от проскальзывания и ленты котировок.
 
 Покрывает executor.py без сети:
-  * maker-выход (PostOnly) закрывает позицию без маркет-ордера;
-  * Max Slippage Filter откладывает маркет при широком спреде (exit_deferred)
-    и отпускает его после дедлайна exit_force_after_sec;
+  * fast-выход (_close_fast) сразу шлёт market-IOC, без maker и спред-фильтра;
+  * медленный выход (_close_slow) не блокирует монитор: maker ставится без
+    ожидания, маркет разрешён при узком спреде или после дедлайна
+    exit_force_after_sec (широкий спред журналируется как exit_deferred);
   * частичный филл maker-лимитки списывается с позиции, остаток добивает
     маркет;
   * MainnetQuoteFeed: TTL-кэш, разбор tickers-сообщений, приоритет ленты
@@ -175,51 +176,76 @@ def journal_lines(bot=None):
         return [json.loads(x) for x in f if x.strip()]
 
 
-# ── 1. maker-выход полностью закрывает позицию ───────────────────────────────
+# ── 1. fast-выход: сразу market, без maker и спред-фильтра ───────────────────
 
-print("maker-выход")
+print("fast-выход (_close_fast)")
 
-client = FakeClient(bids=[[99.99, 500]], asks=[[100.01, 500]], maker_fill=True)
+client = FakeClient(bids=[[99.0, 500]], asks=[[101.0, 500]], maker_fill=True)
 bot = make_bot(client)
 c = make_cycle(bot)
 t0 = time.time()
-bot._market_close(c, "hard_sl")
-ok("маркет-ордер не потребовался", len(client.market_fills) == 0,
+bot._close_fast(c, "hard_sl")
+ok("маркет-ордер исполнен сразу", len(client.market_fills) == 1,
    client.market_fills)
-ok("цикл закрыт", "TESTUSDT:1:1" not in bot.cycles)
+ok("maker-лимитки не выставлялись",
+   not [o for o in client.orders.values() if o["orderType"] == "Limit"],
+   list(client.orders))
+ok("цикл закрыт, closing снят",
+   "TESTUSDT:1:1" not in bot.cycles and "closing" not in c)
 events = journal_lines(bot)
 ok("причина выхода сохранена", events[-1].get("exit_reason") == "hard_sl",
    events[-1])
-ok("pnl посчитан по maker-цене 99.99",
-   abs(events[-1]["pnl"]
-       - round((99.99 - 100.0) * 2.0 - 1.0 - 2.0 * 99.99 * 0.0002, 4)) < 1e-9,
-   events[-1])
-ok("maker-выход быстрее дедлайна", time.time() - t0 < 2.0)
+expected_pnl = round((99.0 - 100.0) * 2.0 - 1.0 - 2.0 * 99.0 * TAKER_FEE, 4)
+ok("pnl посчитан по market-цене 99.0",
+   abs(events[-1]["pnl"] - expected_pnl) < 1e-9,
+   (events[-1]["pnl"], expected_pnl))
+ok("fast-выход не ждёт дедлайна", time.time() - t0 < 1.0, time.time() - t0)
 
-# ── 2. широкий спред: маркет откладывается до дедлайна ───────────────────────
+# ── 2. медленный выход не блокирует и ставит maker без ожидания ──────────────
 
-print("\nMax Slippage Filter")
+print("\nмедленный выход: неблокирующий maker")
 
 client = FakeClient(bids=[[99.0, 500]], asks=[[101.0, 500]],
                     maker_fill=False)
 bot = make_bot(client)   # полуспред ~1% > лимита 0.5%, дедлайн 2.5 с
 c = make_cycle(bot)
-bot._market_close(c, "hard_sl")
+t0 = time.time()
+bot._close_slow(c, "time_exit")
+ok("вызов вернулся без ожидания", time.time() - t0 < 1.0, time.time() - t0)
+ok("маркет пока не отправлен", len(client.market_fills) == 0,
+   client.market_fills)
+makers = [o for o in client.orders.values() if o["orderType"] == "Limit"]
+ok("выставлена одна PostOnly-maker заявка",
+   len(makers) == 1 and makers[0]["timeInForce"] == "PostOnly"
+   and makers[0]["reduceOnly"] is True, makers)
+ok("цикл ещё открыт, closing взведён",
+   "TESTUSDT:1:1" in bot.cycles and c.get("closing", {}).get("fast") is not True
+   and c["closing"].get("deadline"))
+
+bot._monitor_cycle(c)
 events = journal_lines(bot)
 kinds = [e["kind"] for e in events]
-ok("маркет ушёл только после дедлайна", len(client.market_fills) == 1,
+ok("до дедлайна маркет отложен", len(client.market_fills) == 0,
    client.market_fills)
 ok("выход фиксировался как exit_deferred", "exit_deferred" in kinds, kinds[:20])
 deferred = [e for e in events if e["kind"] == "exit_deferred"]
 ok("в deferred записаны спред и лимит",
    all(abs(e["half_spread_pct"] - 1.0) < 1e-6 and e["limit_pct"] == 0.5
        for e in deferred), deferred[:2])
-ok("цикл закрыт по best bid 99.0",
-   not bot.cycles and events[-1]["exit_reason"] == "hard_sl"
-   and abs(events[-1]["pnl"] - ((99.0 - 100.0) * 2.0 - 1.0 - 2.0 * 99.0 * TAKER_FEE)) < 1e-6,
-   events[-1])
 
-# ── 3. узкий спред: маркет разрешён сразу после неудачного maker ─────────────
+c["closing"]["deadline"] = time.time() - 1
+bot._monitor_cycle(c)
+events = journal_lines(bot)
+ok("после дедлайна маркет исполнен", len(client.market_fills) == 1,
+   client.market_fills)
+expected_pnl = round((99.0 - 100.0) * 2.0 - 1.0 - 2.0 * 99.0 * TAKER_FEE, 4)
+ok("цикл закрыт по best bid 99.0",
+   "TESTUSDT:1:1" not in bot.cycles
+   and events[-1]["exit_reason"] == "time_exit"
+   and abs(events[-1]["pnl"] - expected_pnl) < 1e-9,
+   (events[-1].get("exit_reason"), events[-1].get("pnl"), expected_pnl))
+
+# ── 3. узкий спред: медленный выход сразу шлёт маркет ────────────────────────
 
 print("\nузкий спред")
 
@@ -228,22 +254,25 @@ client = FakeClient(bids=[[99.98, 500]], asks=[[100.02, 500]],
 bot = make_bot(client)   # полуспред 0.02% <= 0.5%
 c = make_cycle(bot)
 t0 = time.time()
-bot._market_close(c, "trailing")
+bot._close_slow(c, "trailing")
 events = journal_lines(bot)
-ok("маркет не ждал дедлайна", time.time() - t0 < 2.0, time.time() - t0)
-ok("один маркет-ордер", len(client.market_fills) == 1)
+ok("маркет не ждал дедлайна", time.time() - t0 < 1.0, time.time() - t0)
+ok("один маркет-ордер", len(client.market_fills) == 1, client.market_fills)
 ok("нет exit_deferred при допустимом спреде",
-   all(e["kind"] != "exit_deferred" for e in events), kinds if False else [e["kind"] for e in events])
+   all(e["kind"] != "exit_deferred" for e in events), [e["kind"] for e in events])
+ok("цикл закрыт", "TESTUSDT:1:1" not in bot.cycles)
 
 # ── 4. частичный филл maker + маркет на остаток ───────────────────────────────
 
 print("\nчастичный филл")
 
-client = FakeClient(bids=[[99.98, 500]], asks=[[100.02, 500]],
+client = FakeClient(bids=[[99.0, 500]], asks=[[101.0, 500]],
                     maker_fill=False, maker_partial=True)
 bot = make_bot(client)
 c = make_cycle(bot)
-bot._market_close(c, "time_exit")
+bot._close_slow(c, "time_exit")          # широкий спред → PostOnly
+client.book = {"bids": [[99.98, 500]], "asks": [[100.02, 500]]}
+bot._monitor_cycle(c)                    # подобрать частичный филл + маркет
 events = journal_lines(bot)
 partials = [e for e in events if e.get("role") == "close_maker"]
 markets = [e for e in events if e.get("role") == "close"]
@@ -251,25 +280,28 @@ ok("частичный филл списал половину позиции",
    partials and abs(partials[0]["qty_closed"] - 1.0) < 1e-9, partials)
 ok("маркет добил остаток 1.0",
    markets and abs(markets[-1]["qty_closed"] - 1.0) < 1e-9, markets)
-ok("позиция обнулилась, цикл закрыт", "TESTUSDT:1:1" not in bot.cycles)
-expected_pnl = round(((99.98 - 100.0) * 1.0 - 1.0 * 99.98 * 0.0002)
+ok("позиция обнулилась, цикл закрыт",
+   "TESTUSDT:1:1" not in bot.cycles and abs(float(c["qty"])) < 1e-12, c["qty"])
+expected_pnl = round(((101.0 - 100.0) * 1.0 - 1.0 * 101.0 * 0.0002)
                      + ((99.98 - 100.0) * 1.0 - 1.0 * 99.98 * TAKER_FEE) - 1.0, 4)
 ok("pnl суммирован по двум филлам",
    abs(events[-1]["pnl"] - expected_pnl) < 1e-9,
    (events[-1]["pnl"], expected_pnl))
-ok("зависшая лимитка снята", len(client.cancelled) >= 1, client.cancelled)
 
-# ── 5. выключенный maker → прежнее поведение ─────────────────────────────────
+# ── 5. выключенный maker → медленный выход сразу маркетом ────────────────────
 
 print("\nвыключенный maker")
 
-client = FakeClient(bids=[[99.98, 500]], asks=[[100.02, 500]], maker_fill=False)
+client = FakeClient(bids=[[99.0, 500]], asks=[[101.0, 500]], maker_fill=False)
 bot = make_bot(client, exit_maker_enabled=False)
 c = make_cycle(bot)
-bot._market_close(c, "hard_sl")
-ok("сразу один маркет-ордер", len(client.market_fills) == 1)
+bot._close_slow(c, "hard_sl")
+ok("сразу один маркет-ордер", len(client.market_fills) == 1,
+   client.market_fills)
 ok("лимитки не выставлялись",
-   not [l for l in client.orders if "_mk" in l], client.orders.keys())
+   not [o for o in client.orders.values() if o["orderType"] == "Limit"],
+   list(client.orders))
+ok("цикл закрыт", "TESTUSDT:1:1" not in bot.cycles)
 
 # ── 6. MainnetQuoteFeed: кэш, TTL, разбор тикеров ────────────────────────────
 

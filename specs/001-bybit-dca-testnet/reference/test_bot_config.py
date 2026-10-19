@@ -111,7 +111,8 @@ ok("steps → max_docups", p.max_docups == 2)
 ok("multiplier → multiplier", p.multiplier == 2.0)
 ok("take_profit_pct → tp_pct", p.tp_pct == 1.2)
 ok("tp_escalation → кортеж", p.tp_escalation == (1.2, 1.5, 2.0))
-ok("hard_sl_pct → stop_pct", p.stop_pct == 5.0)
+ok("hard_sl_pct → stop_pct", p.stop_pct == _dca.get("hard_sl_pct"),
+   (p.stop_pct, _dca.get("hard_sl_pct")))
 ok("max_hold_hours → max_hold_minutes (×60)", p.max_hold_minutes == 90)
 ok("leverage → leverage", p.leverage == 4)
 
