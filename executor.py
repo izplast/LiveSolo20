@@ -1498,8 +1498,12 @@ class DcaBot:
         try:
             self.client.cancel_order(c["symbol"], link)
         except Exception as e:
-            self.journal.write("api_error", operation="cancel_order",
-                               symbol=c["symbol"], link=link, error=str(e))
+            if "110001" in str(e):
+                logger.info("cancel_order %s %s: 110001 (уже исполнен или слишком поздно) — игнорируем",
+                            c["symbol"], link)
+            else:
+                self.journal.write("api_error", operation="cancel_order",
+                                   symbol=c["symbol"], link=link, error=str(e))
 
     def _place_tp(self, c: dict, price: float) -> None:
         tp_side = "Sell" if c["side"] == "Buy" else "Buy"
@@ -1527,16 +1531,22 @@ class DcaBot:
         logger.info("докупка %s #%d → %.6g x%.6g", c["symbol"],
                     c["so_seq"], price, qty)
 
+    def _stop_level_for(self, c: dict) -> float | None:
+        stop_pct = effective_stop_pct(self.p, c.get("natr"))
+        if not stop_pct:
+            return None
+        factor = 1 - stop_pct / 100 if c["side"] == "Buy" else 1 + stop_pct / 100
+        return c["avg_entry"] * factor
+
     def _after_position_change(self, c: dict, now: int) -> None:
         p = self.p
         step_pct = effective_step_pct(p, c["natr"])
-        stop_pct = effective_stop_pct(p, c["natr"])
         tp_pct = rbot.take_profit_pct_at(p, c["docups"])
         tp = rbot.tp_price(c["avg_entry"], c["side"], tp_pct, c["tick_size"])
         self._place_tp(c, tp)
-        if stop_pct:
-            factor = 1 - stop_pct / 100 if c["side"] == "Buy" else 1 + stop_pct / 100
-            c["stop_level"] = c["avg_entry"] * factor
+        stop_level = self._stop_level_for(c)
+        if stop_level is not None:
+            c["stop_level"] = stop_level
         if c["docups"] < p.max_docups:
             next_level = c["last_fill_price"] * (
                 1 - step_pct / 100 if c["side"] == "Buy" else 1 + step_pct / 100)
@@ -1592,9 +1602,17 @@ class DcaBot:
             self._close_fast(c, "hard_sl")
             return
         try:
-            self.client.set_trading_stop(c["symbol"], str(px), trigger="MarkPrice")
+            resp = self.client.set_trading_stop(
+                c["symbol"], str(px), trigger="MarkPrice")
             c["stop_price"] = px
             c["stop_armed"] = True
+            self.journal.write("stop_armed", cycle_id=c["cycle_id"],
+                               symbol=c["symbol"], stop_price=px,
+                               stop_level=c.get("stop_level"), side=c["side"],
+                               qty=_f(c.get("qty")),
+                               notional=_f(c.get("qty")) * px,
+                               avg_price=c.get("avg_entry"),
+                               bybit_response=resp if resp is not None else {})
         except Exception as e:  # noqa: BLE001
             if self._stop_breached(c["side"], self._stop_mark(c["symbol"]), px):
                 self._close_fast(c, "hard_sl")
@@ -1624,8 +1642,12 @@ class DcaBot:
         try:
             self.client.set_trading_stop(c["symbol"], None)
         except Exception as e:  # noqa: BLE001
-            self.journal.write("api_error", operation="clear_trading_stop",
-                               symbol=c["symbol"], error=str(e))
+            if "34040" in str(e):
+                logger.info("clear_trading_stop %s: 34040 (not modified) — игнорируем",
+                            c["symbol"])
+            else:
+                self.journal.write("api_error", operation="clear_trading_stop",
+                                   symbol=c["symbol"], error=str(e))
 
     def _sync_position(self, c: dict) -> None:
         """Биржа закрыла позицию сама (сработал выставленный stopLoss).
@@ -1671,6 +1693,8 @@ class DcaBot:
                     c["realized_pnl"] = _f(c.get("realized_pnl")) + net
                     c["fee"] = 0.0
                 c["exit_price"] = exit_price
+                c["pnl_source"] = "closed_pnl" if net is not None else "estimated"
+                c["closed_qty"] = _f(c.get("closed_qty")) + qty
                 self.journal.write("order_filled", signal_id=c["signal_id"],
                                    cycle_id=c["cycle_id"], symbol=c["symbol"],
                                    role="close", mode="exchange_stop",
@@ -1678,6 +1702,10 @@ class DcaBot:
                                    qty_closed=qty, qty_left=0,
                                    estimated=False, price_source=source,
                                    fee=round(fee, 8),
+                                   side=c["side"], qty=qty,
+                                   notional=_f(qty * exit_price),
+                                   avg_price=c.get("avg_entry"),
+                                   stop_level=c.get("stop_level"),
                                    ts_signal=c["signal_ts"],
                                    ts_confirmed=int(time.time() * 1000))
                 c["qty"] = 0.0
@@ -1690,12 +1718,18 @@ class DcaBot:
                          else (c["avg_entry"] - est) * qty)
                 c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
                 c["exit_price"] = est
+                c["pnl_source"] = "estimated"
+                c["closed_qty"] = _f(c.get("closed_qty")) + qty
                 self.journal.write("order_filled", signal_id=c["signal_id"],
                                    cycle_id=c["cycle_id"], symbol=c["symbol"],
                                    role="close", mode="exchange_stop",
                                    avg_fill_price=round(est, 8),
                                    qty_closed=qty, qty_left=0,
                                    estimated=True,
+                                   side=c["side"], qty=qty,
+                                   notional=_f(qty * est),
+                                   avg_price=c.get("avg_entry"),
+                                   stop_level=c.get("stop_level"),
                                    ts_signal=c["signal_ts"],
                                    ts_confirmed=int(time.time() * 1000))
             c["qty"] = 0.0
@@ -1823,15 +1857,26 @@ class DcaBot:
             c["avg_entry"] = price
             c["fee"] += fee
             c["last_fill_price"] = price
+            stop_level = self._stop_level_for(c)
+            if stop_level is not None:
+                c["stop_level"] = stop_level
             self.journal.write("order_filled", signal_id=c["signal_id"],
                                cycle_id=c["cycle_id"], symbol=c["symbol"],
                                role="entry", mode="entry",
                                expected_price=c["price_testnet"],
                                avg_fill_price=round(price, 8),
                                price_venue="bybit_testnet",
-                               ts_signal=c["signal_ts"], ts_confirmed=now)
+                               ts_signal=c["signal_ts"], ts_confirmed=now,
+                               side=c["side"], qty=qty,
+                               notional=_f(qty * price),
+                               stop_level=c.get("stop_level"),
+                               avg_price=round(c["avg_entry"], 8))
             self.journal.cycle_opened(c["cycle_id"], c["symbol"],
-                                      open_ts=c["open_ts"])
+                                      open_ts=c["open_ts"],
+                                      side=c["side"], qty=_f(c.get("qty")),
+                                      notional=_f(c.get("qty") * c.get("avg_entry", 0)),
+                                      stop_level=c.get("stop_level"),
+                                      avg_price=c.get("avg_entry"))
             logger.info("вход %s %s x%.6g @%.6g", c["symbol"], c["side"],
                         qty, price)
             self._after_position_change(c, now)
@@ -1842,13 +1887,20 @@ class DcaBot:
             c["docups"] += 1
             c["fee"] += fee
             c["last_fill_price"] = price
+            stop_level = self._stop_level_for(c)
+            if stop_level is not None:
+                c["stop_level"] = stop_level
             self.journal.write("order_filled", signal_id=c["signal_id"],
                                cycle_id=c["cycle_id"], symbol=c["symbol"],
                                role="dca", mode="entry",
                                expected_price=_f(order.get("price")),
                                avg_fill_price=round(price, 8),
                                price_venue="bybit_testnet",
-                               ts_signal=c["signal_ts"], ts_confirmed=now)
+                               ts_signal=c["signal_ts"], ts_confirmed=now,
+                               side=c["side"], qty=qty,
+                               notional=_f(qty * price),
+                               stop_level=c.get("stop_level"),
+                               avg_price=round(c["avg_entry"], 8))
             logger.info("докупка #%d %s @%.6g, avg=%.6g", c["docups"],
                         c["symbol"], price, c["avg_entry"])
             self._after_position_change(c, now)
@@ -2079,6 +2131,8 @@ class DcaBot:
         c["qty"] = round(_f(c.get("qty")) - qty, 12)
         c["exit_price"] = price
         c["exit_ts"] = now
+        c["pnl_source"] = "estimated"
+        c["closed_qty"] = _f(c.get("closed_qty")) + qty
         self.journal.write("order_filled", signal_id=c["signal_id"],
                            cycle_id=c["cycle_id"], symbol=c["symbol"],
                            role=role, mode="close",
@@ -2086,7 +2140,11 @@ class DcaBot:
                            avg_fill_price=round(price, 8),
                            qty_closed=qty, qty_left=c["qty"],
                            price_venue="bybit_testnet",
-                           ts_signal=c["signal_ts"], ts_confirmed=now)
+                           ts_signal=c["signal_ts"], ts_confirmed=now,
+                           side=c["side"], qty=qty,
+                           notional=_f(qty * price),
+                           stop_level=c.get("stop_level"),
+                           avg_price=c.get("avg_entry"))
         logger.info("закрытие %s: %.6g @%.6g, осталось %.6g",
                     c["symbol"], qty, price, c["qty"])
 
@@ -2096,9 +2154,16 @@ class DcaBot:
         pnl = _f(c.get("realized_pnl")) - c["fee"]
         c["pnl"] = pnl
         c["closed"] = True
+        qty = _f(c.get("closed_qty")) or _f(c.get("qty"))
+        price = _f(c.get("exit_price")) or _f(c.get("avg_entry"))
         self.journal.cycle_closed(c["cycle_id"], c["symbol"],
                                   exit_reason=reason, pnl=round(pnl, 4),
-                                  close_ts=int(time.time() * 1000))
+                                  close_ts=int(time.time() * 1000),
+                                  side=c["side"], qty=qty,
+                                  notional=_f(qty * price),
+                                  avg_price=c.get("avg_entry"),
+                                  stop_level=c.get("stop_level"),
+                                  pnl_source=c.get("pnl_source") or "estimated")
         logger.info("цикл %s закрыт: %s pnl=%.4f", c["symbol"], reason, pnl)
         self.cycles.pop(c["cycle_id"], None)
 
@@ -2210,6 +2275,9 @@ class DcaBot:
                 c["trail_peak"] = mark
                 self.journal.write("trail_activated", cycle_id=c["cycle_id"],
                                    symbol=c["symbol"], avg_price=c["avg_entry"],
+                                   side=c["side"], qty=_f(c.get("qty")),
+                                   notional=_f(c.get("qty")) * _f(c.get("avg_entry")),
+                                   stop_level=c.get("stop_level"),
                                    trigger_pct=self.trail_trigger,
                                    peak_price=mark)
             if c["trail_active"] and c["trail_peak"]:
@@ -2333,12 +2401,18 @@ class DcaBot:
         gross = ((price - c["avg_entry"]) * c["qty"] if c["side"] == "Buy"
                  else (c["avg_entry"] - price) * c["qty"])
         pnl = gross - c["fee"] - fee
+        pnl_source = "estimated"
         self.journal.write("cycle_recovered", cycle_id=c["cycle_id"],
                            symbol=c["symbol"], open_ts=c.get("open_ts"))
         self.journal.cycle_closed(c["cycle_id"], c["symbol"],
                                   exit_reason=reason,
                                   pnl=round(pnl, 4),
-                                  close_ts=int(time.time() * 1000))
+                                  close_ts=int(time.time() * 1000),
+                                  side=c["side"], qty=_f(c.get("qty")),
+                                  notional=_f(c.get("qty")) * price,
+                                  avg_price=c.get("avg_entry"),
+                                  stop_level=c.get("stop_level"),
+                                  pnl_source=pnl_source)
         self.cycles.pop(c["cycle_id"], None)
         logger.info("цикл %s закрыт на старте (сверка): %s pnl=%.4f",
                     c["symbol"], reason, pnl)
