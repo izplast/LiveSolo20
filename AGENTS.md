@@ -12,19 +12,24 @@
   `python3 tools/last_hour_kyiv.py [--hours 1]`
 - Скрипт сам читает:
   - `logs/screener-events.jsonl` (сигналы),
-  - `logs/bot-events.jsonl`, `logs/paper-dca-events.jsonl`,
-    `logs/bot3-achop-events.jsonl`, `logs/bot4-achop-solo-events.jsonl` (сделки),
-  - `logs/bot.log`, `logs/paper_dca.log`, `logs/bot3.log`, `logs/bot4.log` (heartbeat),
+  - `logs/bot-events.jsonl` (сделки),
+  - `logs/bot.log` (heartbeat),
   - `live_100_700_timeline.csv` (пульс скринера).
 - Если процессов нет (`pgrep -f live_screener|bot.py|executor` пусто) и логи старше 5 мин —
-  прямо сказать, что боты стоят с `HH:MM Kyiv`, и предложить рестарт через `watchdog.sh` / `bot.py`.
+  прямо сказать, что боты стоят с `HH:MM Kyiv`, и предложить `sv restart midcap-bot` /
+  `sv restart midcap-screener`.
+
+## Live-процессы: runsv (Termux)
+- `bot.py`, `executor.py` и `live_screener_midcap.py` управляются через **runsv**,
+  не вручную.
+- Сервисы: `midcap-bot` (бот + исполнитель) и `midcap-screener`.
+- Статус: `sv status midcap-bot midcap-screener`.
+- Рестарт: `sv restart midcap-bot` / `sv restart midcap-screener`.
 
 ## Bybit-контур: DEMO (не testnet, не mainnet)
 - `config/config.yml`: `bybit.demo: true`, `bybit.testnet: false`.
 - Ключи демо — **только через env, не в файл**: `/root/.bybit_demo_env` (chmod 600, вне репо).
-- Рестарт только с окружением: `source /root/.bybit_demo_env` перед запуском
-  `watchdog.sh` / `bot.py`, иначе исполнители падают с `требует API-ключи`.
-- watchdog запускать откреплённо: `setsid nohup bash watchdog.sh >> logs/watchdog.log 2>&1 < /dev/null &`
-  (иначе висящий дочерний процесс вешает вызывающий шелл).
+- Сервис `midcap-bot` должен получать окружение из `/root/.bybit_demo_env`, иначе
+  исполнитель падает с `требует API-ключи`.
 - Не плодить дубли: один `bot.py --live` → один `executor.py --live` (дубли = двойные ордера
   на одном демо-счёте). Проверка: `pgrep -a python3`.

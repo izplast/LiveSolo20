@@ -3,6 +3,11 @@ logs/
 state.json
 __pycache__/
 *.log
+data/cache/
+data/cache_dl/
+data/*.parquet
+*.pkl
+grid_search_results_*.csv
 data/mcp_runs/
 live_*_new.csv
 live_100_700_*

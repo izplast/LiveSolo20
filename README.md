@@ -19,7 +19,7 @@ WebSocket-потоке. Скринер ищет монеты с волатиль
 | Phase 1–7 (MVP) | инфраструктура, WS-скринер, вход с плечом, докупки и TP, 72 ч, сводка прогона |
 | Phase 8 | A/B-инструменты, единый автораннер, графики по эквити/просадкам |
 | Phase 9 | синтетические журналы, экспорт сделок, лимиты бэктеста, история прогонов, расширенные метрики, валидатор конфига, сводка по символам |
-| Phase 10 (Live) | сверка состояния с биржей, backoff + circuit breaker, Telegram-уведомления, **paper-режим (dry-run)**, ключи фильтрации прод-скринера |
+| Phase 10 (Live) | сверка состояния с биржей, backoff + circuit breaker, Telegram-уведомления, ключи фильтрации прод-скринера |
 
 ## Запуск тестов
 
@@ -30,63 +30,42 @@ python3 tools/run_tests.py            # все автономные тесты r
 Ожидаемый итог: `995 ok, 0 fail` (юнит-секция `reference/test_*.py`,
 22 файла — без сети, только stdlib).
 
-## Paper-прогон перед Testnet (dry-run)
+## Управление live-процессами (runsv, Termux)
 
-Без единого ордера: проверка WS-подключения, нагрузки скринера, логов и
-Telegram-уведомлений. Требует зависимостей (в Termux):
+Live-процессы `bot.py`, `executor.py` и `live_screener_midcap.py` управляются
+через **runsv**, не вручную. Сервисы:
 
-```bash
-pip install websockets requests pyyaml
-```
-
-Сначала — тест канала Telegram (укажите в `config/config.yml` секцию `telegram`:
-`enabled: true`, `bot_token`, `chat_id`):
+- `midcap-bot` — бот + исполнитель;
+- `midcap-screener` — live-скринер.
 
 ```bash
-python3 specs/001-bybit-dca-testnet/reference/screener.py --telegram-test --config config/config.yml
+sv status midcap-bot midcap-screener
+sv restart midcap-bot
+sv restart midcap-screener
 ```
 
-Затем paper-прогон (реальный WS mainnet, сигналы → журнал `signal_dry_run` +
-Telegram, ордера не выставляются):
+Не запускать процессы вручную параллельно с runsv — дубли дают двойные ордера
+на одном демо-счёте. Проверка: `pgrep -a python3`.
 
-```bash
-python3 specs/001-bybit-dca-testnet/reference/screener.py --dry-run --config config/config.yml
-```
-
-Смотреть за работой 30–60 минут: WS-поток (600 символов, 6 соединений),
-события `signal_dry_run` в `logs/screener-events.jsonl`, уведомления в Telegram.
-Ctrl+C — аккуратная остановка. Для непрерывной работы в Termux:
-`termux-wake-lock`.
-
-## Запуск исполнителя (реальные DCA-ордера на Testnet)
+## Запуск исполнителя (реальные DCA-ордера, Bybit DEMO)
 
 `executor.py` — бот-исполнитель: читает новые сигналы из `logs/screener-events.jsonl`
 (ключ `screener.journal_path`), дедуплицирует их по `signal_id`, проверяет лимиты
-и выставляет реальные DCA-ордера на **Bybit Testnet**, затем сопровождает циклы:
+и выставляет реальные DCA-ордера на **Bybit DEMO**, затем сопровождает циклы:
 докупки по лестнице Мартингейла, поуровневый тейк-профит, стоп и выход по времени.
 
 ```bash
 pip install requests                          # единственная зависимость бота
 
-# 1. Проверка конфига и чистой логики
+# Проверка конфига и чистой логики
 python3 executor.py --check-config
 python3 executor.py --self-test
-
-# 2. Paper-прогон без ордеров (конвейер журнал→решение→журнал)
-python3 executor.py --once
-python3 executor.py                           # непрерывный режим, Ctrl+C — стоп
-
-# 3. Боевой прогон на Testnet (реальные ордера)
-python3 executor.py --live
-nohup python3 executor.py --live >> logs/executor.out 2>&1 &   # фоном
 ```
 
 Перед `--live`:
-1. Добавить секцию `bybit` в `config/config.yml` (`api_key`/`api_secret` с
-   https://testnet.bybit.com → API → Create New Key, разрешения Read-Write)
-   или задать `BYBIT_API_KEY`/`BYBIT_API_SECRET`.
-2. Скринер должен писать `signal_sent`/`signal_dry_run` в
-   `logs/screener-events.jsonl`.
+1. Задать `BYBIT_API_KEY`/`BYBIT_API_SECRET` через окружение
+   (`/root/.bybit_demo_env`, вне репо) — ключи в файл не писать.
+2. Скринер должен писать `signal_sent` в `logs/screener-events.jsonl`.
 3. Сигналы старее `--max-signal-age` (по умолчанию 300 с = кулдаун) пропускаются —
    при первом прогоне по историческому журналу передайте `--max-signal-age 0`.
 
@@ -124,6 +103,5 @@ logs/                           # журналы и история прогон�
    указать `bot_token`/`chat_id`, чтобы получать уведомления о входах/выходах,
    TP/SL и критических ошибках API.
 2. Прогнать `python3 tools/run_tests.py` — итог `995 ok, 0 fail`.
-3. Сделать paper-прогон (см. выше, `--dry-run`) и посмотреть 30–60 мин за
-   поведением WS и уведомлениями.
-4. Калибровать пороги волатильности/проскальзывания по результатам Testnet.
+3. Убедиться, что `sv status midcap-bot midcap-screener` показывает `run`.
+4. Калибровать пороги волатильности/проскальзывания по результатам DEMO.
