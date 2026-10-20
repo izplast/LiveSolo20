@@ -20,8 +20,20 @@ class FakeClient:
         self.by_link = {}
         self.mark = 100.0
         self.pos_qty = 0.0
+        self.pos_symbol = "TSTUSDT"
+        self.pos_side = "Buy"
+        self.history = []
+        self.pnl = []
         self.book = {"bids": [[99.9, 10]], "asks": [[100.1, 10]]}
         self.executions = []
+        self.instruments_info = {
+            "symbol": "TSTUSDT",
+            "lotSizeFilter": {"qtyStep": "0.1", "minOrderQty": "0.1",
+                              "maxOrderQty": "100000",
+                              "maxNotionalValue": "200"},
+            "priceFilter": {"tickSize": "0.01"},
+            "leverageFilter": {"maxLeverage": "20"},
+        }
 
     def ticker(self, symbol):
         return {"markPrice": self.mark, "lastPrice": self.mark}
@@ -29,9 +41,20 @@ class FakeClient:
     def orderbook(self, symbol, limit=1):
         return self.book
 
+    def instruments(self, symbol=None):
+        row = dict(self.instruments_info)
+        if symbol:
+            row["symbol"] = symbol
+        return [row]
+
+    def set_leverage(self, symbol, leverage):
+        self.calls.append({"set_leverage": leverage, "symbol": symbol})
+        return {}
+
     def create_order(self, **kw):
         self.calls.append(kw)
         o = {"orderId": f"f{len(self.calls)}", "orderStatus": "New",
+             "orderLinkId": kw.get("order_link_id"),
              "cumExecQty": "0", "price": str(kw.get("price") or 0)}
         if kw.get("order_type") == "Market":
             o.update({"orderStatus": "Filled",
@@ -46,7 +69,7 @@ class FakeClient:
         self.calls.append({"cancel": order_link_id})
         return {}
 
-    def get_order(self, symbol, link):
+    def get_order(self, symbol, link, order_id=None):
         return self.by_link.get(link, {"orderStatus": "New",
                                        "cumExecQty": "0", "price": "100"})
 
@@ -54,7 +77,17 @@ class FakeClient:
         return []
 
     def get_position(self, symbol):
-        return {"size": str(self.pos_qty), "avgPrice": "100"}
+        return {"symbol": symbol, "size": str(self.pos_qty),
+                "side": self.pos_side, "avgPrice": str(self.mark)}
+
+    def all_positions(self, settle_coin="USDT", limit=200):
+        if self.pos_qty <= 0:
+            return []
+        return [{"symbol": self.pos_symbol, "size": str(self.pos_qty),
+                 "side": self.pos_side, "avgPrice": str(self.mark)}]
+
+    def closed_pnl(self, symbol, limit=20):
+        return list(self.pnl)
 
     def set_trading_stop(self, symbol, stop_loss, trigger="MarkPrice"):
         self.calls.append({"trading_stop": stop_loss, "trigger": trigger})
@@ -91,6 +124,14 @@ def make_bot(client=None, **kw):
     bot.exit_maker_enabled, bot.exit_maker_timeout_sec = True, 15.0
     bot.max_exit_slippage_pct, bot.exit_force_after_sec = 0.5, 180.0
     bot.cycles = {}
+    bot._instruments = {}
+    bot._last_prices = {}
+    bot.processed = set()
+    bot.offset = 0
+    bot.leverage_applied = set()
+    bot.orphan_recheck_sec = 60.0
+    bot.state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "_tmp_state.json")
     for k, v in kw.items():
         setattr(bot, k, v)
     return bot

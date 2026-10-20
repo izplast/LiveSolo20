@@ -477,11 +477,44 @@ class BybitClient:
                           {"category": "linear", "symbol": symbol,
                            "orderLinkId": order_link_id})
 
-    def get_order(self, symbol: str, order_link_id: str) -> dict | None:
-        lst = self._get("/v5/order/realtime",
-                        {"category": "linear", "symbol": symbol,
-                         "orderLinkId": order_link_id}, signed=True).get("list", [])
-        return lst[0] if lst else None
+    def get_order(self, symbol: str, order_link_id: str,
+                  order_id: str | None = None) -> dict | None:
+        params: dict[str, Any] = {"category": "linear", "symbol": symbol}
+        if order_link_id:
+            params["orderLinkId"] = order_link_id
+        elif order_id:
+            params["orderId"] = order_id
+        lst = self._get("/v5/order/realtime", params, signed=True).get("list", [])
+        if lst:
+            return lst[0]
+        hist = self._get("/v5/order/history",
+                         {**params, "limit": "50"}, signed=True).get("list", [])
+        if hist:
+            return hist[0]
+        return self._order_from_executions(symbol, order_link_id, order_id)
+
+    def _order_from_executions(self, symbol: str, order_link_id: str,
+                               order_id: str | None) -> dict | None:
+        try:
+            rows = self.executions(symbol, limit=100)
+        except Exception:  # noqa: BLE001 — фолбэк не должен ломать опрос
+            return None
+        rows = [e for e in rows if isinstance(e, dict) and (
+            (order_link_id and str(e.get("orderLinkId")) == order_link_id)
+            or (order_id and str(e.get("orderId")) == order_id))]
+        trades = [e for e in rows if str(e.get("execType")) == "Trade"]
+        rows = trades or rows
+        if not rows:
+            return None
+        qty = sum(_f(e.get("execQty")) for e in rows)
+        value = sum(_f(e.get("execQty")) * _f(e.get("execPrice")) for e in rows)
+        fee = sum(_f(e.get("execFee")) for e in rows)
+        return {"orderId": order_id or str(rows[0].get("orderId") or ""),
+                "orderLinkId": order_link_id or str(rows[0].get("orderLinkId") or ""),
+                "orderStatus": "Filled",
+                "cumExecQty": str(qty),
+                "avgPrice": str(value / qty) if qty > 0 else "0",
+                "cumExecFee": str(fee)}
 
     def open_orders(self, symbol: str) -> list[dict]:
         lst = self._get("/v5/order/realtime",
@@ -913,7 +946,8 @@ class PaperClient:
         else:
             self.positions[symbol] = {"side": side, "qty": qty, "avg": price}
 
-    def get_order(self, symbol: str, order_link_id: str) -> dict | None:
+    def get_order(self, symbol: str, order_link_id: str,
+                  order_id: str | None = None) -> dict | None:
         order = self.orders.get(order_link_id)
         if order is None:
             return None
@@ -1453,11 +1487,56 @@ class DcaBot:
             c["fills"][entry_link] = cum      # вход исполнен — монитор не повторяет
             c["links"].pop(entry_link, None)
         except Exception as e:
+            # Ордер мог быть принят биржей, а ответ потерян (таймаут/обрыв):
+            # пока по символу есть позиция — сигнал не реджектим, принимаем её.
+            if self._adopt_exchange_position(c, entry_link, None, now):
+                return
             logger.error("вход %s не исполнен: %s", symbol, e)
             self.journal.write("signal_rejected", signal_id=sig_id,
                                symbol=symbol, reason="error", error=str(e))
             self.cycles.pop(sig_id, None)
             self._save_state()
+
+    def _adopt_exchange_position(self, c: dict, link: str,
+                                 order: dict | None, now: int) -> bool:
+        """Ордер не найден, но позиция на бирже есть — принять её в цикл.
+
+        Гарантия: сигнал никогда не реджектится, если по символу открыта
+        позиция. qty/avg берём с биржи, TP/стоп/DCA ставит _on_fill.
+        """
+        try:
+            pos = self.client.get_position(c["symbol"])
+        except Exception as e:  # noqa: BLE001 — не терять сигнал из-за сверки
+            self.journal.write("api_error", operation="adopt_position",
+                               symbol=c["symbol"], error=str(e))
+            return False
+        if not pos:
+            return False
+        qty = _f(pos.get("size") or pos.get("qty"))
+        price = _f(pos.get("avgPrice"))
+        if qty <= 0 or price <= 0:
+            return False
+        pos_side = str(pos.get("side") or "")
+        if pos_side in ("Buy", "Sell"):
+            c["side"] = pos_side
+        fee = _f((order or {}).get("cumExecFee", 0))
+        self.journal.write("position_adopted", signal_id=c["signal_id"],
+                           cycle_id=c["cycle_id"], symbol=c["symbol"],
+                           side=c["side"], qty=qty, avg_price=price)
+        logger.warning("вход %s не подтверждён ордером — принимаю позицию "
+                       "с биржи: %s x%.6g @%.6g",
+                       c["symbol"], c["side"], qty, price)
+        try:
+            self._on_fill(c, link, "entry", qty, price, fee, now, order or {})
+        except Exception as e:  # noqa: BLE001 — позиция уже на бирже
+            self.journal.write("api_error", operation="adopt_on_fill",
+                               symbol=c["symbol"], error=str(e))
+            logger.error("принятая позиция %s: пост-обработка неполна: %s",
+                         c["symbol"], e)
+            self._sync_exchange_stop(c)
+        c["fills"][link] = qty
+        c["links"].pop(link, None)
+        return True
 
     # ── размещение ордеров ────────────────────────────────────────────────────
 
@@ -1469,16 +1548,19 @@ class DcaBot:
             price=price, reduce_only=reduce_only, time_in_force=tif,
             order_link_id=link)
         c["links"][link] = {"role": role, "side": side, "qty": qty,
-                            "price": price, "reduce_only": reduce_only}
+                            "price": price, "reduce_only": reduce_only,
+                            "order_id": (order or {}).get("orderId")}
         c["fills"][link] = 0.0
         return order
 
     def _wait_fill(self, c: dict, link: str, timeout_ms: int) -> dict | None:
         deadline = time.time() + timeout_ms / 1000.0
         last: dict | None = None
+        order_id = (c["links"].get(link) or {}).get("order_id")
         while time.time() < deadline:
             try:
-                order = self.client.get_order(c["symbol"], link)
+                order = self.client.get_order(c["symbol"], link,
+                                              order_id=order_id)
             except Exception as e:
                 self.journal.write("api_error", operation="get_order",
                                    symbol=c["symbol"], link=link, error=str(e))
@@ -2199,7 +2281,9 @@ class DcaBot:
                 order = next((o for o in open_list
                               if str(o.get("orderLinkId")) == link), None)
             else:
-                order = self.client.get_order(c["symbol"], link)
+                order = self.client.get_order(
+                    c["symbol"], link,
+                    order_id=(c["links"].get(link) or {}).get("order_id"))
             if order is None:
                 continue
             status = str(order.get("orderStatus", "New"))

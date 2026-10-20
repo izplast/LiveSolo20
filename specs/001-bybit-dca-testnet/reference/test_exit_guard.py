@@ -101,7 +101,7 @@ class FakeClient:
         self.orders[order_link_id] = o
         return o
 
-    def get_order(self, symbol, link):
+    def get_order(self, symbol, link, order_id=None):
         return self.orders.get(link)
 
     def open_orders(self, symbol):
