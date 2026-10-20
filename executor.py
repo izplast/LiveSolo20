@@ -2418,6 +2418,7 @@ class DcaBot:
         except Exception as e:  # noqa: BLE001 — сверка не должна ронять цикл
             self.journal.write("api_error", operation="reconcile_positions",
                                error=str(e))
+            logger.error("сверка позиций не удалась: %s", e)
             return self._positions_on_exchange, 0
         self._last_reconcile_at = time.monotonic()
         positions = [p for p in rows
