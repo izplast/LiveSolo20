@@ -375,9 +375,9 @@ class BybitClient:
                 return self._check(r)
             return self._call_resilient(fn)
         qs = urllib.parse.urlencode(sorted(params.items()))
-        ts = int(time.time() * 1000)
 
         def fn():
+            ts = int(time.time() * 1000)
             r = requests.get(self.base + path + "?" + qs, timeout=10,
                              headers=self._headers(ts, self._sign(ts, qs)))
             return self._check(r)
@@ -385,9 +385,9 @@ class BybitClient:
 
     def _post(self, path: str, body: dict) -> dict:
         data = json.dumps(body, separators=(",", ":"))
-        ts = int(time.time() * 1000)
 
         def fn():
+            ts = int(time.time() * 1000)
             r = requests.post(self.base + path, data=data, timeout=10,
                               headers=self._headers(ts, self._sign(ts, data)))
             return self._check(r)
