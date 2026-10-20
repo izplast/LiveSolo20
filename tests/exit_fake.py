@@ -129,6 +129,9 @@ def make_bot(client=None, **kw):
     bot.processed = set()
     bot.offset = 0
     bot.orphan_recheck_sec = 60.0
+    bot._last_reconcile_at = None
+    bot._positions_on_exchange = 0
+    bot._orphans_total = 0
     bot.state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "_tmp_state.json")
     for k, v in kw.items():

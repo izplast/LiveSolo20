@@ -1149,6 +1149,9 @@ class DcaBot:
         self.signal_poll_sec = max(0.05, _f(signal_poll_sec) or 0.5)
         self.orphan_recheck_sec = 60.0
         self._last_orphan_check = 0.0
+        self._last_reconcile_at: float | None = None
+        self._positions_on_exchange = 0
+        self._orphans_total = 0
         self._instruments: dict[str, InstrumentInfo] = {}
         self._last_prices: dict[str, float] = {}
         self._load_state()
@@ -1218,15 +1221,26 @@ class DcaBot:
                     next_monitor = now + self.bp.monitor_interval_sec
                     if now - last_hb >= self.bp.heartbeat_sec:
                         last_hb = now
-                        logger.info("heartbeat: открыто циклов=%d обработано сигналов=%d",
-                                    sum(1 for c in self.cycles.values()
-                                        if not c.get("closed")),
-                                    len(self.processed))
+                        self._log_heartbeat(now)
                 time.sleep(0.05)
             except KeyboardInterrupt:
                 logger.info("остановка по Ctrl+C")
                 self._save_state()
                 break
+
+    def _log_heartbeat(self, now: float) -> None:
+        """Heartbeat: жив ли монитор и когда последний раз сверяли позиции.
+
+        reconcile_last — секунды с последней удачной сверки (-1, если ещё
+        не было): по нему видно, что reconcile крутится, даже когда сирот нет.
+        """
+        recon_age = (int(max(0.0, now - self._last_reconcile_at))
+                     if self._last_reconcile_at is not None else -1)
+        logger.info("heartbeat: открыто циклов=%d обработано сигналов=%d "
+                    "reconcile_last=%d positions_on_exchange=%d orphans_total=%d",
+                    sum(1 for c in self.cycles.values() if not c.get("closed")),
+                    len(self.processed), recon_age,
+                    self._positions_on_exchange, self._orphans_total)
 
     # ── приём сигналов ────────────────────────────────────────────────────────
 
@@ -2392,32 +2406,37 @@ class DcaBot:
 
     # ── сверка на старте ──────────────────────────────────────────────────────
 
-    def _reconcile_positions(self) -> None:
+    def _reconcile_positions(self) -> tuple[int, int]:
         """Сверить все биржевые позиции с открытыми циклами.
 
         Позиция без цикла — сирота (вход исполнился, но бот его не учёл):
         закрыть маркетом reduceOnly и записать orphan_closed.
+        Возвращает (позиций на бирже, найдено сирот).
         """
         try:
             rows = self.client.all_positions()
         except Exception as e:  # noqa: BLE001 — сверка не должна ронять цикл
             self.journal.write("api_error", operation="reconcile_positions",
                                error=str(e))
-            return
+            return self._positions_on_exchange, 0
+        self._last_reconcile_at = time.monotonic()
+        positions = [p for p in rows
+                     if isinstance(p, dict) and _f(p.get("size")) > 0]
+        self._positions_on_exchange = len(positions)
         open_symbols = {c["symbol"] for c in self.cycles.values()
                         if not c.get("closed")}
-        for pos in rows:
-            if not isinstance(pos, dict):
-                continue
-            qty = _f(pos.get("size"))
-            if qty <= 0:
-                continue
+        orphans = 0
+        for pos in positions:
             symbol = str(pos.get("symbol") or "")
             if not symbol or symbol in open_symbols:
                 continue
-            self._close_orphan(symbol, qty, str(pos.get("side") or ""))
+            orphans += 1
+            if self._close_orphan(symbol, _f(pos.get("size")),
+                                  str(pos.get("side") or "")):
+                self._orphans_total += 1
+        return self._positions_on_exchange, orphans
 
-    def _close_orphan(self, symbol: str, qty: float, side: str) -> None:
+    def _close_orphan(self, symbol: str, qty: float, side: str) -> bool:
         exit_side = "Sell" if side == "Buy" else "Buy"
         link = _link(f"orphan_{symbol}_{int(time.time() * 1000)}")
         try:
@@ -2432,7 +2451,7 @@ class DcaBot:
             self.journal.write("api_error", operation="orphan_close",
                                symbol=symbol, error=str(e))
             logger.error("сирота %s: закрыть не удалось: %s", symbol, e)
-            return
+            return False
         cum = _f(filled.get("cumExecQty")) if filled else 0.0
         price = _f(filled.get("avgPrice") or filled.get("price")) if filled else 0.0
         pnl = self._orphan_pnl(symbol, order)
@@ -2441,6 +2460,7 @@ class DcaBot:
                            order_id=(order or {}).get("orderId"))
         logger.warning("позиция-сирота %s закрыта: %s x%.6g @%.6g pnl=%.4f",
                        symbol, side, cum or qty, price, pnl)
+        return cum > 0
 
     def _orphan_pnl(self, symbol: str, order: dict | None) -> float:
         order_id = str((order or {}).get("orderId") or "")
@@ -2457,7 +2477,9 @@ class DcaBot:
         return 0.0
 
     def _startup_reconcile(self) -> None:
-        self._reconcile_positions()
+        n_pos, n_orphans = self._reconcile_positions()
+        logger.info("startup reconcile: позиций на бирже %d, сирот %d",
+                    n_pos, n_orphans)
         active = {cid: c for cid, c in self.cycles.items() if not c.get("closed")}
         if not active:
             return
