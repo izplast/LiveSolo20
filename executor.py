@@ -528,6 +528,14 @@ class BybitClient:
                         signed=True).get("list", [])
         return lst[0] if lst else None
 
+    def all_positions(self, settle_coin: str = "USDT",
+                      limit: int = 200) -> list[dict]:
+        lst = self._get("/v5/position/list",
+                        {"category": "linear", "settleCoin": settle_coin,
+                         "limit": str(max(1, min(200, limit)))},
+                        signed=True).get("list", [])
+        return lst if isinstance(lst, list) else []
+
     def closed_pnl(self, symbol: str, limit: int = 20) -> list[dict]:
         """Закрытые PnL: фактическая цена выхода биржевого стопа.
 
@@ -988,6 +996,12 @@ class PaperClient:
         return {"side": pos["side"], "qty": str(pos["qty"]),
                 "avgPrice": str(pos["avg"]), "positionStatus": "Normal"}
 
+    def all_positions(self, settle_coin: str = "USDT",
+                      limit: int = 200) -> list[dict]:
+        return [{"symbol": sym, "size": str(pos["qty"]), "side": pos["side"],
+                 "avgPrice": str(pos["avg"])}
+                for sym, pos in self.positions.items() if pos["qty"] > 0]
+
     def set_trading_stop(self, symbol: str, stop_loss: str | None,
                            trigger: str = "MarkPrice") -> dict:
         """Paper: стоп не исполняется движком (ботовый hard_sl в мониторе
@@ -1133,6 +1147,8 @@ class DcaBot:
         self.max_exit_slippage_pct = max(0.0, _f(max_exit_slippage_pct))
         self.exit_force_after_sec = max(0.0, _f(exit_force_after_sec))
         self.signal_poll_sec = max(0.05, _f(signal_poll_sec) or 0.5)
+        self.orphan_recheck_sec = 60.0
+        self._last_orphan_check = 0.0
         self._instruments: dict[str, InstrumentInfo] = {}
         self._last_prices: dict[str, float] = {}
         self._load_state()
@@ -1198,6 +1214,9 @@ class DcaBot:
                     next_signal_poll = now + max(0.05, self.signal_poll_sec)
                 if now >= next_monitor:
                     self._monitor_cycles()
+                    if now - self._last_orphan_check >= self.orphan_recheck_sec:
+                        self._last_orphan_check = now
+                        self._reconcile_positions()
                     self._save_state()
                     next_monitor = now + self.bp.monitor_interval_sec
                     if now - last_hb >= self.bp.heartbeat_sec:
@@ -2378,7 +2397,72 @@ class DcaBot:
 
     # ── сверка на старте ──────────────────────────────────────────────────────
 
+    def _reconcile_positions(self) -> None:
+        """Сверить все биржевые позиции с открытыми циклами.
+
+        Позиция без цикла — сирота (вход исполнился, но бот его не учёл):
+        закрыть маркетом reduceOnly и записать orphan_closed.
+        """
+        try:
+            rows = self.client.all_positions()
+        except Exception as e:  # noqa: BLE001 — сверка не должна ронять цикл
+            self.journal.write("api_error", operation="reconcile_positions",
+                               error=str(e))
+            return
+        open_symbols = {c["symbol"] for c in self.cycles.values()
+                        if not c.get("closed")}
+        for pos in rows:
+            if not isinstance(pos, dict):
+                continue
+            qty = _f(pos.get("size"))
+            if qty <= 0:
+                continue
+            symbol = str(pos.get("symbol") or "")
+            if not symbol or symbol in open_symbols:
+                continue
+            self._close_orphan(symbol, qty, str(pos.get("side") or ""))
+
+    def _close_orphan(self, symbol: str, qty: float, side: str) -> None:
+        exit_side = "Sell" if side == "Buy" else "Buy"
+        link = _link(f"orphan_{symbol}_{int(time.time() * 1000)}")
+        try:
+            order = self.client.create_order(
+                symbol=symbol, side=exit_side, order_type="Market", qty=qty,
+                price=None, reduce_only=True, time_in_force="IOC",
+                order_link_id=link)
+            ctx = {"symbol": symbol, "fills": {},
+                   "links": {link: {"order_id": (order or {}).get("orderId")}}}
+            filled = self._wait_fill(ctx, link, self.bp.fill_timeout_ms)
+        except Exception as e:  # noqa: BLE001 — сироту добьём следующим тактом
+            self.journal.write("api_error", operation="orphan_close",
+                               symbol=symbol, error=str(e))
+            logger.error("сирота %s: закрыть не удалось: %s", symbol, e)
+            return
+        cum = _f(filled.get("cumExecQty")) if filled else 0.0
+        price = _f(filled.get("avgPrice") or filled.get("price")) if filled else 0.0
+        pnl = self._orphan_pnl(symbol, order)
+        self.journal.write("orphan_closed", symbol=symbol, side=side,
+                           qty=cum or qty, price=price, pnl=pnl,
+                           order_id=(order or {}).get("orderId"))
+        logger.warning("позиция-сирота %s закрыта: %s x%.6g @%.6g pnl=%.4f",
+                       symbol, side, cum or qty, price, pnl)
+
+    def _orphan_pnl(self, symbol: str, order: dict | None) -> float:
+        order_id = str((order or {}).get("orderId") or "")
+        try:
+            rows = self.client.closed_pnl(symbol, limit=20)
+        except Exception:  # noqa: BLE001 — pnl не критичен для закрытия
+            rows = []
+        for r in rows:
+            if isinstance(r, dict) and order_id \
+                    and str(r.get("orderId")) == order_id:
+                return _f(r.get("closedPnl"))
+        if rows and isinstance(rows[0], dict):
+            return _f(rows[0].get("closedPnl"))
+        return 0.0
+
     def _startup_reconcile(self) -> None:
+        self._reconcile_positions()
         active = {cid: c for cid, c in self.cycles.items() if not c.get("closed")}
         if not active:
             return
