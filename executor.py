@@ -1373,7 +1373,6 @@ class DcaBot:
                                leverage=self.p.leverage, ret_code=110043)
             logger.info("плечо %s уже %s (110043) — продолжаем",
                         symbol, self.p.leverage)
-        self.leverage_applied.add(symbol)
         logger.info("плечо %s → %s", symbol, self.p.leverage)
 
     def _open_cycle(self, sig: dict, recv_ts: int) -> None:
@@ -1479,6 +1478,8 @@ class DcaBot:
             order = self._wait_fill(c, entry_link, self.bp.fill_timeout_ms)
             cum = _f(order.get("cumExecQty", 0)) if order else 0.0
             if order is None or cum <= 0 or order.get("orderStatus") == "Rejected":
+                if self._adopt_exchange_position(c, entry_link, order, now):
+                    return
                 raise BybitOrderError(
                     f"вход не исполнился: {order.get('orderStatus') if order else 'нет ордера'}")
             price = _f(order.get("avgPrice") or order.get("price") or ref)
