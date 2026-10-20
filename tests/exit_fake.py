@@ -128,7 +128,6 @@ def make_bot(client=None, **kw):
     bot._last_prices = {}
     bot.processed = set()
     bot.offset = 0
-    bot.leverage_applied = set()
     bot.orphan_recheck_sec = 60.0
     bot.state_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "_tmp_state.json")

@@ -1158,14 +1158,12 @@ class DcaBot:
     def _load_state(self) -> None:
         self.offset = 0
         self.processed: set[str] = set()
-        self.leverage_applied: set[str] = set()
         self.cycles: dict[str, dict] = {}
         try:
             with open(self.state_path, encoding="utf-8") as f:
                 st = json.load(f)
             self.offset = int(st.get("offset") or 0)
             self.processed = set(str(x) for x in (st.get("processed_ids") or []))
-            self.leverage_applied = set(str(x) for x in (st.get("leverage") or []))
             self.cycles = {str(k): v for k, v in (st.get("cycles") or {}).items()}
         except (OSError, ValueError):
             pass  # первый запуск
@@ -1174,7 +1172,6 @@ class DcaBot:
         state = {
             "offset": self.offset,
             "processed_ids": list(self.processed)[-1000:],
-            "leverage": sorted(self.leverage_applied),
             "cycles": {cid: c for cid, c in self.cycles.items()
                        if not c.get("closed")},
         }
@@ -1380,10 +1377,8 @@ class DcaBot:
         return None
 
     def _apply_leverage(self, symbol: str) -> None:
-        if symbol in self.leverage_applied:
-            return
         try:
-            self.client.set_leverage(symbol, self.p.leverage)  # FR-018: один раз
+            self.client.set_leverage(symbol, self.p.leverage)
         except BybitApiError as e:
             if e.ret_code != 110043:
                 raise
