@@ -110,6 +110,7 @@ DEFAULT_VOL_MULT = 1.5
 DEFAULT_NATR_MIN = 0.90
 DEFAULT_NATR_MAX = 1.5
 DEFAULT_NATR_PERIOD = 14
+DEFAULT_CONFIG_PATH = "config/config.yml"
 WS_CHUNK_SIZE = 10
 WS_PING_INTERVAL = 15
 WS_PONG_TIMEOUT = 20
@@ -1672,8 +1673,42 @@ class MidcapScreener:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Конфиг и CLI
 # ---------------------------------------------------------------------------
+def load_screener_config(path: str = DEFAULT_CONFIG_PATH) -> dict:
+    """Секция screener из config.yml. Нет файла/ключа — пустой dict (дефолты)."""
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+        return raw.get("screener", {}) or {}
+    except FileNotFoundError:
+        log(f"config: {path} не найден — используем значения по умолчанию")
+        return {}
+    except Exception as e:
+        log(f"config: не удалось прочитать {path} ({e}) — используем значения по умолчанию")
+        return {}
+
+
+def resolve_natr_thresholds(args, cfg: dict) -> Tuple[float, float]:
+    """CLI > config.yml > DEFAULT_NATR_*; возвращает (min, max)."""
+    min_raw = args.natr_min if args.natr_min is not None else cfg.get("natr_min", DEFAULT_NATR_MIN)
+    max_raw = args.natr_max if args.natr_max is not None else cfg.get("natr_max", DEFAULT_NATR_MAX)
+    try:
+        natr_min, natr_max = float(min_raw), float(max_raw)
+    except (TypeError, ValueError):
+        raise SystemExit(f"некорректные NATR-пороги: {min_raw!r}..{max_raw!r}")
+    if natr_min > natr_max:
+        raise SystemExit(f"некорректные NATR-пороги: min={natr_min} > max={natr_max}")
+    return natr_min, natr_max
+
+
+def natr_source(args, cfg: dict, key: str) -> str:
+    if getattr(args, key) is not None:
+        return "CLI"
+    return "config" if key in cfg else "default"
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=f"Midcap #{MIDCAP_START}-{MIDCAP_END} screener WS (kline.1) — с timeline для бота")
     ap.add_argument("--rank-start", type=int, default=MIDCAP_START, help="начало ранга (100)")
@@ -1682,9 +1717,13 @@ def parse_args(argv=None):
     ap.add_argument("--duration", type=int, default=DEFAULT_DURATION_SEC, help="длительность сек (36000=10ч)")
     ap.add_argument("--csv", type=str, default=DEFAULT_CSV, help="путь к CSV сигналов")
     ap.add_argument("--timeline", type=str, default=DEFAULT_TIMELINE_CSV, help="путь к timeline CSV для бота")
+    ap.add_argument("--config", type=str, default=DEFAULT_CONFIG_PATH,
+                    help="путь к config.yml (NATR-пороги; CLI переопределяет)")
     ap.add_argument("--vol-mult", type=float, default=DEFAULT_VOL_MULT, help="порог volume_ratio")
-    ap.add_argument("--natr-min", type=float, default=DEFAULT_NATR_MIN, help="мин NATR")
-    ap.add_argument("--natr-max", type=float, default=DEFAULT_NATR_MAX, help="макс NATR (реджект NATR>max)")
+    ap.add_argument("--natr-min", type=float, default=None,
+                    help=f"мин NATR (по умолчанию из config.yml, иначе {DEFAULT_NATR_MIN})")
+    ap.add_argument("--natr-max", type=float, default=None,
+                    help=f"макс NATR (по умолчанию из config.yml, иначе {DEFAULT_NATR_MAX})")
     ap.add_argument("--uhlo-length", type=int, default=15, help="длина UHLO для тренда 1м")
     ap.add_argument("--uhlo-length-15m", type=int, default=20, help="длина UHLO для тренда 15м")
     ap.add_argument("--vwap-max-std", type=float, default=1.5, help="F6: макс отклонение close от VWAP20 в std (0 — выкл)")
@@ -1713,11 +1752,15 @@ async def amain(argv=None):
     ws_url = args.ws_url
     if not ws_url and args.testnet:
         ws_url = BYBIT_WS_PUBLIC_TESTNET
+    cfg = load_screener_config(args.config)
+    natr_min, natr_max = resolve_natr_thresholds(args, cfg)
+    log(f"NATR пороги: min={natr_min} ({natr_source(args, cfg, 'natr_min')}), "
+        f"max={natr_max} ({natr_source(args, cfg, 'natr_max')}), config={args.config}")
     screener = MidcapScreener(
         rank_start=args.rank_start, rank_end=args.rank_end,
         interval_sec=args.interval, duration_sec=args.duration,
         csv_path=args.csv, timeline_path=args.timeline,
-        vol_mult=args.vol_mult, natr_min=args.natr_min, natr_max=args.natr_max, uhlo_length=args.uhlo_length,
+        vol_mult=args.vol_mult, natr_min=natr_min, natr_max=natr_max, uhlo_length=args.uhlo_length,
         uhlo_length_15m=args.uhlo_length_15m,
         vwap_max_std=args.vwap_max_std, hv_corr_max=args.hv_corr_max,
         body_range_max=args.body_range_max, f1_enabled=not args.no_f1,
