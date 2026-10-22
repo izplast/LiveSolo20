@@ -194,6 +194,10 @@ planned_ladder_notional = backtest.planned_ladder_notional
 
 logger = _logger
 
+# Порог паузы между тактами монитора: больше — процесс был заморожен
+# (Android wake-lock/doze), пишем process_stall для последующего разбора.
+PROCESS_STALL_GAP_SEC = 30.0
+
 # ── вспомогательное ──────────────────────────────────────────────────────────
 
 
@@ -371,14 +375,14 @@ class BybitClient:
         params = dict(params or {})
         if not signed:
             def fn():
-                r = requests.get(self.base + path, params=params, timeout=10)
+                r = requests.get(self.base + path, params=params, timeout=(3, 7))
                 return self._check(r)
             return self._call_resilient(fn)
         qs = urllib.parse.urlencode(sorted(params.items()))
 
         def fn():
             ts = int(time.time() * 1000)
-            r = requests.get(self.base + path + "?" + qs, timeout=10,
+            r = requests.get(self.base + path + "?" + qs, timeout=(3, 7),
                              headers=self._headers(ts, self._sign(ts, qs)))
             return self._check(r)
         return self._call_resilient(fn)
@@ -388,7 +392,7 @@ class BybitClient:
 
         def fn():
             ts = int(time.time() * 1000)
-            r = requests.post(self.base + path, data=data, timeout=10,
+            r = requests.post(self.base + path, data=data, timeout=(3, 7),
                               headers=self._headers(ts, self._sign(ts, data)))
             return self._check(r)
         return self._call_resilient(fn)
@@ -397,7 +401,7 @@ class BybitClient:
     def server_time(self) -> int:
         # поле time лежит в корне ответа, а не в result — читаем сырой JSON.
         def fn():
-            r = requests.get(self.base + "/v5/market/time", timeout=10)
+            r = requests.get(self.base + "/v5/market/time", timeout=(3, 7))
             if not 200 <= r.status_code < 300:
                 raise ResponseError(r.status_code, r.text[:200])
             return int(r.json().get("time", 0))
@@ -1150,6 +1154,7 @@ class DcaBot:
         self.orphan_recheck_sec = 60.0
         self._last_orphan_check = 0.0
         self._last_reconcile_at: float | None = None
+        self._last_monitor_tick: float | None = None
         self._positions_on_exchange = 0
         self._orphans_total = 0
         self._instruments: dict[str, InstrumentInfo] = {}
@@ -1213,6 +1218,7 @@ class DcaBot:
                     self._poll_signals()
                     next_signal_poll = now + max(0.05, self.signal_poll_sec)
                 if now >= next_monitor:
+                    self._check_process_stall(now)
                     self._monitor_cycles()
                     if now - self._last_orphan_check >= self.orphan_recheck_sec:
                         self._last_orphan_check = now
@@ -1227,6 +1233,26 @@ class DcaBot:
                 logger.info("остановка по Ctrl+C")
                 self._save_state()
                 break
+
+    def _check_process_stall(self, now: float) -> float | None:
+        """Зафиксировать паузу между тактами монитора (заморозка процесса).
+
+        now — time.monotonic() на входе такта. Если с прошлого такта прошло
+        больше PROCESS_STALL_GAP_SEC, пишем событие process_stall в журнал и
+        WARNING в лог: по нему видно, помог ли wake-lock.
+        """
+        last = self._last_monitor_tick
+        self._last_monitor_tick = now
+        if last is None:
+            return None
+        gap = now - last
+        if gap > PROCESS_STALL_GAP_SEC:
+            gap_sec = round(gap, 1)
+            self.journal.write("process_stall", gap_sec=gap_sec)
+            logger.warning("process_stall: пауза монитора %.1f с (> %.0f с)",
+                           gap, PROCESS_STALL_GAP_SEC)
+            return gap
+        return None
 
     def _log_heartbeat(self, now: float) -> None:
         """Heartbeat: жив ли монитор и когда последний раз сверяли позиции.

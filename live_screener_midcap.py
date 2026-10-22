@@ -115,6 +115,10 @@ WS_CHUNK_SIZE = 10
 WS_PING_INTERVAL = 15
 WS_PONG_TIMEOUT = 20
 
+# Порог паузы между тактами монитора: больше — процесс был заморожен
+# (Android wake-lock/doze), пишем process_stall для последующего разбора.
+PROCESS_STALL_GAP_SEC = 30.0
+
 # Уровень логирования: INFO по умолчанию (без сырых WS-свечей), DEBUG включает детальные дампы
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # INFO | DEBUG
 ENABLE_DEBUG_WS = LOG_LEVEL == "DEBUG"  # сырые kline.1 raw dumps только в DEBUG режиме
@@ -789,6 +793,7 @@ class MidcapScreener:
         self._last_kline1_confirm_ms: int | None = None  # время последней confirm=kline.1
         self._fatal_reason: str | None = None  # причина фатального выхода (exit code 1)
         self._exit_code: int = 0
+        self._last_monitor_tick: float | None = None  # прошлый такт главного цикла
         self.concurrency = concurrency
         self.dry_run = dry_run
         self.ws_url = ws_url
@@ -1386,6 +1391,27 @@ class MidcapScreener:
                 natr_total += 1
         return new_signals, natr_no_trend, natr_total
 
+    def _check_process_stall(self, now: float) -> float | None:
+        """Зафиксировать паузу между тактами главного цикла монитора.
+
+        now — time.monotonic() на входе такта. Если с прошлого такта прошло
+        больше PROCESS_STALL_GAP_SEC, пишем событие process_stall в журнал и
+        WARNING в лог: по нему видно, помог ли wake-lock.
+        """
+        last = self._last_monitor_tick
+        self._last_monitor_tick = now
+        if last is None:
+            return None
+        gap = now - last
+        if gap > PROCESS_STALL_GAP_SEC:
+            gap_sec = round(gap, 1)
+            if self.journal:
+                self.journal.write("process_stall", gap_sec=gap_sec)
+            log(f"WARNING process_stall: пауза монитора {gap:.1f} с "
+                f"(> {PROCESS_STALL_GAP_SEC:.0f} с)")
+            return gap
+        return None
+
     async def _timeline_loop(self, end_ts: float):
         # выравнивание до следующей минуты
         now = time.time()
@@ -1561,6 +1587,7 @@ class MidcapScreener:
         timeline_task = asyncio.create_task(self._timeline_loop(end_ts))
         try:
             while time.time() < end_ts and not self._stop.is_set():
+                self._check_process_stall(time.monotonic())
                 await asyncio.sleep(0.5)
                 if ws_task.done() and not self._stop.is_set():
                     # WS упал без reconnect — перезапустим
