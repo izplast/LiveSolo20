@@ -981,7 +981,6 @@ class MidcapScreener:
                      price=price, volume_ratio=float(vr) if vr else 0,
                      atr=float(natr) if natr else 0,
                      time_str=time_str, ts_ms=ts_ms, side=side)
-        self.last_signal_ts[sym] = ts_ms
         return (sig, None, True, None)
 
     def _snapshot_timeline_state(self) -> Tuple[List[Tuple[str,int,float]], int]:
@@ -1020,7 +1019,9 @@ class MidcapScreener:
                 return
             if any(f"{s.symbol}:1:{s.ts_ms}" == sig_id for s in self.signals):
                 return
-            self._pending_signals.append(sig)
+            # dry-run не имеет timeline-цикла, который чистит pending.
+            if not self.dry_run:
+                self._pending_signals.append(sig)
         # сразу пишем в csv/журнал/консоль (realtime), timeline заберёт агрегат позже
         assert self.csv_logger is not None
         self.csv_logger.write(sig)
@@ -1075,6 +1076,9 @@ class MidcapScreener:
             if diagnostics:
                 sig_payload["diagnostics"] = diagnostics
             self.journal.write("signal_sent", signal=sig_payload)
+            # Кулдаун ставится только после фактической отправки сигнала:
+            # снапшот/оценка символа больше не «съедают» окно кулдауна.
+            self.last_signal_ts[sig.symbol] = sig.ts_ms
         except Exception:
             pass
         print(f"[{sig.timestamp}] [SIGNAL] Rank #{sig.rank} | {sig.symbol} | Price: {sig.price:.4f} | "
@@ -1286,13 +1290,8 @@ class MidcapScreener:
             t0 = time.time()
             # эмулируем poll_once через REST но без WS
             new_signals, natr_no_trend, natr_total = await self._poll_once_rest(sem)
-            async with self._lock:
-                for s in new_signals:
-                    self._pending_signals.append(s)
-                    self.signals.append(s)
-                    assert self.csv_logger is not None
-                    self.csv_logger.write(s)
-                    print(f"[{s.timestamp}] [SIGNAL] Rank #{s.rank} | {s.symbol} | Price: {s.price:.4f} | Vol_ratio: {s.volume_ratio:.2f} | ATR: {s.atr:.3f} | Side: {s.side} | Time: {s.time_str}", flush=True)
+            for s in new_signals:
+                await self._emit_signal(s)
             # timeline сразу? оставим таймеру отдельно, но fallback пишет напрямую раз в интервал
             await asyncio.sleep(max(0, self.interval_sec - (time.time() - t0)))
 
@@ -1371,7 +1370,6 @@ class MidcapScreener:
                                      price=float(last[4]), volume_ratio=float(vr) if vr else 0,
                                      atr=float(natr) if natr else 0,
                                      time_str=time_str, ts_ms=last[0], side=side)
-                        self.last_signal_ts[sym] = last[0]
                         return (sig, None, True)
                     return (None, None, natr_pass)
                 except Exception as e:
@@ -1531,17 +1529,7 @@ class MidcapScreener:
                             natr_total += 1
                         if sig:
                             minute_signals.append(sig)
-                            self.csv_logger.write(sig)
-                            self.signals.append(sig)
-                            try:
-                                signal_id = f"{sig.symbol}:1:{sig.ts_ms}"
-                                self.journal.write("signal_sent", signal={
-                                    "signal_id": signal_id, "symbol": sig.symbol, "side": sig.side,
-                                    "price": sig.price, "ts": sig.ts_ms, "rank": sig.rank, "atr": sig.atr, "volume_ratio": sig.volume_ratio,
-                                })
-                            except Exception:
-                                pass
-                            print(f"[{sig.timestamp}] [SIGNAL] Rank #{sig.rank} | {sig.symbol} | Price: {sig.price:.4f} | Vol_ratio: {sig.volume_ratio:.2f} | ATR: {sig.atr:.3f} | Side: {sig.side} | Time: {sig.time_str}", flush=True)
+                            await self._emit_signal(sig)
                     dt_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     ts_ms = int(time.time()*1000)
                     time_str = datetime.now().strftime("%H:%M:%S")
