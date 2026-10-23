@@ -2329,6 +2329,14 @@ class DcaBot:
 
     def _monitor_cycle(self, c: dict) -> None:
         now = int(time.time() * 1000)
+        # Сверка биржевой позиции ДО обработки филлов: если биржа уже закрыла
+        # позицию (stopLoss/TP), цикл должен финализироваться раньше, чем
+        # _on_fill попытается выставить reduce-only ордера в пустую позицию
+        # (Bybit 110017) и упадёт, оставив филл неучтённым навсегда.
+        if _f(c.get("qty")) > 0 and not c.get("closing"):
+            self._sync_position(c)
+            if c.get("closed"):
+                return
         open_list = self.client.open_orders(c["symbol"])
         seen = {str(o.get("orderLinkId")) for o in open_list}
         for link in list(c["links"].keys()):
@@ -2348,19 +2356,24 @@ class DcaBot:
                 role = c["links"][link]["role"]
                 price = _f(order.get("avgPrice") or order.get("price"))
                 fee = _f(order.get("cumExecFee", 0))
-                self._on_fill(c, link, role, cum - prev, price, fee, now, order)
-                c["fills"][link] = cum
+                try:
+                    self._on_fill(c, link, role, cum - prev, price, fee,
+                                  now, order)
+                except Exception as e:  # noqa: BLE001 — филл уже учтён
+                    # Сбой пост-обработки (например, TP в нулевую позицию)
+                    # не должен повторять один и тот же филл каждый такт:
+                    # фиксируем прогресс и убираем терминальный линк ниже.
+                    self.journal.write("api_error", operation="on_fill",
+                                       symbol=c["symbol"], link=link,
+                                       role=role, error=str(e))
+                    logger.error("филл %s %s (%s): пост-обработка неполна: %s",
+                                 c["symbol"], link, role, e)
+                finally:
+                    c["fills"][link] = cum
             if status in ("Filled", "Cancelled", "Rejected", "Expired"):
                 c["links"].pop(link, None)
         if c.get("closed"):
             return
-        # Биржа могла закрыть позицию сама (сработал выставленный stopLoss):
-        # сверить остатки до проверки выходов, иначе бот будет слать маркеты
-        # в пустую позицию до бесконечности.
-        if c.get("stop_armed") and not c.get("closing"):
-            self._sync_position(c)
-            if c.get("closed"):
-                return
         # Стоп не выставлен (ошибка постановки ранее): повтор каждую минуту
         # такта; при пробитом стопе _sync_exchange_stop закроет сам.
         if (not c.get("stop_armed") and c.get("stop_level")
@@ -2547,7 +2560,12 @@ class DcaBot:
             if c is None:
                 continue
             if d.action == "close_local_cycle":
-                self._finalize_orphan(c, "manual")
+                # Позиции на бирже нет: сначала пробуем фактический выход
+                # (closedPnl/execution), чтобы PnL не считался по tp_price;
+                # оценка _finalize_orphan — только если API не ответил.
+                self._sync_position(c)
+                if not c.get("closed"):
+                    self._finalize_orphan(c, "manual")
             elif d.action in ("sync_position", "sync_position_qty",
                               "sync_position_avg") and d.exchange is not None:
                 c["qty"] = d.exchange.qty
@@ -2559,7 +2577,7 @@ class DcaBot:
             if d.action == "recreate_order" and d.local is not None \
                     and d.local.kind == "dca":
                 c = active.get(d.local.cycle_id)
-                if c and d.local.price:
+                if c and not c.get("closed") and d.local.price:
                     try:
                         self._place(c, side=c["side"], order_type="Limit",
                                     qty=d.local.qty, price=d.local.price,
