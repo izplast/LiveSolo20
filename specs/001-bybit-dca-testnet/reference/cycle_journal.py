@@ -32,9 +32,12 @@ Termux-хосте). Пишет в `logs/bot-events.jsonl` (ключ `bot.journal
 - Длительность переживает смерть процесса: при старте открытые циклы
   восстанавливаются из уже записанных `cycle_opened` (на Android смерть
   процесса — ожидаемое событие, см. config `exchange_take_profit`).
-- `exit_reason`: take_profit | hard_sl | exchange_sl | trailing | time_exit | manual.
+- `exit_reason`: take_profit | hard_sl | exchange_sl | external_close |
+  trailing | time_exit | manual.
   `exchange_sl` — позицию закрыл выставленный на бирже stopLoss, пока бот
   был жив/спал (бот лишь фиксирует факт и фактический closedPnl).
+  `external_close` — позиции на бирже уже нет, но следов StopLoss в
+  исполнениях нет (закрыл пользователь/внешний ордер); PnL — из closed-pnl.
 - Секреты и подписи в журнал не попадают (FR-024).
 
 Запуск проверок:
@@ -49,8 +52,8 @@ import time
 from typing import Any, Callable
 
 # Причины выхода, которые умеет разбирать tools/stats_summary.py.
-EXIT_REASONS = ("take_profit", "hard_sl", "exchange_sl", "trailing",
-                "time_exit", "manual")
+EXIT_REASONS = ("take_profit", "hard_sl", "exchange_sl", "external_close",
+                "trailing", "time_exit", "manual")
 
 
 def now_ms() -> int:
@@ -129,7 +132,8 @@ class CycleJournal:
                      **fields: Any) -> None:
         """Зафиксировать закрытие цикла: время окончания и длительность.
 
-        exit_reason: take_profit | hard_sl | exchange_sl | trailing | time_exit | manual.
+        exit_reason: take_profit | hard_sl | exchange_sl | external_close |
+        trailing | time_exit | manual.
         pnl — в USDT.
         open_ts берётся из слоя журнала (в т.ч. восстановленный после
         перезапуска) и дублируется в событие для независимой от порядка

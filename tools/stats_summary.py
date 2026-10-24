@@ -233,7 +233,9 @@ def summarize(cycles: Sequence[dict[str, Any]],
         },
         "закрыто_циклов": closed,
         "по_причине": {r: reasons.get(r, 0) for r in
-                       ("take_profit", "hard_sl", "trailing", "time_exit", "manual", "unknown")},
+                       ("take_profit", "hard_sl", "exchange_sl",
+                        "external_close", "trailing", "time_exit",
+                        "manual", "unknown")},
         "pnl_usdt": round(total_pnl, 4) if pnls else 0.0,
         "циклов_с_pnl": len(pnls),
         "win_rate_pct": round(wins / len(pnls) * 100, 1) if pnls else 0.0,
@@ -303,6 +305,8 @@ def render(s: dict[str, Any], by_symbol: bool) -> str:
     lines.append(f"  Закрыто циклов:   {s['закрыто_циклов']}")
     lines.append(f"    по TP:          {s['по_причине']['take_profit']}")
     lines.append(f"    по SL:          {s['по_причине']['hard_sl']}")
+    lines.append(f"    по бирж. стопу: {s['по_причине']['exchange_sl']}")
+    lines.append(f"    внешнее закрытие: {s['по_причине']['external_close']}")
     lines.append(f"    по трейлингу:   {s['по_причине']['trailing']}")
     lines.append(f"    по времени:     {s['по_причине']['time_exit']}")
     lines.append(f"    вручную/иное:   {s['по_причине']['manual'] + s['по_причине']['unknown']}")

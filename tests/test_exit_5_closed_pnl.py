@@ -22,7 +22,7 @@ now = int(time.time() * 1000)
 # funding 0 -> чистый closedPnl = -3.02
 rows = [{"symbol": "TSTUSDT", "avgExitPrice": "97.1", "closedPnl": "-3.02",
          "openFee": "0.05", "closeFee": "0.07",
-         "updatedTime": str(now)}]
+         "stopOrderType": "StopLoss", "updatedTime": str(now)}]
 client = PnlClient(rows)
 client.pos_qty = 0.0
 bot = make_bot(client)
@@ -71,7 +71,7 @@ c2["links"] = {}
 bot2._sync_position(c2)
 fills2 = [kw for n, a, kw in bot2.journal.rows
           if n == "write" and a and a[0] == "order_filled"
-          and kw.get("mode") == "exchange_stop"]
+          and kw.get("estimated") is True]
 check("фолбэк пишет estimated=True", len(fills2) == 1
       and fills2[0].get("estimated") is True, fills2)
 check("фолбэк цена = stop_price", abs(fills2[0].get("avg_fill_price", 0)

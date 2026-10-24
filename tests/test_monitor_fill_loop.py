@@ -81,8 +81,8 @@ check("биржа закрыла позицию → цикл снят", bot.cycl
 check("cycle_closed ровно один", len(bot.journal.reasons("cycle_closed")) == 1,
       bot.journal.reasons("cycle_closed"))
 closed = [kw for n, a, kw in bot.journal.rows if n == "cycle_closed"]
-check("reason=exchange_sl", closed and closed[0].get("exit_reason") == "exchange_sl",
-      closed)
+check("reason=external_close (следов StopLoss нет)",
+      closed and closed[0].get("exit_reason") == "external_close", closed)
 check("pnl из closedPnl", closed and abs(closed[0].get("pnl", 0) + 2.0) < 1e-9,
       closed)
 check("устаревший DCA-филл не применён", not count_fills(bot, "dca"),
@@ -143,8 +143,8 @@ bot3._startup_reconcile()
 
 check("startup: цикл закрыт фактическим PnL", c3.get("closed") is True, c3)
 closed3 = [kw for n, a, kw in bot3.journal.rows if n == "cycle_closed"]
-check("startup: exchange_sl + closedPnl",
-      closed3 and closed3[0].get("exit_reason") == "exchange_sl"
+check("startup: external_close + closedPnl",
+      closed3 and closed3[0].get("exit_reason") == "external_close"
       and abs(closed3[0].get("pnl", 0) + 2.0) < 1e-9, closed3)
 check("startup: DCA не пересоздан",
       not [c for c in client3.calls

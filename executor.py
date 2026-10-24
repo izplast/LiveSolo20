@@ -1751,6 +1751,9 @@ class DcaBot:
                                avg_price=c.get("avg_entry"),
                                bybit_response=resp if resp is not None else {})
         except Exception as e:  # noqa: BLE001
+            if self._is_zero_position_error(e) \
+                    and self._finalize_flat_cycle(c):
+                return
             if self._stop_breached(c["side"], self._stop_mark(c["symbol"]), px):
                 self._close_fast(c, "hard_sl")
             else:
@@ -1787,15 +1790,12 @@ class DcaBot:
                                    symbol=c["symbol"], error=str(e))
 
     def _sync_position(self, c: dict) -> None:
-        """Биржа закрыла позицию сама (сработал выставленный stopLoss).
+        """Биржа закрыла позицию сама — финализировать цикл по факту.
 
         Без этой сверки бот слал бы маркеты в пустую позицию каждый такт.
-        Цена выхода — фактическая из /v5/position/closed-pnl (фолбэк —
-        /v5/execution/list). По докам Bybit closedPnl уже чистый:
-        Position P&L − openFee − closeFee − funding, поэтому он идёт в
-        realized как есть, без повторного вычета fee (openFee+closeFee
-        пишется в журнал только информационно). stop_price +
-        estimated=True — только фолбэк, если API не ответил.
+        Цена/PnL — из /v5/position/closed-pnl (фолбэк — executions). Причина
+        выхода по факту: exchange_sl, если в исполнениях есть stopOrderType
+        StopLoss, иначе external_close (позицию закрыл не бот).
         """
         try:
             pos = self.client.get_position(c["symbol"])
@@ -1806,51 +1806,74 @@ class DcaBot:
             # size 0, но TP-лимитка исполнилась: это take_profit, а не стоп.
             if self._tp_filled_close(c):
                 return
-            for link, o in list(c["links"].items()):
-                if o["role"] in ("tp", "dca", "close_maker"):
-                    self._safe_cancel(c, link)
-            actual = self._fetch_exchange_exit(c)
-            if actual is not None:
-                exit_price, net, fee, source = actual
-                qty = _f(c.get("qty"))
-                if net is None:
-                    # execution-фолбэк: gross без комиссий — fee вычитается
-                    # штатно через c["fee"] в _finalize_close.
-                    gross = ((exit_price - c["avg_entry"]) * qty
-                             if c["side"] == "Buy"
-                             else (c["avg_entry"] - exit_price) * qty)
-                    c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
-                    c["fee"] = _f(c.get("fee")) + fee
-                else:
-                    # closedPnl чистый (комиссии open/close и фандинг уже
-                    # внутри) — он авторитетен за всю позицию: локальный
-                    # c["fee"] (вход/докупки) обнуляем, иначе двойной вычет.
-                    # Сюда доходим только без активных добивок (closing
-                    # guard в мониторе), т.е. prior realized всегда 0.
-                    c["realized_pnl"] = _f(c.get("realized_pnl")) + net
-                    c["fee"] = 0.0
-                c["exit_price"] = exit_price
-                c["pnl_source"] = "closed_pnl" if net is not None else "estimated"
-                c["closed_qty"] = _f(c.get("closed_qty")) + qty
-                self.journal.write("order_filled", signal_id=c["signal_id"],
-                                   cycle_id=c["cycle_id"], symbol=c["symbol"],
-                                   role="close", mode="exchange_stop",
-                                   avg_fill_price=round(exit_price, 8),
-                                   qty_closed=qty, qty_left=0,
-                                   estimated=False, price_source=source,
-                                   fee=round(fee, 8),
-                                   side=c["side"], qty=qty,
-                                   notional=_f(qty * exit_price),
-                                   avg_price=c.get("avg_entry"),
-                                   stop_level=c.get("stop_level"),
-                                   ts_signal=c["signal_ts"],
-                                   ts_confirmed=int(time.time() * 1000))
-                c["qty"] = 0.0
-                self._finalize_close(c, "exchange_sl")
-                return
+            self._finalize_flat_cycle(c, position_checked=True)
+
+    def _finalize_flat_cycle(self, c: dict, *,
+                             default_reason: str = "external_close",
+                             position_checked: bool = False) -> bool:
+        """Цикл есть, позиции на бирже нет — финализировать по closed-pnl.
+
+        Единый путь для 110017 на reduceOnly-закрытии, reconcile «цикл без
+        позиции» и стартовой сверки. Цена/PnL/fee берутся из
+        /v5/position/closed-pnl (pnl_source=closed_pnl); exit_reason — по
+        факту: exchange_sl при сработавшем биржевом стопе, иначе
+        external_close. Оставшиеся ордера цикла снимаются.
+
+        Возвращает True, если цикл финализирован.
+        """
+        if c.get("closed"):
+            return True
+        if _f(c.get("qty")) <= 0 and _f(c.get("closed_qty")) <= 0:
+            return False
+        symbol = c["symbol"]
+        if not position_checked:
+            ex_qty = self._exchange_position_qty(symbol)
+            if ex_qty is None or ex_qty > 0:
+                return False
+        for link, o in list(c["links"].items()):
+            if o["role"] in ("tp", "dca", "close_maker"):
+                self._safe_cancel(c, link)
+        reason = self._exchange_exit_reason(c, default=default_reason)
+        qty = _f(c.get("qty"))
+        actual = self._fetch_exchange_exit(c)
+        if actual is not None:
+            exit_price, net, fee, source = actual
+            if net is None:
+                # execution-фолбэк: gross без комиссий — fee вычитается
+                # штатно через c["fee"] в _finalize_close.
+                gross = ((exit_price - c["avg_entry"]) * qty
+                         if c["side"] == "Buy"
+                         else (c["avg_entry"] - exit_price) * qty)
+                c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
+                c["fee"] = _f(c.get("fee")) + fee
+            else:
+                # closedPnl чистый (комиссии open/close и фандинг уже
+                # внутри) — он авторитетен за всю позицию: локальный c["fee"]
+                # (вход/докупки) обнуляем, иначе двойной вычет.
+                c["realized_pnl"] = _f(c.get("realized_pnl")) + net
+                c["fee"] = 0.0
+            c["exit_price"] = exit_price
+            c["pnl_source"] = "closed_pnl" if net is not None else "estimated"
+            c["closed_qty"] = _f(c.get("closed_qty")) + qty
+            self.journal.write("order_filled", signal_id=c["signal_id"],
+                               cycle_id=c["cycle_id"], symbol=symbol,
+                               role="close", mode=("exchange_stop"
+                                                   if reason == "exchange_sl"
+                                                   else reason),
+                               avg_fill_price=round(exit_price, 8),
+                               qty_closed=qty, qty_left=0,
+                               estimated=False, price_source=source,
+                               fee=round(fee, 8),
+                               side=c["side"], qty=qty,
+                               notional=_f(qty * exit_price),
+                               avg_price=c.get("avg_entry"),
+                               stop_level=c.get("stop_level"),
+                               ts_signal=c["signal_ts"],
+                               ts_confirmed=int(time.time() * 1000))
+        else:
+            # API не ответил — оценка по stop_price, как раньше.
             est = _f(c.get("stop_price")) or 0.0
             if est > 0:
-                qty = _f(c.get("qty"))
                 gross = ((est - c["avg_entry"]) * qty if c["side"] == "Buy"
                          else (c["avg_entry"] - est) * qty)
                 c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
@@ -1858,8 +1881,10 @@ class DcaBot:
                 c["pnl_source"] = "estimated"
                 c["closed_qty"] = _f(c.get("closed_qty")) + qty
                 self.journal.write("order_filled", signal_id=c["signal_id"],
-                                   cycle_id=c["cycle_id"], symbol=c["symbol"],
-                                   role="close", mode="exchange_stop",
+                                   cycle_id=c["cycle_id"], symbol=symbol,
+                                   role="close", mode=("exchange_stop"
+                                                       if reason == "exchange_sl"
+                                                       else reason),
                                    avg_fill_price=round(est, 8),
                                    qty_closed=qty, qty_left=0,
                                    estimated=True,
@@ -1869,8 +1894,74 @@ class DcaBot:
                                    stop_level=c.get("stop_level"),
                                    ts_signal=c["signal_ts"],
                                    ts_confirmed=int(time.time() * 1000))
-            c["qty"] = 0.0
-            self._finalize_close(c, "exchange_sl")
+        c["qty"] = 0.0
+        c.pop("closing", None)
+        self._finalize_close(c, reason)
+        return True
+
+    def _exchange_position_qty(self, symbol: str) -> float | None:
+        """Размер позиции на бирже; None — API не ответил (не финализируем)."""
+        try:
+            pos = self.client.get_position(symbol)
+        except Exception:
+            return None
+        return _f((pos or {}).get("size") or (pos or {}).get("qty") or 0)
+
+    @staticmethod
+    def _is_zero_position_error(exc: BaseException) -> bool:
+        """110017: reduceOnly-ордер в нулевую позицию (позиции уже нет)."""
+        if isinstance(exc, BybitApiError):
+            return exc.ret_code == 110017
+        text = str(exc)
+        return "110017" in text or "current position is zero" in text.lower()
+
+    def _exchange_exit_reason(self, c: dict,
+                              default: str = "external_close") -> str:
+        """Причина закрытия по факту: сработал биржевой StopLoss или нет.
+
+        closed-pnl сначала (stopOrderType часто заполнен), затем лента
+        исполнений — у trading-stop закрытие видно там как StopLoss.
+        """
+        symbol = c["symbol"]
+        since = int(c.get("open_ts") or 0)
+        try:
+            rows = self.client.closed_pnl(symbol, limit=20)
+        except Exception:  # noqa: BLE001 — причина не критична для фиксации
+            rows = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            ts = int(_f(r.get("updatedTime") or r.get("createdTime")
+                        or r.get("closeTime") or 0))
+            if since and ts and ts < since:
+                continue
+            if "stop" in str(r.get("stopOrderType") or "").lower():
+                return "exchange_sl"
+        for method in ("executions", "closed_executions"):
+            fn = getattr(self.client, method, None)
+            if not callable(fn):
+                continue
+            try:
+                execs = fn(symbol, since, 50) if method == "executions" \
+                    else fn(symbol, since)
+            except TypeError:
+                try:
+                    execs = fn(symbol)
+                except Exception:  # noqa: BLE001
+                    execs = None
+            except Exception:  # noqa: BLE001
+                execs = None
+            for e in execs or []:
+                if not isinstance(e, dict):
+                    continue
+                ts = int(_f(e.get("execTime") or e.get("transactTime") or 0))
+                if since and ts and ts < since:
+                    continue
+                if "stop" in str(e.get("stopOrderType") or "").lower():
+                    return "exchange_sl"
+            if execs:
+                break
+        return default
 
     def _fetch_exchange_exit(self, c: dict):
         """(exit_price, net|None, fee, source) из closed-pnl/execution или None.
@@ -2244,6 +2335,11 @@ class DcaBot:
                                        limit_pct=self.max_exit_slippage_pct)
             self._apply_close_fill(c, cum, price, fee, role="close")
         except Exception as e:  # noqa: BLE001
+            # 110017: позиции уже нет (её закрыл биржевой стоп/внешний
+            # ордер). Это не ошибка закрытия — финализируем по closed-pnl.
+            if self._is_zero_position_error(e) \
+                    and self._finalize_flat_cycle(c):
+                return True
             self.journal.write("api_error", operation="market_close",
                                symbol=c["symbol"], reason=reason, error=str(e))
             logger.error("закрытие %s (%s) не удалось: %s",
@@ -2360,6 +2456,13 @@ class DcaBot:
                     self._on_fill(c, link, role, cum - prev, price, fee,
                                   now, order)
                 except Exception as e:  # noqa: BLE001 — филл уже учтён
+                    # 110017 на reduce-only TP: позиции на бирже уже нет.
+                    # Финализируем цикл, а не повторяем один и тот же филл.
+                    if self._is_zero_position_error(e) \
+                            and self._finalize_flat_cycle(c):
+                        c["fills"][link] = cum
+                        c["links"].pop(link, None)
+                        return
                     # Сбой пост-обработки (например, TP в нулевую позицию)
                     # не должен повторять один и тот же филл каждый такт:
                     # фиксируем прогресс и убираем терминальный линк ниже.
@@ -2446,10 +2549,13 @@ class DcaBot:
     # ── сверка на старте ──────────────────────────────────────────────────────
 
     def _reconcile_positions(self) -> tuple[int, int]:
-        """Сверить все биржевые позиции с открытыми циклами.
+        """Сверить все биржевые позиции с открытыми циклами — в обе стороны.
 
-        Позиция без цикла — сирота (вход исполнился, но бот его не учёл):
+        (a) Позиция без цикла — сирота (вход исполнился, но бот его не учёл):
         закрыть маркетом reduceOnly и записать orphan_closed.
+        (b) Цикл без позиции — финализировать по closed-pnl (exchange_sl или
+        external_close) и снять оставшиеся ордера: иначе цикл занимает слот
+        и вечно получает 110017 на reduce-only закрытиях.
         Возвращает (позиций на бирже, найдено сирот).
         """
         try:
@@ -2465,6 +2571,12 @@ class DcaBot:
         self._positions_on_exchange = len(positions)
         open_symbols = {c["symbol"] for c in self.cycles.values()
                         if not c.get("closed")}
+        exchange_symbols = {str(p.get("symbol") or "") for p in positions}
+        for c in list(self.cycles.values()):
+            if c.get("closed") or _f(c.get("qty")) <= 0:
+                continue
+            if c["symbol"] not in exchange_symbols:
+                self._finalize_flat_cycle(c, position_checked=True)
         orphans = 0
         for pos in positions:
             symbol = str(pos.get("symbol") or "")

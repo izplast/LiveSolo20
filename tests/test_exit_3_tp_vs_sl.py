@@ -1,4 +1,6 @@
 """Item 3: TP filled + size 0 -> take_profit, а не exchange_sl."""
+import time
+
 from exit_fake import FakeClient, make_bot, cyc, check
 
 # --- TP исполнился, биржа пуста ---
@@ -34,6 +36,10 @@ c2["links"] = {"t1_tp1": {"role": "tp", "side": "Sell", "qty": 1.0,
                           "price": 101.2, "reduce_only": True}}
 client2.by_link["t1_tp1"] = {"orderStatus": "New", "cumExecQty": "0",
                              "price": "101.2"}
+client2.executions = [{"symbol": "TSTUSDT",
+                       "execTime": int(time.time() * 1000),
+                       "execPrice": "97.5", "execQty": "1.0",
+                       "stopOrderType": "StopLoss", "orderType": "Market"}]
 bot2._sync_position(c2)
 closed2 = [kw for n, a, kw in bot2.journal.rows if n == "cycle_closed"]
 check("без TP-филла reason=exchange_sl", len(closed2) == 1
