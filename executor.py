@@ -1525,6 +1525,20 @@ class DcaBot:
             "trail_peak": None,
             "closed": False,
         }
+        plan = self._build_stop_plan(c, ref, qty)
+        if plan is not None and not plan["stop_beyond_last"]:
+            self.journal.write(
+                "stop_plan_rejected", signal_id=sig_id, symbol=symbol,
+                side=side, entry_price=ref, stop_level=plan["stop_level"],
+                last_level=plan["last_level"], stop_pct=plan["stop_pct"],
+                step_pct=plan["step_pct"])
+            self._reject(sig_id, "risk_limit", symbol=symbol,
+                         reason_detail=(
+                             f"стоп {plan['stop_level']:.8g} не дальше "
+                             f"последнего уровня лестницы "
+                             f"{plan['last_level']:.8g}"))
+            return
+        c["stop_plan"] = plan
         self.cycles[sig_id] = c
 
         entry_link = base
@@ -1675,18 +1689,70 @@ class DcaBot:
         stop_pct = effective_stop_pct(self.p, c.get("natr"))
         if not stop_pct:
             return None
+        base = _f(c.get("stop_avg_entry")) or _f(c.get("avg_entry"))
+        if base <= 0:
+            return None
         factor = 1 - stop_pct / 100 if c["side"] == "Buy" else 1 + stop_pct / 100
-        return c["avg_entry"] * factor
+        return base * factor
 
-    def _after_position_change(self, c: dict, now: int) -> None:
+    def _build_stop_plan(self, c: dict, entry_price: float,
+                         entry_qty: float) -> dict | None:
+        """Стоп от worst-case средней после всей лестницы DCA.
+
+        Средняя считается при условии, что заполнятся вход и все докупки
+        по плановым уровням. Стоп ставится один раз и после DCA не
+        пересчитывается. Если стоп не дальше последнего уровня лестницы,
+        вход отклоняется: иначе докупка сама пробьёт защиту.
+        """
+        p = self.p
+        stop_pct = effective_stop_pct(p, c.get("natr"))
+        if not stop_pct or entry_price <= 0 or entry_qty <= 0:
+            return None
+        step_pct = effective_step_pct(p, c.get("natr"))
+        total_qty = entry_qty
+        total_notional = entry_price * entry_qty
+        last_level = entry_price
+        levels: list[float] = []
+        for k in range(1, p.max_docups + 1):
+            last_level = last_level * (
+                1 - step_pct / 100 if c["side"] == "Buy"
+                else 1 + step_pct / 100)
+            qty = quantize_qty(
+                p.entry_usdt * p.multiplier ** k / last_level,
+                c.get("qty_step") or 0.0)
+            if qty < _f(c.get("min_qty")):
+                qty = _f(c.get("min_qty"))
+            if qty <= 0:
+                continue
+            levels.append(last_level)
+            total_qty += qty
+            total_notional += last_level * qty
+        worst_avg = total_notional / total_qty
+        stop = worst_avg * (
+            1 - stop_pct / 100 if c["side"] == "Buy"
+            else 1 + stop_pct / 100)
+        beyond = (stop < last_level if c["side"] == "Buy"
+                  else stop > last_level)
+        return {
+            "worst_avg": worst_avg,
+            "stop_level": stop,
+            "last_level": last_level,
+            "levels": levels,
+            "qty": total_qty,
+            "notional": total_notional,
+            "stop_pct": stop_pct,
+            "step_pct": step_pct,
+            "max_loss": abs(worst_avg - stop) * total_qty,
+            "stop_beyond_last": beyond,
+        }
+
+    def _after_position_change(self, c: dict, now: int,
+                               *, sync_stop: bool = True) -> None:
         p = self.p
         step_pct = effective_step_pct(p, c["natr"])
         tp_pct = rbot.take_profit_pct_at(p, c["docups"])
         tp = rbot.tp_price(c["avg_entry"], c["side"], tp_pct, c["tick_size"])
         self._place_tp(c, tp)
-        stop_level = self._stop_level_for(c)
-        if stop_level is not None:
-            c["stop_level"] = stop_level
         if c["docups"] < p.max_docups:
             next_level = c["last_fill_price"] * (
                 1 - step_pct / 100 if c["side"] == "Buy" else 1 + step_pct / 100)
@@ -1696,9 +1762,10 @@ class DcaBot:
             if qty < c["min_qty"]:
                 qty = c["min_qty"]
             self._place_dca(c, next_level, qty)
-        # stop_level зависит от avg_entry — после каждой докупки биржевой
-        # стоп нужно перевыставить (иначе защищает старую цену).
-        self._sync_exchange_stop(c)
+        # Стоп выставлен один раз на входе от worst-case средней всей
+        # лестницы; докупки его не двигают.
+        if sync_stop:
+            self._sync_exchange_stop(c)
 
     def _tp_filled_close(self, c: dict) -> bool:
         """TP-лимитка исполнилась, а локальный qty ещё > 0: закрыть как TP.
@@ -2088,9 +2155,23 @@ class DcaBot:
             c["avg_entry"] = price
             c["fee"] += fee
             c["last_fill_price"] = price
-            stop_level = self._stop_level_for(c)
-            if stop_level is not None:
-                c["stop_level"] = stop_level
+            plan = self._build_stop_plan(c, price, qty)
+            if plan is not None:
+                c["stop_plan"] = plan
+                c["stop_avg_entry"] = plan["worst_avg"]
+                c["stop_level"] = plan["stop_level"]
+                if not plan["stop_beyond_last"]:
+                    self.journal.write(
+                        "stop_plan_rejected_after_fill",
+                        signal_id=c["signal_id"], cycle_id=c["cycle_id"],
+                        symbol=c["symbol"], side=c["side"],
+                        entry_price=price, stop_level=plan["stop_level"],
+                        last_level=plan["last_level"],
+                        stop_pct=plan["stop_pct"])
+            else:
+                stop_level = self._stop_level_for(c)
+                if stop_level is not None:
+                    c["stop_level"] = stop_level
             self.journal.write("order_filled", signal_id=c["signal_id"],
                                cycle_id=c["cycle_id"], symbol=c["symbol"],
                                role="entry", mode="entry",
@@ -2118,9 +2199,6 @@ class DcaBot:
             c["docups"] += 1
             c["fee"] += fee
             c["last_fill_price"] = price
-            stop_level = self._stop_level_for(c)
-            if stop_level is not None:
-                c["stop_level"] = stop_level
             self.journal.write("order_filled", signal_id=c["signal_id"],
                                cycle_id=c["cycle_id"], symbol=c["symbol"],
                                role="dca", mode="entry",
@@ -2134,7 +2212,7 @@ class DcaBot:
                                avg_price=round(c["avg_entry"], 8))
             logger.info("докупка #%d %s @%.6g, avg=%.6g", c["docups"],
                         c["symbol"], price, c["avg_entry"])
-            self._after_position_change(c, now)
+            self._after_position_change(c, now, sync_stop=False)
         elif role == "tp":
             self._close(c, "take_profit", price, now, fee)
         elif role == "close":

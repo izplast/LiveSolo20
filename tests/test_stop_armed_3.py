@@ -1,4 +1,4 @@
-"""Журнал: вход + 2 докупки → три события stop_armed (перевыставление стопа).
+"""Журнал: вход выставляет стоп один раз; докупки его не перевыставляют.
 
 Запуск:  python3 tests/test_stop_armed_3.py   (код 0 = ок)
 """
@@ -33,13 +33,13 @@ bot._on_fill(c, "t1_so2", "dca", 0.8, 98.4064, 0.01, now,
 
 armed = [kw for n, a, kw in bot.journal.rows
          if n == "write" and a and a[0] == "stop_armed"]
-check("вход + 2 докупки → 3 stop_armed", len(armed) == 3, len(armed))
-check("qty в stop_armed растёт по лестнице",
-      [round(kw.get("qty", 0), 6) for kw in armed] == [0.2, 0.6, 1.4],
+check("вход + 2 докупки → 1 stop_armed", len(armed) == 1, len(armed))
+check("qty в stop_armed = объём входа",
+      [round(kw.get("qty", 0), 6) for kw in armed] == [0.2],
       [kw.get("qty") for kw in armed])
-check("stop_level есть в каждом stop_armed",
+check("stop_level есть в stop_armed",
       all(kw.get("stop_level") for kw in armed), armed)
-check("ответ Bybit есть в каждом stop_armed",
+check("ответ Bybit есть в stop_armed",
       all(kw.get("bybit_response") for kw in armed), armed)
 check("stop_armed содержит side/notional/avg_price",
       all(kw.get("side") == "Buy" and kw.get("notional", 0) > 0
