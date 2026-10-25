@@ -1122,6 +1122,7 @@ class DcaBot:
     def __init__(self, *, p: DcaParams, bp, client: Any, mode: str,
                  journal_path: str, state_path: str, screener_path: str,
                  trail_trigger_pct: float = 0.0, trail_step_pct: float = 0.0,
+                 trailing_enabled: bool = True,
                  max_signal_age: int = 300,
                  exit_maker_enabled: bool = True,
                  exit_maker_timeout_sec: float = 15.0,
@@ -1136,8 +1137,10 @@ class DcaBot:
         self.journal_path = journal_path
         self.state_path = state_path
         self.screener_path = screener_path
-        self.trail_trigger = trail_trigger_pct
-        self.trail_step = trail_step_pct
+        self.trailing_enabled = bool(trailing_enabled)
+        self.trail_trigger = trail_trigger_pct if self.trailing_enabled else 0.0
+        self.trail_step = trail_step_pct if self.trailing_enabled else 0.0
+        self.exit_retry_delays = (1.0, 2.0, 4.0)
         self.max_signal_age = max_signal_age
         # ── защита от проскальзывания на выходах (SC-004: p95 close до 10%) ──
         # Выход сначала пробует стать maker'ом (PostOnly-лимитка у лучшей
@@ -2875,6 +2878,7 @@ def main(argv: list[str] | None = None) -> int:
         journal_path=bp.journal_path,
         state_path=os.path.join("logs", "bot-state.json"),
         screener_path=screener_path,
+        trailing_enabled=bool(dca_raw.get("trailing_enabled", True)),
         trail_trigger_pct=_f(dca_raw.get("trail_trigger_pct") or 0),
         trail_step_pct=_f(dca_raw.get("trail_step_pct") or 0),
         max_signal_age=args.max_signal_age,
