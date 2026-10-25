@@ -7,7 +7,7 @@
   (цикл без позиции).
 
 Проверяем: цена/PnL из closed-pnl, pnl_source=closed_pnl, exit_reason по
-факту (exchange_sl при StopLoss в исполнениях, иначе external_close),
+факту (exchange_sl при StopLoss в исполнениях, иначе unknown_exchange),
 оставшиеся ордера цикла сняты.
 
 Запуск:  python3 tests/test_flat_cycle_finalize.py   (код 0 = ок)
@@ -98,7 +98,7 @@ check("ордера цикла сняты", set(cancels(bot)) >= {"t1_tp1", "t1_
 check("110017 не журналируется как ошибка закрытия",
       not api_errors(bot, "market_close"), api_errors(bot, "market_close"))
 
-# 2) тот же 110017, но StopLoss в исполнениях нет → external_close
+# 2) тот же 110017, но StopLoss в исполнениях нет → unknown_exchange
 client2, now2 = flat_client(stop_hit=False, pnl=-1.25, exit_px=98.0)
 bot2 = make_bot(client2)
 c2 = linked_cycle(now2)
@@ -107,9 +107,9 @@ c2["closing"] = {"reason": "hard_sl", "fast": True}
 bot2.cycles[c2["cycle_id"]] = c2
 bot2._monitor_cycles()
 closed2 = cycle_closed(bot2)
-check("без StopLoss → exit_reason=external_close",
-      closed2 and closed2[0].get("exit_reason") == "external_close", closed2)
-check("external_close: pnl из closedPnl",
+check("без StopLoss → exit_reason=unknown_exchange",
+      closed2 and closed2[0].get("exit_reason") == "unknown_exchange", closed2)
+check("unknown_exchange: pnl из closedPnl",
       closed2 and abs(closed2[0].get("pnl", 0) + 1.25) < 1e-9, closed2)
 
 # 3) reconcile (b): цикл без позиции, без монитора — финализация

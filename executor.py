@@ -497,6 +497,20 @@ class BybitClient:
             return hist[0]
         return self._order_from_executions(symbol, order_link_id, order_id)
 
+    def order_history(self, symbol: str, order_id: str = "",
+                      order_link_id: str = "", limit: int = 50) -> list[dict]:
+        """История ордеров: stopOrderType/triggerPrice закрывающего ордера."""
+        params: dict[str, Any] = {
+            "category": "linear", "symbol": symbol,
+            "limit": str(max(1, min(100, limit))),
+        }
+        if order_id:
+            params["orderId"] = str(order_id)
+        elif order_link_id:
+            params["orderLinkId"] = str(order_link_id)
+        lst = self._get("/v5/order/history", params, signed=True).get("list", [])
+        return lst if isinstance(lst, list) else []
+
     def _order_from_executions(self, symbol: str, order_link_id: str,
                                order_id: str | None) -> dict | None:
         try:
@@ -1016,6 +1030,16 @@ class PaperClient:
     def closed_pnl(self, symbol: str, limit: int = 20) -> list[dict]:
         """Paper: биржевых закрытий нет — пусто (фолбэк по stop_price)."""
         return []
+
+    def order_history(self, symbol: str, order_id: str = "",
+                      order_link_id: str = "", limit: int = 50) -> list[dict]:
+        """Paper: история локальных ордеров для паритета API."""
+        rows = [o for o in self.orders.values()
+                if o.get("symbol") == symbol and (
+                    (order_id and str(o.get("orderId")) == str(order_id))
+                    or (order_link_id
+                        and str(o.get("orderLinkId")) == str(order_link_id)))]
+        return rows[:max(1, min(100, limit))]
 
     def executions(self, symbol: str, start_time_ms: int | None = None,
                    limit: int = 50) -> list[dict]:
@@ -1767,6 +1791,64 @@ class DcaBot:
         if sync_stop:
             self._sync_exchange_stop(c)
 
+    def _apply_exchange_close(self, c: dict, actual: dict,
+                              *, now: int | None = None) -> bool:
+        """Применить авторитетное закрытие из closed-pnl (net уже с fee)."""
+        net = actual.get("net")
+        if net is None:
+            return False
+        qty = _f(actual.get("qty")) or _f(c.get("qty"))
+        close_ts = int(actual.get("close_ts") or now or time.time() * 1000)
+        hist = actual.get("history") or {}
+        c["realized_pnl"] = net
+        c["fee"] = 0.0
+        c["pnl_source"] = "closed_pnl"
+        c["qty"] = 0.0
+        c["closed_qty"] = max(_f(c.get("closed_qty")), qty)
+        c["exit_price"] = _f(actual.get("exit_price"))
+        c["exit_ts"] = close_ts
+        if actual.get("avg_entry"):
+            c["avg_entry"] = _f(actual["avg_entry"])
+        c["closing_order_id"] = actual.get("order_id") or ""
+        c["trigger_price"] = _f(hist.get("triggerPrice")) or None
+        c["trigger_type"] = str(hist.get("stopOrderType") or "") or None
+        c["funding"] = self._funding_for_symbol(
+            c, int(c.get("open_ts") or 0), close_ts)
+        return True
+
+    def _close_tp_from_exchange(self, c: dict, order: dict, price: float,
+                                now: int, fee: float) -> bool:
+        """TP-филл: PnL из closed-pnl по orderId закрывающего ордера."""
+        oid = str((order or {}).get("orderId") or "")
+        actual = self._fetch_exchange_exit(c, order_id=oid) if oid else None
+        if not actual or not self._apply_exchange_close(c, actual, now=now):
+            return False
+        for link, o in list(c["links"].items()):
+            if o["role"] in ("tp", "dca", "close_maker"):
+                self._safe_cancel(c, link)
+        c["close_reason"] = "take_profit"
+        c["exit_ts"] = int(actual.get("close_ts") or now)
+        hist = actual.get("history") or {}
+        self.journal.write("order_filled", signal_id=c["signal_id"],
+                           cycle_id=c["cycle_id"], symbol=c["symbol"],
+                           role="close", mode="take_profit",
+                           avg_fill_price=round(_f(c.get("exit_price")), 8),
+                           qty_closed=_f(c.get("closed_qty")), qty_left=0,
+                           estimated=False, price_source=actual.get("source"),
+                           fee=round(_f(actual.get("fee")), 8),
+                           side=c["side"], qty=_f(c.get("closed_qty")),
+                           notional=_f(_f(c.get("closed_qty"))
+                                       * _f(c.get("exit_price"))),
+                           avg_price=c.get("avg_entry"),
+                           stop_level=c.get("stop_level"),
+                           trigger_price=_f(hist.get("triggerPrice")) or None,
+                           trigger_type=str(hist.get("stopOrderType") or "")
+                           or None,
+                           funding=round(_f(c.get("funding")), 8),
+                           ts_signal=c["signal_ts"], ts_confirmed=now)
+        self._finalize_close(c, "take_profit")
+        return True
+
     def _tp_filled_close(self, c: dict) -> bool:
         """TP-лимитка исполнилась, а локальный qty ещё > 0: закрыть как TP.
 
@@ -1786,7 +1868,9 @@ class DcaBot:
             return False
         price = _f(o.get("avgPrice") or o.get("price"))
         fee = _f(o.get("cumExecFee"))
-        self._close(c, "take_profit", price, int(time.time() * 1000), fee)
+        now = int(time.time() * 1000)
+        if not self._close_tp_from_exchange(c, o, price, now, fee):
+            self._close(c, "take_profit", price, now, fee)
         return True
 
     def _sync_exchange_stop(self, c: dict) -> None:
@@ -1863,9 +1947,10 @@ class DcaBot:
         """Биржа закрыла позицию сама — финализировать цикл по факту.
 
         Без этой сверки бот слал бы маркеты в пустую позицию каждый такт.
-        Цена/PnL — из /v5/position/closed-pnl (фолбэк — executions). Причина
-        выхода по факту: exchange_sl, если в исполнениях есть stopOrderType
-        StopLoss, иначе external_close (позицию закрыл не бот).
+        Цена/PnL — из /v5/position/closed-pnl (фолбэк — executions).
+        Причина выхода — по /v5/order/history закрывающего orderId:
+        StopLoss → exchange_sl, TakeProfit → take_profit; если после
+        ретраев не определена — unknown_exchange.
         """
         try:
             pos = self.client.get_position(c["symbol"])
@@ -1878,18 +1963,91 @@ class DcaBot:
                 return
             self._finalize_flat_cycle(c, position_checked=True)
 
+    def _retry_exit(self, fn):
+        """Повторить чтение закрытия с паузами 1/2/4 с (всего ~7 с)."""
+        delays = tuple(getattr(self, "exit_retry_delays", (1.0, 2.0, 4.0))
+                       or ())
+        for i in range(len(delays) + 1):
+            res = fn()
+            if res is not None:
+                return res
+            if i < len(delays):
+                time.sleep(max(0.0, _f(delays[i])))
+        return None
+
+    def _order_history_once(self, c: dict, order_id: str = "",
+                            order_link_id: str = "") -> dict | None:
+        if not order_id and not order_link_id:
+            return None
+        fn = getattr(self.client, "order_history", None)
+        if not callable(fn):
+            return None
+        try:
+            rows = fn(c["symbol"], order_id=str(order_id),
+                      order_link_id=str(order_link_id))
+        except Exception:  # noqa: BLE001 — причина не должна ронять фиксацию
+            return None
+        return rows[0] if isinstance(rows, list) and rows else None
+
+    def _closing_order_history(self, c: dict, order_id: str = "",
+                               order_link_id: str = "") -> dict | None:
+        return self._retry_exit(
+            lambda: self._order_history_once(c, order_id, order_link_id))
+
+    @staticmethod
+    def _funding_for(c: dict, since: int, until: int | None = None,
+                     execs: list[dict] | None = None) -> float:
+        """Funding за цикл: положительный = получен, отрицательный = уплачен.
+
+        closedPnl уже включает funding, поэтому в PnL его повторно не
+        добавляем. В execution/list funding идёт отдельной строкой
+        execType=Funding с execFee > 0 при списании.
+        """
+        total = 0.0
+        for e in execs or []:
+            if not isinstance(e, dict):
+                continue
+            if str(e.get("symbol") or c["symbol"]) != c["symbol"]:
+                continue
+            if str(e.get("execType") or "") != "Funding":
+                continue
+            ts = int(_f(e.get("execTime") or e.get("transactTime") or 0))
+            if since and ts and ts < since:
+                continue
+            if until and ts and ts > until:
+                continue
+            total += _f(e.get("execFee") or e.get("fee") or 0)
+        return -total
+
+    def _funding_for_symbol(self, c: dict, since: int,
+                            until: int | None = None,
+                            execs: list[dict] | None = None) -> float:
+        if execs is None:
+            fn = getattr(self.client, "executions", None)
+            if callable(fn):
+                try:
+                    execs = fn(c["symbol"], since, 100)
+                except TypeError:
+                    try:
+                        execs = fn(c["symbol"])
+                    except Exception:  # noqa: BLE001
+                        execs = []
+                except Exception:  # noqa: BLE001
+                    execs = []
+            else:
+                execs = []
+        return self._funding_for(c, since, until, execs)
+
     def _finalize_flat_cycle(self, c: dict, *,
-                             default_reason: str = "external_close",
+                             default_reason: str = "unknown_exchange",
                              position_checked: bool = False) -> bool:
         """Цикл есть, позиции на бирже нет — финализировать по closed-pnl.
 
-        Единый путь для 110017 на reduceOnly-закрытии, reconcile «цикл без
-        позиции» и стартовой сверки. Цена/PnL/fee берутся из
-        /v5/position/closed-pnl (pnl_source=closed_pnl); exit_reason — по
-        факту: exchange_sl при сработавшем биржевом стопе, иначе
-        external_close. Оставшиеся ордера цикла снимаются.
-
-        Возвращает True, если цикл финализирован.
+        qty/avgEntry/PnL берутся из closed-pnl (одна или несколько строк
+        закрытия за цикл), funding — отдельным полем, но в PnL не
+        добавляется повторно. Причина выхода — по order history
+        закрывающего orderId; если не определена — unknown_exchange.
+        Оставшиеся ордера цикла снимаются.
         """
         if c.get("closed"):
             return True
@@ -1903,65 +2061,89 @@ class DcaBot:
         for link, o in list(c["links"].items()):
             if o["role"] in ("tp", "dca", "close_maker"):
                 self._safe_cancel(c, link)
-        reason = self._exchange_exit_reason(c, default=default_reason)
-        qty = _f(c.get("qty"))
         actual = self._fetch_exchange_exit(c)
+        reason = self._exchange_exit_reason(
+            c, default=default_reason, actual=actual)
+        qty_local = _f(c.get("qty"))
         if actual is not None:
-            exit_price, net, fee, source = actual
-            if net is None:
-                # execution-фолбэк: gross без комиссий — fee вычитается
-                # штатно через c["fee"] в _finalize_close.
-                gross = ((exit_price - c["avg_entry"]) * qty
-                         if c["side"] == "Buy"
-                         else (c["avg_entry"] - exit_price) * qty)
-                c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
-                c["fee"] = _f(c.get("fee")) + fee
-            else:
-                # closedPnl чистый (комиссии open/close и фандинг уже
-                # внутри) — он авторитетен за всю позицию: локальный c["fee"]
-                # (вход/докупки) обнуляем, иначе двойной вычет.
-                c["realized_pnl"] = _f(c.get("realized_pnl")) + net
+            qty_out = _f(actual.get("qty")) or qty_local
+            exit_price = _f(actual.get("exit_price"))
+            net = actual.get("net")
+            fee = _f(actual.get("fee"))
+            hist = actual.get("history") or {}
+            if net is not None:
+                # closedPnl чистый (open/close fee и funding уже внутри):
+                # авторитетен за всю позицию, локальный fee обнуляем.
+                c["realized_pnl"] = net
                 c["fee"] = 0.0
+                c["pnl_source"] = "closed_pnl"
+            else:
+                remaining = max(0.0, qty_out - _f(c.get("closed_qty")))
+                gross = ((exit_price - c["avg_entry"]) * remaining
+                         if c["side"] == "Buy"
+                         else (c["avg_entry"] - exit_price) * remaining)
+                c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
+                fee_delta = max(0.0, fee - _f(c.get("exit_fee")))
+                c["fee"] = _f(c.get("fee")) + fee_delta
+                c["exit_fee"] = _f(c.get("exit_fee")) + fee_delta
+                c["pnl_source"] = "estimated"
             c["exit_price"] = exit_price
-            c["pnl_source"] = "closed_pnl" if net is not None else "estimated"
-            c["closed_qty"] = _f(c.get("closed_qty")) + qty
+            c["closed_qty"] = max(_f(c.get("closed_qty")), qty_out)
+            if actual.get("avg_entry"):
+                c["avg_entry"] = _f(actual["avg_entry"])
+            c["exit_ts"] = int(actual.get("close_ts") or time.time() * 1000)
+            c["closing_order_id"] = actual.get("order_id") or ""
+            c["trigger_price"] = _f(hist.get("triggerPrice")) or None
+            c["trigger_type"] = str(hist.get("stopOrderType") or "") or None
+            c["funding"] = self._funding_for_symbol(
+                c, int(c.get("open_ts") or 0), c["exit_ts"])
             self.journal.write("order_filled", signal_id=c["signal_id"],
                                cycle_id=c["cycle_id"], symbol=symbol,
                                role="close", mode=("exchange_stop"
                                                    if reason == "exchange_sl"
                                                    else reason),
                                avg_fill_price=round(exit_price, 8),
-                               qty_closed=qty, qty_left=0,
-                               estimated=False, price_source=source,
+                               qty_closed=qty_out, qty_left=0,
+                               estimated=(net is None), price_source=actual.get("source"),
                                fee=round(fee, 8),
-                               side=c["side"], qty=qty,
-                               notional=_f(qty * exit_price),
+                               side=c["side"], qty=qty_out,
+                               notional=_f(qty_out * exit_price),
                                avg_price=c.get("avg_entry"),
                                stop_level=c.get("stop_level"),
+                               trigger_price=c["trigger_price"],
+                               trigger_type=c["trigger_type"],
+                               funding=round(c["funding"], 8),
                                ts_signal=c["signal_ts"],
                                ts_confirmed=int(time.time() * 1000))
         else:
-            # API не ответил — оценка по stop_price, как раньше.
-            est = _f(c.get("stop_price")) or 0.0
+            # API не ответил после ретраев — оценка по фактическому триггеру.
+            est = (_f(c.get("trigger_price")) or _f(c.get("stop_price"))
+                   or _f(c.get("stop_level")) or 0.0)
             if est > 0:
-                gross = ((est - c["avg_entry"]) * qty if c["side"] == "Buy"
-                         else (c["avg_entry"] - est) * qty)
+                gross = ((est - c["avg_entry"]) * qty_local
+                         if c["side"] == "Buy"
+                         else (c["avg_entry"] - est) * qty_local)
                 c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
                 c["exit_price"] = est
                 c["pnl_source"] = "estimated"
-                c["closed_qty"] = _f(c.get("closed_qty")) + qty
+                c["closed_qty"] = _f(c.get("closed_qty")) + qty_local
+                c["funding"] = self._funding_for_symbol(
+                    c, int(c.get("open_ts") or 0))
                 self.journal.write("order_filled", signal_id=c["signal_id"],
                                    cycle_id=c["cycle_id"], symbol=symbol,
                                    role="close", mode=("exchange_stop"
                                                        if reason == "exchange_sl"
                                                        else reason),
                                    avg_fill_price=round(est, 8),
-                                   qty_closed=qty, qty_left=0,
+                                   qty_closed=qty_local, qty_left=0,
                                    estimated=True,
-                                   side=c["side"], qty=qty,
-                                   notional=_f(qty * est),
+                                   side=c["side"], qty=qty_local,
+                                   notional=_f(qty_local * est),
                                    avg_price=c.get("avg_entry"),
                                    stop_level=c.get("stop_level"),
+                                   trigger_price=c.get("trigger_price"),
+                                   trigger_type=c.get("trigger_type"),
+                                   funding=round(_f(c.get("funding")), 8),
                                    ts_signal=c["signal_ts"],
                                    ts_confirmed=int(time.time() * 1000))
         c["qty"] = 0.0
@@ -1986,90 +2168,39 @@ class DcaBot:
         return "110017" in text or "current position is zero" in text.lower()
 
     def _exchange_exit_reason(self, c: dict,
-                              default: str = "external_close") -> str:
-        """Причина закрытия по факту: сработал биржевой StopLoss или нет.
+                              default: str = "unknown_exchange",
+                              *, actual: dict | None = None) -> str:
+        """Причина закрытия по order history закрывающего orderId.
 
-        closed-pnl сначала (stopOrderType часто заполнен), затем лента
-        исполнений — у trading-stop закрытие видно там как StopLoss.
+        StopLoss → exchange_sl, TakeProfit → take_profit. Если причина не
+        определена после ретраев — default (unknown_exchange), а не
+        external_close: «позицию закрыли снаружи» больше не угадываем.
         """
         symbol = c["symbol"]
         since = int(c.get("open_ts") or 0)
-        try:
-            rows = self.client.closed_pnl(symbol, limit=20)
-        except Exception:  # noqa: BLE001 — причина не критична для фиксации
-            rows = []
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-            ts = int(_f(r.get("updatedTime") or r.get("createdTime")
-                        or r.get("closeTime") or 0))
-            if since and ts and ts < since:
-                continue
-            if "stop" in str(r.get("stopOrderType") or "").lower():
-                return "exchange_sl"
-        for method in ("executions", "closed_executions"):
-            fn = getattr(self.client, method, None)
-            if not callable(fn):
-                continue
-            try:
-                execs = fn(symbol, since, 50) if method == "executions" \
-                    else fn(symbol, since)
-            except TypeError:
-                try:
-                    execs = fn(symbol)
-                except Exception:  # noqa: BLE001
-                    execs = None
-            except Exception:  # noqa: BLE001
-                execs = None
-            for e in execs or []:
-                if not isinstance(e, dict):
-                    continue
-                ts = int(_f(e.get("execTime") or e.get("transactTime") or 0))
-                if since and ts and ts < since:
-                    continue
-                if "stop" in str(e.get("stopOrderType") or "").lower():
-                    return "exchange_sl"
-            if execs:
-                break
-        return default
+        hist = (actual or {}).get("history")
+        order_id = str((actual or {}).get("order_id") or "")
+        if hist is None and order_id:
+            hist = self._closing_order_history(c, order_id=order_id)
+            if actual is not None:
+                actual["history"] = hist
+        sot = str((hist or {}).get("stopOrderType")
+                  or (actual or {}).get("stop_order_type") or "").lower()
+        if "stop" in sot:
+            return "exchange_sl"
+        if "takeprofit" in sot or "take_profit" in sot:
+            return "take_profit"
+        if hist:
+            return default
 
-    def _fetch_exchange_exit(self, c: dict):
-        """(exit_price, net|None, fee, source) из closed-pnl/execution или None.
-
-        closed-pnl первичен: avgExitPrice + чистый closedPnl (комиссии
-        open/close и фандинг уже внутри) + openFee+closeFee информационно.
-        execution/list — фолбэк: (средневзвешенная цена, None, сумма
-        execFee, "execution") — там gross считается без комиссий.
-        None — API не ответил: вызыватель использует оценку по stop_price.
-        """
-        symbol = c["symbol"]
-        since = int(c.get("open_ts") or 0)
-        rows: list[dict] | None = None
-        for method in ("closed_pnl", "closed_executions"):
-            fn = getattr(self.client, method, None)
-            if callable(fn):
+        def from_execs() -> str | None:
+            for method in ("executions", "closed_executions"):
+                fn = getattr(self.client, method, None)
+                if not callable(fn):
+                    continue
                 try:
-                    rows = fn(symbol) if method != "closed_executions" \
+                    execs = fn(symbol, since, 50) if method == "executions" \
                         else fn(symbol, since)
-                except Exception:  # noqa: BLE001 — фолбэк ниже
-                    rows = None
-                if rows:
-                    break
-        if rows:
-            best = self._pick_closed_row(rows, symbol, since)
-            if best is not None:
-                px, net, fee = best
-                if px > 0:
-                    return px, net, fee, "closed_pnl"
-        execs: list[dict] | None = None
-        for method in ("executions", "closed_executions"):
-            fn = getattr(self.client, method, None)
-            if callable(fn):
-                try:
-                    execs = fn(symbol, since) if method != "executions" \
-                        else fn(symbol, since, 50)
-                    if method == "executions" and execs is None:
-                        execs = []
                 except TypeError:
                     try:
                         execs = fn(symbol)
@@ -2077,74 +2208,179 @@ class DcaBot:
                         execs = None
                 except Exception:  # noqa: BLE001
                     execs = None
+                for e in execs or []:
+                    if not isinstance(e, dict):
+                        continue
+                    ts = int(_f(e.get("execTime") or e.get("transactTime") or 0))
+                    if since and ts and ts < since:
+                        continue
+                    if "stop" in str(e.get("stopOrderType") or "").lower():
+                        return "exchange_sl"
                 if execs:
                     break
-        if execs:
-            agg = self._aggregate_executions(execs, symbol, since)
-            if agg is not None and agg[0] > 0:
-                return agg[0], None, agg[2], "execution"
-        return None
+            return None
+        return self._retry_exit(from_execs) or default
+
+    def _fetch_exchange_exit(self, c: dict, order_id: str = "") -> dict | None:
+        """Фактическое закрытие: закрывающие филлы, а не все исполнения.
+
+        closed-pnl первичен: qty/avgEntry/avgExitPrice + чистый closedPnl.
+        execution/list — фолбэк только по строкам с closedSize > 0 и
+        стороной выхода; входные филлы и funding не попадают в цену/PnL.
+        Нет закрывающего филла после 1/2/4 с — None.
+        """
+        symbol = c["symbol"]
+        since = int(c.get("open_ts") or 0)
+        exit_side = "Sell" if c["side"] == "Buy" else "Buy"
+
+        def attempt() -> dict | None:
+            rows: list[dict] | None = None
+            fn = getattr(self.client, "closed_pnl", None)
+            if callable(fn):
+                try:
+                    rows = fn(symbol, limit=50)
+                except Exception:  # noqa: BLE001
+                    rows = None
+            if rows:
+                agg = self._collect_closed_pnl(
+                    rows, symbol, since, order_id=order_id,
+                    fallback_qty=_f(c.get("qty")))
+                if agg is not None and agg["exit_price"] > 0:
+                    agg["source"] = "closed_pnl"
+                    agg["history"] = self._order_history_once(
+                        c, order_id=agg.get("order_id") or "")
+                    return agg
+
+            execs: list[dict] | None = None
+            fn = getattr(self.client, "executions", None)
+            if callable(fn):
+                try:
+                    execs = fn(symbol, since, 100)
+                except TypeError:
+                    try:
+                        execs = fn(symbol)
+                    except Exception:  # noqa: BLE001
+                        execs = None
+                except Exception:  # noqa: BLE001
+                    execs = None
+            if execs:
+                agg = self._aggregate_executions(
+                    execs, symbol, since, exit_side=exit_side,
+                    order_id=order_id)
+                if agg is not None and agg["exit_price"] > 0:
+                    agg["net"] = None
+                    agg["source"] = "execution"
+                    agg["history"] = self._order_history_once(
+                        c, order_id=agg.get("order_id") or "")
+                    return agg
+            return None
+
+        return self._retry_exit(attempt)
 
     @staticmethod
-    def _pick_closed_row(rows: list[dict], symbol: str, since: int):
-        """Новейшая строка closed-pnl по символу не раньше open_ts.
-
-        Возвращает (avgExitPrice, чистый closedPnl|None, openFee+closeFee).
-        closedPnl чистый по докам Bybit (минус open/close комиссии и
-        фандинг) — вычитать fee повторно нельзя.
-        """
-        best = None
-        best_ts = -1
+    def _collect_closed_pnl(rows: list[dict], symbol: str, since: int,
+                            *, order_id: str = "",
+                            fallback_qty: float = 0.0) -> dict | None:
+        """Свернуть строки closed-pnl цикла: qty, avg entry/exit, net, fee."""
+        matched: list[dict] = []
         for r in rows:
             if not isinstance(r, dict):
                 continue
             if str(r.get("symbol") or symbol) != symbol:
                 continue
+            oid = str(r.get("orderId") or "")
+            if order_id and oid != str(order_id):
+                continue
             ts = int(_f(r.get("updatedTime") or r.get("createdTime")
                         or r.get("closeTime") or 0))
             if since and ts and ts < since:
                 continue
+            qty = _f(r.get("qty") or r.get("closedSize") or fallback_qty)
             px = _f(r.get("avgExitPrice") or r.get("exitPrice")
                     or r.get("closePrice") or r.get("avgPrice") or 0)
-            if px <= 0:
+            if qty <= 0 or px <= 0:
                 continue
             gp = r.get("closedPnl")
             if gp is None:
                 gp = r.get("realisedPnl", r.get("realizedPnl"))
-            net = _f(gp) if gp is not None else None
-            fee = _f(r.get("openFee") or 0) + _f(r.get("closeFee") or 0)
-            if fee <= 0:
-                fee = _f(r.get("cumExecFee") or r.get("execFee")
-                         or r.get("fee") or r.get("closeFee") or 0)
-            if ts >= best_ts:
-                best_ts = ts
-                best = (px, net, fee)
-        return best
+            matched.append({
+                "qty": qty,
+                "px": px,
+                "entry": _f(r.get("avgEntryPrice") or r.get("avgPrice") or 0),
+                "net": _f(gp) if gp is not None else None,
+                "fee": _f(r.get("openFee") or 0) + _f(r.get("closeFee") or 0),
+                "ts": ts,
+                "oid": oid,
+                "sot": str(r.get("stopOrderType") or ""),
+            })
+        if not matched:
+            return None
+        total_qty = sum(x["qty"] for x in matched)
+        if total_qty <= 0:
+            return None
+        exit_px = sum(x["px"] * x["qty"] for x in matched) / total_qty
+        entry_px = 0.0
+        entry_qty = sum(x["qty"] for x in matched if x["entry"] > 0)
+        if entry_qty > 0:
+            entry_px = sum(x["entry"] * x["qty"] for x in matched
+                           if x["entry"] > 0) / entry_qty
+        nets = [x["net"] for x in matched]
+        net = None if any(n is None for n in nets) else sum(nets)
+        newest = max(matched, key=lambda x: x["ts"])
+        return {
+            "exit_price": exit_px,
+            "net": net,
+            "fee": sum(x["fee"] for x in matched),
+            "qty": total_qty,
+            "avg_entry": entry_px or None,
+            "order_id": newest["oid"],
+            "close_ts": newest["ts"],
+            "stop_order_type": newest["sot"],
+        }
 
     @staticmethod
-    def _aggregate_executions(execs: list[dict], symbol: str, since: int):
-        """(средневзвешенная цена, None, суммарная комиссия) после open_ts."""
+    def _aggregate_executions(execs: list[dict], symbol: str, since: int,
+                              *, exit_side: str = "",
+                              order_id: str = "") -> dict | None:
+        """Только закрывающие филлы: closedSize > 0, сторона выхода."""
         tot_q = 0.0
         tot_px = 0.0
         tot_fee = 0.0
+        oid = ""
+        close_ts = 0
         for e in execs:
             if not isinstance(e, dict):
                 continue
             if str(e.get("symbol") or symbol) != symbol:
                 continue
+            if order_id and str(e.get("orderId") or "") != str(order_id):
+                continue
+            if exit_side and str(e.get("side") or "") != exit_side:
+                continue
             ts = int(_f(e.get("execTime") or e.get("transactTime") or 0))
             if since and ts and ts < since:
                 continue
-            q = _f(e.get("execQty") or e.get("closedSize") or 0)
+            q = _f(e.get("closedSize"))
+            if q <= 0:
+                continue
             px = _f(e.get("execPrice") or e.get("price") or 0)
-            if q <= 0 or px <= 0:
+            if px <= 0:
                 continue
             tot_q += q
             tot_px += px * q
             tot_fee += _f(e.get("execFee") or e.get("fee") or 0)
+            oid = str(e.get("orderId") or oid)
+            close_ts = max(close_ts, ts)
         if tot_q <= 0:
             return None
-        return tot_px / tot_q, None, tot_fee
+        return {
+            "exit_price": tot_px / tot_q,
+            "fee": tot_fee,
+            "qty": tot_q,
+            "avg_entry": None,
+            "order_id": oid,
+            "close_ts": close_ts,
+        }
 
     # ── филлы ─────────────────────────────────────────────────────────────────
 
@@ -2214,7 +2450,8 @@ class DcaBot:
                         c["symbol"], price, c["avg_entry"])
             self._after_position_change(c, now, sync_stop=False)
         elif role == "tp":
-            self._close(c, "take_profit", price, now, fee)
+            if not self._close_tp_from_exchange(c, order, price, now, fee):
+                self._close(c, "take_profit", price, now, fee)
         elif role == "close":
             self._close(c, c.get("close_reason") or "manual", price, now, fee)
         elif role == "close_maker":
@@ -2442,6 +2679,7 @@ class DcaBot:
                  else (c["avg_entry"] - price) * qty)
         c["realized_pnl"] = _f(c.get("realized_pnl")) + gross
         c["fee"] += fee
+        c["exit_fee"] = _f(c.get("exit_fee")) + fee
         c["qty"] = round(_f(c.get("qty")) - qty, 12)
         c["exit_price"] = price
         c["exit_ts"] = now
@@ -2476,7 +2714,11 @@ class DcaBot:
                                   side=c["side"], qty=qty,
                                   notional=_f(qty * price),
                                   avg_price=c.get("avg_entry"),
-                                  stop_level=c.get("stop_level"),
+                                  exit_price=price,
+                                  trigger_price=c.get("trigger_price"),
+                                  trigger_type=c.get("trigger_type"),
+                                  closing_order_id=c.get("closing_order_id"),
+                                  funding=round(_f(c.get("funding")), 8),
                                   pnl_source=c.get("pnl_source") or "estimated")
         logger.info("цикл %s закрыт: %s pnl=%.4f", c["symbol"], reason, pnl)
         self.cycles.pop(c["cycle_id"], None)

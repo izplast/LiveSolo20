@@ -53,7 +53,7 @@ from typing import Any, Callable
 
 # Причины выхода, которые умеет разбирать tools/stats_summary.py.
 EXIT_REASONS = ("take_profit", "hard_sl", "exchange_sl", "external_close",
-                "trailing", "time_exit", "manual")
+                "trailing", "time_exit", "manual", "unknown_exchange")
 
 
 def now_ms() -> int:
@@ -133,7 +133,7 @@ class CycleJournal:
         """Зафиксировать закрытие цикла: время окончания и длительность.
 
         exit_reason: take_profit | hard_sl | exchange_sl | external_close |
-        trailing | time_exit | manual.
+        trailing | time_exit | manual | unknown_exchange.
         pnl — в USDT.
         open_ts берётся из слоя журнала (в т.ч. восстановленный после
         перезапуска) и дублируется в событие для независимой от порядка

@@ -89,6 +89,13 @@ class FakeClient:
     def closed_pnl(self, symbol, limit=20):
         return list(self.pnl)
 
+    def order_history(self, symbol, order_id="", order_link_id="", limit=50):
+        rows = [o for o in self.by_link.values()
+                if (order_id and str(o.get("orderId")) == str(order_id))
+                or (order_link_id
+                    and str(o.get("orderLinkId")) == str(order_link_id))]
+        return rows[:limit]
+
     def set_trading_stop(self, symbol, stop_loss, trigger="MarkPrice"):
         self.calls.append({"trading_stop": stop_loss, "trigger": trigger})
         return {}
@@ -120,7 +127,9 @@ def make_bot(client=None, **kw):
     bot.bp = SimpleNamespace(fill_timeout_ms=100)
     bot.client = client or FakeClient()
     bot.journal = FakeJournal()
+    bot.trailing_enabled = True
     bot.trail_trigger, bot.trail_step = 1.5, 0.5
+    bot.exit_retry_delays = ()
     bot.exit_maker_enabled, bot.exit_maker_timeout_sec = True, 15.0
     bot.max_exit_slippage_pct, bot.exit_force_after_sec = 0.5, 180.0
     bot.cycles = {}
