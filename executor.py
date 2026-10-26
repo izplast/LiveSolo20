@@ -2391,6 +2391,7 @@ class DcaBot:
             c["avg_entry"] = price
             c["fee"] += fee
             c["last_fill_price"] = price
+            self._init_trail_at_fill(c, price)
             plan = self._build_stop_plan(c, price, qty)
             if plan is not None:
                 c["stop_plan"] = plan
@@ -2812,6 +2813,27 @@ class DcaBot:
             return
         self._check_exits(c, now)
 
+    def _init_trail_at_fill(self, c: dict, fill_price: float) -> None:
+        """Запомнить fill и mark на входе: пик = лучший из них.
+
+        Лимитка может исполниться ниже рынка (Buy), поэтому mark на филле
+        уже выше fill. Пик берём max(fill, mark), а активацию разрешаем
+        только после нового экстремума — иначе трейлинг сработает мгновенно.
+        """
+        if self.trail_trigger <= 0 or fill_price <= 0:
+            return
+        mark = self._stop_mark(c["symbol"]) or fill_price
+        c["trail_fill_price"] = fill_price
+        c["trail_mark_at_fill"] = mark
+        c["trail_peak"] = (max(fill_price, mark) if c["side"] == "Buy"
+                           else min(fill_price, mark))
+        c["trail_active"] = False
+
+    def _trail_step_pct(self, c: dict) -> float:
+        """Шаг трейлинга: max(0.5%, 0.5×NATR), но не ниже конфига."""
+        floor = max(0.5, _f(self.trail_step))
+        return max(floor, 0.5 * _f(c.get("natr")))
+
     def _check_exits(self, c: dict, now: int) -> None:
         p = self.p
         # Порядок важен: сначала стопы (hard_sl и кап), потом таймер.
@@ -2844,30 +2866,49 @@ class DcaBot:
             return
         if mark <= 0:
             return
-        if self.trail_trigger > 0 and self.trail_step > 0:
-            upct = ((mark - c["avg_entry"]) / c["avg_entry"] * 100
-                    if c["side"] == "Buy"
-                    else (c["avg_entry"] - mark) / c["avg_entry"] * 100)
-            if not c["trail_active"] and upct >= self.trail_trigger:
-                c["trail_active"] = True
-                c["trail_peak"] = mark
-                self.journal.write("trail_activated", cycle_id=c["cycle_id"],
-                                   symbol=c["symbol"], avg_price=c["avg_entry"],
-                                   side=c["side"], qty=_f(c.get("qty")),
-                                   notional=_f(c.get("qty")) * _f(c.get("avg_entry")),
-                                   stop_level=c.get("stop_level"),
-                                   trigger_pct=self.trail_trigger,
-                                   peak_price=mark)
-            if c["trail_active"] and c["trail_peak"]:
-                if c["side"] == "Buy":
-                    c["trail_peak"] = max(c["trail_peak"], mark)
-                else:
-                    c["trail_peak"] = min(c["trail_peak"], mark)
-                retrace = ((c["trail_peak"] - mark) / c["trail_peak"] * 100
-                           if c["side"] == "Buy"
-                           else (mark - c["trail_peak"]) / c["trail_peak"] * 100)
-                if retrace >= self.trail_step:
-                    self._close_slow(c, "trailing")
+        if self.trail_trigger > 0:
+            fill = _f(c.get("trail_fill_price")) or _f(c.get("avg_entry"))
+            if fill > 0:
+                initial_peak = _f(c.get("trail_peak"))
+                if initial_peak <= 0:
+                    # Старые/восстановленные циклы: считаем, что пик на входе
+                    # уже был max(fill, mark), и ждём нового экстремума.
+                    initial_peak = (max(fill, mark) if c["side"] == "Buy"
+                                    else min(fill, mark))
+                    c["trail_fill_price"] = fill
+                    c["trail_mark_at_fill"] = mark
+                    c["trail_peak"] = initial_peak
+                trigger_px = fill * (
+                    1 + self.trail_trigger / 100 if c["side"] == "Buy"
+                    else 1 - self.trail_trigger / 100)
+                crossed = (mark >= trigger_px if c["side"] == "Buy"
+                           else mark <= trigger_px)
+                advanced = (mark > initial_peak if c["side"] == "Buy"
+                            else mark < initial_peak)
+                if not c["trail_active"] and crossed and advanced:
+                    c["trail_active"] = True
+                    c["trail_peak"] = mark
+                    c["trail_step_pct"] = self._trail_step_pct(c)
+                    self.journal.write("trail_activated", cycle_id=c["cycle_id"],
+                                       symbol=c["symbol"], avg_price=c["avg_entry"],
+                                       side=c["side"], qty=_f(c.get("qty")),
+                                       notional=_f(c.get("qty")) * _f(c.get("avg_entry")),
+                                       stop_level=c.get("stop_level"),
+                                       trigger_pct=self.trail_trigger,
+                                       fill_price=fill,
+                                       mark_at_fill=c.get("trail_mark_at_fill"),
+                                       step_pct=c["trail_step_pct"],
+                                       peak_price=mark)
+                if c["trail_active"] and c["trail_peak"]:
+                    if c["side"] == "Buy":
+                        c["trail_peak"] = max(c["trail_peak"], mark)
+                    else:
+                        c["trail_peak"] = min(c["trail_peak"], mark)
+                    retrace = ((c["trail_peak"] - mark) / c["trail_peak"] * 100
+                               if c["side"] == "Buy"
+                               else (mark - c["trail_peak"]) / c["trail_peak"] * 100)
+                    if retrace >= self._trail_step_pct(c):
+                        self._close_slow(c, "trailing")
 
     # ── сверка на старте ──────────────────────────────────────────────────────
 

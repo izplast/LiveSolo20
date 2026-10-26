@@ -41,7 +41,7 @@ check("trailing_enabled=True сохраняет step", bot2.trail_step == 0.5,
       bot2.trail_step)
 
 cfg = E.bot_config.read_dca_section("config/config.yml")
-check("config: trailing_enabled=false", cfg.get("trailing_enabled") is False,
+check("config: trailing_enabled=true", cfg.get("trailing_enabled") is True,
       cfg.get("trailing_enabled"))
 
 print("TRAILING_FLAG OK")
