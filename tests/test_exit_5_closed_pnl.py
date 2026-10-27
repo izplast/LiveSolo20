@@ -59,7 +59,7 @@ check("pnl = чистый closedPnl без повторного вычета (-3
 check("c[fee] обнулён (net уже включает комиссии)",
       abs(c.get("fee", -1) - 0.0) < 1e-9, c.get("fee"))
 
-# --- фолбэк: API молчит -> оценка по stop_price + estimated=True ---
+# --- closed-pnl молчит -> PnL не оцениваем: pending, затем pnl_missing ---
 client2 = FakeClient()
 client2.pos_qty = 0.0
 bot2 = make_bot(client2)
@@ -69,11 +69,21 @@ c2["stop_price"] = 97.5
 c2["tp_link"] = None
 c2["links"] = {}
 bot2._sync_position(c2)
-fills2 = [kw for n, a, kw in bot2.journal.rows
-          if n == "write" and a and a[0] == "order_filled"
-          and kw.get("estimated") is True]
-check("фолбэк пишет estimated=True", len(fills2) == 1
-      and fills2[0].get("estimated") is True, fills2)
-check("фолбэк цена = stop_price", abs(fills2[0].get("avg_fill_price", 0)
-                                      - 97.5) < 1e-9, fills2)
+closed2 = [kw for n, a, kw in bot2.journal.rows if n == "cycle_closed"]
+check("без closed-pnl cycle_closed отложен", closed2 == [], closed2)
+check("pending выставлен", c2.get("pnl_pending") is True, c2)
+check("estimated не пишется",
+      not [kw for n, a, kw in bot2.journal.rows
+           if n == "write" and a and a[0] == "order_filled"
+           and kw.get("estimated") is True])
+bot2._finalize_close(c2, "hard_sl")
+check("pending не финализируется досрочно",
+      c2.get("closed") is False, c2)
+c2["pnl_retry_at"] = time.time() - 1
+bot2._retry_pending_pnl(c2)
+closed2 = [kw for n, a, kw in bot2.journal.rows if n == "cycle_closed"]
+check("после 60 с pnl_missing", len(closed2) == 1
+      and closed2[0].get("pnl") is None
+      and closed2[0].get("pnl_source") == "pnl_missing", closed2)
+check("pending снят после missing", c2.get("pnl_pending") is None, c2)
 print("ITEM5 OK")

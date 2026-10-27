@@ -36,12 +36,17 @@ c2["links"] = {"t1_tp1": {"role": "tp", "side": "Sell", "qty": 1.0,
                           "price": 101.2, "reduce_only": True}}
 client2.by_link["t1_tp1"] = {"orderStatus": "New", "cumExecQty": "0",
                              "price": "101.2"}
-client2.executions = [{"symbol": "TSTUSDT",
-                       "execTime": int(time.time() * 1000),
+now2 = int(time.time() * 1000)
+client2.executions = [{"symbol": "TSTUSDT", "execTime": now2,
                        "execPrice": "97.5", "execQty": "1.0",
                        "stopOrderType": "StopLoss", "orderType": "Market"}]
+client2.pnl = [{"symbol": "TSTUSDT", "avgExitPrice": "97.5",
+                "closedPnl": "-2.55", "updatedTime": str(now2)}]
 bot2._sync_position(c2)
 closed2 = [kw for n, a, kw in bot2.journal.rows if n == "cycle_closed"]
 check("без TP-филла reason=exchange_sl", len(closed2) == 1
       and closed2[0].get("exit_reason") == "exchange_sl", closed2)
+check("exchange_sl pnl из closed-pnl",
+      closed2 and abs(closed2[0].get("pnl", 0) + 2.55) < 1e-9
+      and closed2[0].get("pnl_source") == "closed_pnl", closed2)
 print("ITEM3 OK")
