@@ -5,6 +5,7 @@ __pycache__/
 *.log
 data/cache/
 data/cache_dl/
+data/cache_moon5m/
 data/*.parquet
 *.pkl
 grid_search_results_*.csv
